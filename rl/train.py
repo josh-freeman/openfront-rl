@@ -136,7 +136,7 @@ def train(args):
 
     maps = args.maps.split(",")
     max_neighbors = 16
-    obs_dim = 16 + max_neighbors * 4  # 80
+    obs_dim = 23 + max_neighbors * 4  # 87
 
     # Create vectorized environment
     from vec_env import VecOpenFrontEnv

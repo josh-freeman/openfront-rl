@@ -40,8 +40,8 @@ class VecOpenFrontEnv:
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
 
-        # 16 player stats + max_neighbors * 4 neighbor features
-        obs_size = 16 + max_neighbors * 4
+        # 23 player stats + max_neighbors * 4 neighbor features
+        obs_size = 23 + max_neighbors * 4
         self.obs_dim = obs_size
 
         self._procs: list[Optional[subprocess.Popen]] = [None] * num_envs
@@ -119,9 +119,18 @@ class VecOpenFrontEnv:
             vec[14] = -1.0
         vec[15] = float(obs.get("lastActionSucceeded", False))
 
+        # Affordability flags
+        vec[16] = float(obs.get("canAffordCity", False))
+        vec[17] = float(obs.get("canAffordDefense", False))
+        vec[18] = float(obs.get("canAffordFactory", False))
+        vec[19] = float(obs.get("canAffordPort", False))
+        vec[20] = float(obs.get("canAffordSilo", False))
+        vec[21] = float(obs.get("canAffordSAM", False))
+        vec[22] = float(obs.get("canAffordWarship", False))
+
         self._neighbors_caches[idx] = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 16 + i * 4
+            base = 23 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
