@@ -120,13 +120,17 @@ class RolloutBuffer:
         self.__init__()
 
 
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    """Compute Generalized Advantage Estimation."""
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95, last_value=0.0):
+    """Compute Generalized Advantage Estimation.
+
+    last_value: bootstrap value V(s_T) for truncated episodes. Should be 0 for
+    true terminal states, or the critic's estimate for the final obs if truncated.
+    """
     advantages = np.zeros_like(rewards)
     last_gae = 0
     for t in reversed(range(len(rewards))):
         if t == len(rewards) - 1:
-            next_value = 0
+            next_value = last_value
         else:
             next_value = values[t + 1]
         delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
@@ -249,6 +253,14 @@ def train(args):
             if done or truncated:
                 break
 
+        # Bootstrap value for truncated episodes
+        last_value = 0.0
+        if truncated and not done:
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                _, _, _, v = model.get_action_and_value(obs_t)
+                last_value = v.item()
+
         episode_rewards.append(ep_reward)
         episode_lengths.append(ep_steps)
 
@@ -262,6 +274,7 @@ def train(args):
             data["dones"].cpu().numpy(),
             gamma=args.gamma,
             lam=args.gae_lambda,
+            last_value=last_value,
         )
         advantages_t = torch.FloatTensor(advantages).to(device)
         returns_t = torch.FloatTensor(returns).to(device)
@@ -382,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--opponents", type=int, default=3)
     parser.add_argument("--difficulty", default="Medium")
     parser.add_argument("--ticks-per-step", type=int, default=10)
-    parser.add_argument("--max-steps", type=int, default=3000)
+    parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--num-episodes", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
