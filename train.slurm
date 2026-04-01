@@ -40,7 +40,7 @@ python -u train.py \
     --num-envs 8 \
     --rollout-steps 512 \
     --num-updates 4000 \
-    --lr 1e-4 \
+    --lr 2e-4 \
     --vf-coef 0.25 \
     --anneal-lr \
     --curriculum \
