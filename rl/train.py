@@ -61,11 +61,17 @@ class ActorCritic(nn.Module):
             "value": self.value_head(features).squeeze(-1),
         }
 
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value(self, x, action=None, action_mask=None):
         out = self.forward(x)
 
+        # Apply action mask: set logits of invalid actions to -inf
+        action_type_logits = out["action_type"]
+        if action_mask is not None:
+            # action_mask: (batch, NUM_ACTIONS) with 1=valid, 0=invalid
+            action_type_logits = action_type_logits + (1 - action_mask) * (-1e8)
+
         # Create categorical distributions for each action dimension
-        dist_type = torch.distributions.Categorical(logits=out["action_type"])
+        dist_type = torch.distributions.Categorical(logits=action_type_logits)
         dist_target = torch.distributions.Categorical(logits=out["target"])
         dist_troop = torch.distributions.Categorical(logits=out["troop"])
 
@@ -136,7 +142,7 @@ def train(args):
 
     maps = args.maps.split(",")
     max_neighbors = 16
-    obs_dim = 23 + max_neighbors * 4  # 87
+    obs_dim = 16 + max_neighbors * 4  # 80
 
     # Create vectorized environment
     from vec_env import VecOpenFrontEnv
@@ -208,6 +214,7 @@ def train(args):
 
     # Storage for rollouts: (num_steps, num_envs, ...)
     obs_buf = np.zeros((args.rollout_steps, args.num_envs, obs_dim), dtype=np.float32)
+    masks_buf = np.ones((args.rollout_steps, args.num_envs, NUM_ACTIONS), dtype=np.float32)
     actions_buf = np.zeros((args.rollout_steps, args.num_envs, 3), dtype=np.float32)
     logprobs_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
     rewards_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
@@ -219,7 +226,7 @@ def train(args):
     env_ep_lengths = np.zeros(args.num_envs, dtype=np.int32)
 
     # Initialize
-    obs = envs.reset_all()  # (num_envs, obs_dim)
+    obs, action_masks = envs.reset_all()  # (num_envs, obs_dim), (num_envs, NUM_ACTIONS)
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
@@ -234,17 +241,19 @@ def train(args):
         # Collect rollout
         for step in range(args.rollout_steps):
             obs_buf[step] = obs
+            masks_buf[step] = action_masks
 
             obs_t = torch.FloatTensor(obs).to(device)
+            masks_t = torch.FloatTensor(action_masks).to(device)
             with torch.no_grad():
-                action, log_prob, _, value = model.get_action_and_value(obs_t)
+                action, log_prob, _, value = model.get_action_and_value(obs_t, action_mask=masks_t)
 
             actions_np = action.cpu().numpy()  # (num_envs, 3)
             logprobs_buf[step] = log_prob.cpu().numpy()
             values_buf[step] = value.cpu().numpy()
             actions_buf[step] = actions_np
 
-            next_obs, rewards, dones, truncateds, infos = envs.step(actions_np)
+            next_obs, next_masks, rewards, dones, truncateds, infos = envs.step(actions_np)
             rewards_buf[step] = rewards
             dones_buf[step] = dones | truncateds
 
@@ -258,10 +267,11 @@ def train(args):
                     num_episodes += 1
                     env_ep_rewards[i] = 0
                     env_ep_lengths[i] = 0
-                    next_obs[i] = envs.reset_single(i)
+                    next_obs[i], next_masks[i] = envs.reset_single(i)
 
             global_step += args.num_envs
             obs = next_obs
+            action_masks = next_masks
 
         # Bootstrap values for last step
         with torch.no_grad():
@@ -277,6 +287,7 @@ def train(args):
         # Flatten (num_steps, num_envs, ...) -> (batch_size, ...)
         batch_size = args.rollout_steps * args.num_envs
         b_obs = torch.FloatTensor(obs_buf.reshape(batch_size, -1)).to(device)
+        b_masks = torch.FloatTensor(masks_buf.reshape(batch_size, -1)).to(device)
         b_actions = torch.FloatTensor(actions_buf.reshape(batch_size, -1)).to(device)
         b_logprobs = torch.FloatTensor(logprobs_buf.reshape(batch_size)).to(device)
         b_advantages = torch.FloatTensor(advantages.reshape(batch_size)).to(device)
@@ -294,7 +305,7 @@ def train(args):
                 mb_idx = indices[start:end]
 
                 _, new_log_probs, entropy, new_values = model.get_action_and_value(
-                    b_obs[mb_idx], b_actions[mb_idx]
+                    b_obs[mb_idx], b_actions[mb_idx], action_mask=b_masks[mb_idx]
                 )
 
                 ratio = torch.exp(new_log_probs - b_logprobs[mb_idx])
@@ -444,6 +455,6 @@ if __name__ == "__main__":
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
-    parser.add_argument("--hf-repo", default="JoshuaFreeman/openfront-rl-agent", help="HuggingFace repo for auto-push")
+    parser.add_argument("--hf-repo", default="mischievers/openfront-rl-agent", help="HuggingFace repo for auto-push")
     args = parser.parse_args()
     train(args)

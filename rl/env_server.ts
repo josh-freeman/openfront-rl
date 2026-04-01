@@ -277,6 +277,38 @@ function getObservation() {
     sampleTile !== null &&
     rlPlayer.canBuild(UnitType.Warship, sampleTile) !== false;
 
+  // Nuke affordability (need silo + gold)
+  const canAffordAtom = hasSilo && myGold >= 750_000;
+  const canAffordHBomb = hasSilo && myGold >= 5_000_000;
+  const canAffordMIRV = hasSilo && myGold >= 10_000_000;
+
+  const hasNeighbors = neighbors.length > 0;
+  const hasTroops = myTroops > 10;
+  const hasOutgoingAttacks = outgoing > 0;
+  const hasUnits = units.length > 0;
+
+  // Action mask: 17 booleans, true = action is valid right now
+  // Indices match env.py action IDs exactly
+  const actionMask = [
+    true, // 0: NOOP — always valid
+    hasNeighbors && hasTroops, // 1: ATTACK
+    hasNeighbors && hasTroops && hasPort, // 2: BOAT_ATTACK
+    hasOutgoingAttacks, // 3: RETREAT
+    canAffordCity, // 4: BUILD_CITY
+    canAffordFactory, // 5: BUILD_FACTORY
+    canAffordDefense, // 6: BUILD_DEFENSE
+    canAffordPort, // 7: BUILD_PORT
+    canAffordSAM, // 8: BUILD_SAM
+    canAffordSilo, // 9: BUILD_SILO
+    canAffordWarship && hasPort, // 10: BUILD_WARSHIP
+    canAffordAtom && hasNeighbors, // 11: LAUNCH_ATOM
+    canAffordHBomb && hasNeighbors, // 12: LAUNCH_HBOMB
+    canAffordMIRV && hasNeighbors, // 13: LAUNCH_MIRV
+    numWarships > 0 && hasNeighbors, // 14: MOVE_WARSHIP
+    hasUnits && myGold >= 50_000, // 15: UPGRADE (rough check)
+    hasUnits, // 16: DELETE_UNIT
+  ];
+
   return {
     tick: tickCount,
     alive,
@@ -307,6 +339,7 @@ function getObservation() {
     canAffordSilo,
     canAffordSAM,
     canAffordWarship,
+    actionMask,
   };
 }
 
@@ -444,8 +477,7 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
 
   switch (unitType) {
     case UnitType.City:
-    case UnitType.Factory: // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
-    {
+    case UnitType.Factory: { // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
       const safeTiles = scored.slice(Math.floor(scored.length * 0.8));
       if (safeTiles.length === 0)
         return scored[scored.length - 1]?.tile ?? null;
@@ -453,8 +485,7 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     case UnitType.DefensePost:
-    case UnitType.SAMLauncher: // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
-    {
+    case UnitType.SAMLauncher: { // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
       const lo = Math.floor(scored.length * 0.2);
       const hi = Math.floor(scored.length * 0.4);
       const defTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -463,7 +494,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
       return defTiles[Math.floor(Math.random() * defTiles.length)].tile;
     }
 
-    case UnitType.MissileSilo: { // Silos: medium distance, ~40-60% back from front
+    case UnitType.MissileSilo: {
+      // Silos: medium distance, ~40-60% back from front
       const lo = Math.floor(scored.length * 0.4);
       const hi = Math.floor(scored.length * 0.6);
       const siloTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -472,7 +504,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
       return siloTiles[Math.floor(Math.random() * siloTiles.length)].tile;
     }
 
-    case UnitType.Port: { // Ports need water adjacency — try multiple border tiles, canBuild will validate
+    case UnitType.Port: {
+      // Ports need water adjacency — try multiple border tiles, canBuild will validate
       const shuffled = [...scored].sort(() => Math.random() - 0.5);
       for (const s of shuffled.slice(0, 20)) {
         if (rlPlayer.canBuild(unitType, s.tile) !== false) {

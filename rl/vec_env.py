@@ -40,8 +40,8 @@ class VecOpenFrontEnv:
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
 
-        # 23 player stats + max_neighbors * 4 neighbor features
-        obs_size = 23 + max_neighbors * 4
+        # 16 player stats + max_neighbors * 4 neighbor features
+        obs_size = 16 + max_neighbors * 4
         self.obs_dim = obs_size
 
         self._procs: list[Optional[subprocess.Popen]] = [None] * num_envs
@@ -119,23 +119,23 @@ class VecOpenFrontEnv:
             vec[14] = -1.0
         vec[15] = float(obs.get("lastActionSucceeded", False))
 
-        # Affordability flags
-        vec[16] = float(obs.get("canAffordCity", False))
-        vec[17] = float(obs.get("canAffordDefense", False))
-        vec[18] = float(obs.get("canAffordFactory", False))
-        vec[19] = float(obs.get("canAffordPort", False))
-        vec[20] = float(obs.get("canAffordSilo", False))
-        vec[21] = float(obs.get("canAffordSAM", False))
-        vec[22] = float(obs.get("canAffordWarship", False))
-
         self._neighbors_caches[idx] = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 23 + i * 4
+            base = 16 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
             vec[base + 3] = float(n.get("alive", True))
         return vec
+
+    def _extract_action_mask(self, obs: dict) -> np.ndarray:
+        """Extract 17-element action mask from observation dict."""
+        mask = obs.get("actionMask", [True] * NUM_ACTIONS)
+        arr = np.array(mask[:NUM_ACTIONS], dtype=np.float32)
+        if len(arr) < NUM_ACTIONS:
+            arr = np.concatenate([arr, np.ones(NUM_ACTIONS - len(arr), dtype=np.float32)])
+        arr[0] = 1.0  # NOOP always valid
+        return arr
 
     def _decode_action(self, action: np.ndarray, idx: int) -> dict:
         action_type = int(action[0])
@@ -179,7 +179,8 @@ class VecOpenFrontEnv:
             return {"type": "delete_unit"}
         return {"type": "noop"}
 
-    def reset_single(self, idx: int) -> np.ndarray:
+    def reset_single(self, idx: int):
+        """Returns (obs_vec, action_mask)."""
         self._step_counts[idx] = 0
         map_name = random.choice(self.maps)
         try:
@@ -201,16 +202,19 @@ class VecOpenFrontEnv:
                     "difficulty": self.difficulty,
                 },
             })
-        return self._obs_to_vec(resp["obs"], idx)
+        return self._obs_to_vec(resp["obs"], idx), self._extract_action_mask(resp["obs"])
 
-    def reset_all(self) -> np.ndarray:
+    def reset_all(self):
+        """Returns (obs, masks) each shape (num_envs, ...)."""
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
+        masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
         for i in range(self.num_envs):
-            obs[i] = self.reset_single(i)
-        return obs
+            obs[i], masks[i] = self.reset_single(i)
+        return obs, masks
 
     def step(self, actions: np.ndarray):
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
+        masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         dones = np.zeros(self.num_envs, dtype=bool)
         truncateds = np.zeros(self.num_envs, dtype=bool)
@@ -227,16 +231,17 @@ class VecOpenFrontEnv:
                 })
             except (RuntimeError, BrokenPipeError):
                 dones[i] = True
-                obs[i] = self.reset_single(i)
+                obs[i], masks[i] = self.reset_single(i)
                 continue
 
             obs[i] = self._obs_to_vec(resp["obs"], i)
+            masks[i] = self._extract_action_mask(resp["obs"])
             rewards[i] = float(resp.get("reward", 0))
             dones[i] = bool(resp.get("done", False))
             truncateds[i] = self._step_counts[i] >= self.max_steps
             infos[i] = resp.get("info", {})
 
-        return obs, rewards, dones, truncateds, infos
+        return obs, masks, rewards, dones, truncateds, infos
 
     def close(self):
         for i, proc in enumerate(self._procs):
