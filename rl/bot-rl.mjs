@@ -24,6 +24,15 @@ puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 const BOT_NAME = process.argv[2] || "RLBot";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
 
+// Must match training: ticksPerStep (10) × turnIntervalMs (100) = 1000ms
+// This is defined in env_server.ts and env.py as ticks_per_step=10
+const TICKS_PER_STEP = 10;
+const TURN_INTERVAL_MS = 100;
+const POLICY_INTERVAL_MS = TICKS_PER_STEP * TURN_INTERVAL_MS; // 1000ms
+
+// Shared zoom state — used by randomBorder/randomInterior
+let currentZoomLevel = 8;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function log(msg) {
   const ts = new Date().toISOString().slice(11, 19);
@@ -510,7 +519,7 @@ async function main() {
   let currentAction = null;
   let lastRecenter = 0;
   let lastGold = 0;
-  let currentZoomLevel = 8; // how many zoom-in steps from default (set at spawn)
+  currentZoomLevel = 8; // reset at game start
   let lastTerritoryPct = 0;
   let spawnTime = 0;
 
@@ -671,8 +680,8 @@ async function main() {
         }
       }
 
-      // ── QUERY POLICY SERVER every ~1 second (matches training: 10 ticks × 100ms) ──
-      if (Date.now() - lastPolicyQuery > 1000) {
+      // ── QUERY POLICY SERVER (interval matches training: TICKS_PER_STEP × TURN_INTERVAL_MS) ──
+      if (Date.now() - lastPolicyQuery > POLICY_INTERVAL_MS) {
         lastPolicyQuery = Date.now();
 
         const gameState = await extractGameState(page);
