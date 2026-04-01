@@ -19,7 +19,10 @@ import json
 import random
 from pathlib import Path
 
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 AVAILABLE_MAPS = ["plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean"]
 
