@@ -97,12 +97,13 @@ class OpenFrontEnv(gym.Env):
         #   13: tickProgress (normalized by max ticks)
         #   14: lastBuildSuccess (1=success, 0=none, -1=fail)
         #   15: lastActionSucceeded (0/1)
+        #   16-22: canAfford flags (city, defense, factory, port, silo, SAM, warship)
         # Neighbor features (per neighbor):
         #   0: tiles (normalized)
         #   1: troops (normalized)
         #   2: relation (normalized)
         #   3: isAlive (0/1)
-        obs_size = 16 + max_neighbors * 4
+        obs_size = 23 + max_neighbors * 4
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -176,10 +177,19 @@ class OpenFrontEnv(gym.Env):
             vec[14] = -1.0  # any failure
         vec[15] = float(obs.get("lastActionSucceeded", False))
 
+        # Affordability flags — what can we actually build right now?
+        vec[16] = float(obs.get("canAffordCity", False))
+        vec[17] = float(obs.get("canAffordDefense", False))
+        vec[18] = float(obs.get("canAffordFactory", False))
+        vec[19] = float(obs.get("canAffordPort", False))
+        vec[20] = float(obs.get("canAffordSilo", False))
+        vec[21] = float(obs.get("canAffordSAM", False))
+        vec[22] = float(obs.get("canAffordWarship", False))
+
         # Neighbor features
         self._neighbors_cache = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 16 + i * 4
+            base = 23 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3

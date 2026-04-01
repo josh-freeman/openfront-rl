@@ -249,6 +249,34 @@ function getObservation() {
       u.type === UnitType.MIRV,
   ).length;
 
+  // Affordability flags — tell the model what it can actually build right now
+  // Uses canBuild on a random border tile as a proxy (checks gold + unit constraints)
+  const sampleTile =
+    borderTilesArr.length > 0
+      ? borderTilesArr[Math.floor(Math.random() * borderTilesArr.length)].ref
+      : null;
+  const canAffordCity =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.City, sampleTile) !== false;
+  const canAffordDefense =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.DefensePost, sampleTile) !== false;
+  const canAffordFactory =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.Factory, sampleTile) !== false;
+  const canAffordPort =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.Port, sampleTile) !== false;
+  const canAffordSilo =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.MissileSilo, sampleTile) !== false;
+  const canAffordSAM =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.SAMLauncher, sampleTile) !== false;
+  const canAffordWarship =
+    sampleTile !== null &&
+    rlPlayer.canBuild(UnitType.Warship, sampleTile) !== false;
+
   return {
     tick: tickCount,
     alive,
@@ -272,6 +300,13 @@ function getObservation() {
     numNukes,
     lastBuildResult,
     lastActionSucceeded,
+    canAffordCity,
+    canAffordDefense,
+    canAffordFactory,
+    canAffordPort,
+    canAffordSilo,
+    canAffordSAM,
+    canAffordWarship,
   };
 }
 
@@ -409,8 +444,7 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
 
   switch (unitType) {
     case UnitType.City:
-    case UnitType.Factory: // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
-    // Try top 20% farthest tiles, pick a random one from those
+    case UnitType.Factory: // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
     {
       const safeTiles = scored.slice(Math.floor(scored.length * 0.8));
       if (safeTiles.length === 0)
@@ -419,8 +453,7 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     case UnitType.DefensePost:
-    case UnitType.SAMLauncher: // Defensive buildings: near borders but not ON the border
-    // Pick tiles at 20-40% from the front (some buffer to finish building)
+    case UnitType.SAMLauncher: // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
     {
       const lo = Math.floor(scored.length * 0.2);
       const hi = Math.floor(scored.length * 0.4);
@@ -430,8 +463,7 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
       return defTiles[Math.floor(Math.random() * defTiles.length)].tile;
     }
 
-    case UnitType.MissileSilo: // Silos: medium distance, ~40-60% back from front
-    {
+    case UnitType.MissileSilo: { // Silos: medium distance, ~40-60% back from front
       const lo = Math.floor(scored.length * 0.4);
       const hi = Math.floor(scored.length * 0.6);
       const siloTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -440,8 +472,7 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
       return siloTiles[Math.floor(Math.random() * siloTiles.length)].tile;
     }
 
-    case UnitType.Port: // Ports need water adjacency — try multiple border tiles, canBuild will validate
-    {
+    case UnitType.Port: { // Ports need water adjacency — try multiple border tiles, canBuild will validate
       const shuffled = [...scored].sort(() => Math.random() - 0.5);
       for (const s of shuffled.slice(0, 20)) {
         if (rlPlayer.canBuild(unitType, s.tile) !== false) {
