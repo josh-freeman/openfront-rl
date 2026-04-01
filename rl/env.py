@@ -95,12 +95,14 @@ class OpenFrontEnv(gym.Env):
         #   11: numWarships (normalized)
         #   12: numNukes (normalized)
         #   13: tickProgress (normalized by max ticks)
+        #   14: lastBuildSuccess (1=success, 0=none, -1=fail)
+        #   15: lastActionSucceeded (0/1)
         # Neighbor features (per neighbor):
         #   0: tiles (normalized)
         #   1: troops (normalized)
         #   2: relation (normalized)
         #   3: isAlive (0/1)
-        obs_size = 14 + max_neighbors * 4
+        obs_size = 16 + max_neighbors * 4
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -164,10 +166,20 @@ class OpenFrontEnv(gym.Env):
         vec[12] = obs.get("numNukes", 0) / 5
         vec[13] = obs.get("tick", 0) / 100000
 
+        # Build feedback
+        build_result = obs.get("lastBuildResult", "none")
+        if build_result == "success":
+            vec[14] = 1.0
+        elif build_result == "none":
+            vec[14] = 0.0
+        else:
+            vec[14] = -1.0  # any failure
+        vec[15] = float(obs.get("lastActionSucceeded", False))
+
         # Neighbor features
         self._neighbors_cache = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 14 + i * 4
+            base = 16 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3

@@ -270,6 +270,8 @@ function getObservation() {
     hasSAM,
     numWarships,
     numNukes,
+    lastBuildResult,
+    lastActionSucceeded,
   };
 }
 
@@ -349,8 +351,116 @@ function findClosestBorderTile(target: Player): TileRef | null {
   return bestTile;
 }
 
+// Track build outcomes so the model can learn what works
+let lastBuildResult:
+  | "success"
+  | "invalid_tile"
+  | "no_tile"
+  | "no_port"
+  | "no_gold"
+  | "none" = "none";
+let lastActionSucceeded = false;
+
+/**
+ * Pick the best tile for building a given unit type.
+ * - Cities/Factories: far from borders (safe interior) for economy
+ * - DefensePost/SAMLauncher: near borders but ~3-5 tiles back (time to build before enemy reaches)
+ * - MissileSilo: medium distance from border (protected but in range)
+ * - Port: needs to be near water (handled by canBuild)
+ */
+function pickBuildTile(unitType: UnitType): TileRef | null {
+  if (!game || !rlPlayer) return null;
+
+  const borders = Array.from(rlPlayer.borderTiles());
+  if (borders.length === 0) return null;
+
+  // Compute distance from each border tile to nearest enemy border
+  // We'll use this to rank tiles
+  const enemyBorders: TileRef[] = [];
+  for (const n of rlPlayer.neighbors()) {
+    if (n.isPlayer()) {
+      const nb = Array.from((n as Player).borderTiles());
+      for (let i = 0; i < Math.min(nb.length, 50); i++) {
+        enemyBorders.push(nb[i]);
+      }
+    }
+  }
+
+  // Score each of our border tiles by distance to nearest enemy
+  const scored = borders.map((t) => {
+    let minEnemyDist = Infinity;
+    for (const eb of enemyBorders) {
+      const d = game!.manhattanDist(t, eb);
+      if (d < minEnemyDist) minEnemyDist = d;
+    }
+    // If no enemies, use distance from map center as proxy
+    if (minEnemyDist === Infinity) {
+      const cx = game!.width() / 2;
+      const cy = game!.height() / 2;
+      const tx = game!.x(t);
+      const ty = game!.y(t);
+      minEnemyDist = Math.abs(tx - cx) + Math.abs(ty - cy);
+    }
+    return { tile: t, dist: minEnemyDist };
+  });
+
+  // Sort by distance to enemy
+  scored.sort((a, b) => a.dist - b.dist);
+
+  switch (unitType) {
+    case UnitType.City:
+    case UnitType.Factory: // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
+    // Try top 20% farthest tiles, pick a random one from those
+    {
+      const safeTiles = scored.slice(Math.floor(scored.length * 0.8));
+      if (safeTiles.length === 0)
+        return scored[scored.length - 1]?.tile ?? null;
+      return safeTiles[Math.floor(Math.random() * safeTiles.length)].tile;
+    }
+
+    case UnitType.DefensePost:
+    case UnitType.SAMLauncher: // Defensive buildings: near borders but not ON the border
+    // Pick tiles at 20-40% from the front (some buffer to finish building)
+    {
+      const lo = Math.floor(scored.length * 0.2);
+      const hi = Math.floor(scored.length * 0.4);
+      const defTiles = scored.slice(lo, Math.max(hi, lo + 1));
+      if (defTiles.length === 0)
+        return scored[Math.floor(scored.length * 0.3)]?.tile ?? null;
+      return defTiles[Math.floor(Math.random() * defTiles.length)].tile;
+    }
+
+    case UnitType.MissileSilo: // Silos: medium distance, ~40-60% back from front
+    {
+      const lo = Math.floor(scored.length * 0.4);
+      const hi = Math.floor(scored.length * 0.6);
+      const siloTiles = scored.slice(lo, Math.max(hi, lo + 1));
+      if (siloTiles.length === 0)
+        return scored[Math.floor(scored.length * 0.5)]?.tile ?? null;
+      return siloTiles[Math.floor(Math.random() * siloTiles.length)].tile;
+    }
+
+    case UnitType.Port: // Ports need water adjacency — try multiple border tiles, canBuild will validate
+    {
+      const shuffled = [...scored].sort(() => Math.random() - 0.5);
+      for (const s of shuffled.slice(0, 20)) {
+        if (rlPlayer.canBuild(unitType, s.tile) !== false) {
+          return s.tile;
+        }
+      }
+      return scored[0]?.tile ?? null;
+    }
+
+    default:
+      // Fallback: random border tile
+      return borders[Math.floor(Math.random() * borders.length)];
+  }
+}
+
 function executeAction(action: RLAction) {
   if (!game || !rlPlayer || !rlPlayer.isAlive()) return;
+  lastBuildResult = "none";
+  lastActionSucceeded = false;
 
   switch (action.type) {
     case "attack": {
@@ -369,6 +479,7 @@ function executeAction(action: RLAction) {
       game.addExecution(
         new AttackExecution(troops, rlPlayer, target.id(), tile, true),
       );
+      lastActionSucceeded = true;
       break;
     }
 
@@ -388,6 +499,7 @@ function executeAction(action: RLAction) {
       const portTile = ports[0].tile();
 
       game.addExecution(new TransportShipExecution(rlPlayer, portTile, troops));
+      lastActionSucceeded = true;
       break;
     }
 
@@ -398,6 +510,7 @@ function executeAction(action: RLAction) {
       const attack = attacks[attacks.length - 1];
       if (!attack.retreating()) {
         game.addExecution(new RetreatExecution(rlPlayer, attack.id()));
+        lastActionSucceeded = true;
       }
       break;
     }
@@ -421,22 +534,35 @@ function executeAction(action: RLAction) {
         const ports = rlPlayer
           .units()
           .filter((u) => u.type() === UnitType.Port);
-        if (ports.length === 0) break;
+        if (ports.length === 0) {
+          lastBuildResult = "no_port";
+          break;
+        }
         const canBuild = rlPlayer.canBuild(ut, ports[0].tile());
         if (canBuild !== false) {
           game.addExecution(new ConstructionExecution(rlPlayer, ut, canBuild));
+          lastBuildResult = "success";
+          lastActionSucceeded = true;
+        } else {
+          lastBuildResult = "invalid_tile";
         }
         break;
       }
 
-      // Pick a random interior tile for building
-      const borders = Array.from(rlPlayer.borderTiles());
-      if (borders.length === 0) break;
-      const tile = borders[Math.floor(Math.random() * borders.length)];
+      // Smart tile selection based on unit type
+      const tile = pickBuildTile(ut);
+      if (!tile) {
+        lastBuildResult = "no_tile";
+        break;
+      }
 
       const canBuild = rlPlayer.canBuild(ut, tile);
       if (canBuild !== false) {
         game.addExecution(new ConstructionExecution(rlPlayer, ut, canBuild));
+        lastBuildResult = "success";
+        lastActionSucceeded = true;
+      } else {
+        lastBuildResult = "invalid_tile";
       }
       break;
     }
@@ -470,6 +596,7 @@ function executeAction(action: RLAction) {
       game.addExecution(
         new NukeExecution(nukeUt as any, rlPlayer, dst, silos[0].tile()),
       );
+      lastActionSucceeded = true;
       break;
     }
 
@@ -491,6 +618,7 @@ function executeAction(action: RLAction) {
       game.addExecution(
         new MoveWarshipExecution(rlPlayer, warships[0].id(), dst),
       );
+      lastActionSucceeded = true;
       break;
     }
 
@@ -500,6 +628,7 @@ function executeAction(action: RLAction) {
       for (const u of units) {
         if (rlPlayer.canUpgradeUnit(u)) {
           game.addExecution(new UpgradeStructureExecution(rlPlayer, u.id()));
+          lastActionSucceeded = true;
           break;
         }
       }
@@ -514,12 +643,14 @@ function executeAction(action: RLAction) {
         game.addExecution(
           new DeleteUnitExecution(rlPlayer, units[units.length - 1].id()),
         );
+        lastActionSucceeded = true;
       }
       break;
     }
 
     case "noop":
     default:
+      lastActionSucceeded = true; // noop always "succeeds"
       break;
   }
 }

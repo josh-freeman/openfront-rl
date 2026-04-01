@@ -102,7 +102,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
         obs_dict = json.loads(body)
 
         # Convert observation dict to vector (same as env.py)
-        obs_vec = np.zeros(78, dtype=np.float32)  # 14 + 16*4
+        obs_vec = np.zeros(80, dtype=np.float32)  # 16 + 16*4
         total = max(obs_dict.get("totalMapTiles", 1), 1)
         obs_vec[0] = obs_dict.get("myTiles", 0) / total
         obs_vec[1] = obs_dict.get("myTroops", 0) / 100000
@@ -119,8 +119,19 @@ class PolicyHandler(BaseHTTPRequestHandler):
         obs_vec[11] = obs_dict.get("numWarships", 0) / 5
         obs_vec[12] = obs_dict.get("numNukes", 0) / 5
         obs_vec[13] = obs_dict.get("tick", 0) / 100000
+
+        # Build feedback
+        build_result = obs_dict.get("lastBuildResult", "none")
+        if build_result == "success":
+            obs_vec[14] = 1.0
+        elif build_result == "none":
+            obs_vec[14] = 0.0
+        else:
+            obs_vec[14] = -1.0
+        obs_vec[15] = float(obs_dict.get("lastActionSucceeded", False))
+
         for i, n in enumerate(neighbors[:16]):
-            base = 14 + i * 4
+            base = 16 + i * 4
             obs_vec[base] = n.get("tiles", 0) / total
             obs_vec[base + 1] = n.get("troops", 0) / 100000
             obs_vec[base + 2] = n.get("relation", 0) / 3
@@ -155,7 +166,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
 
 def serve_policy(args):
     """Run HTTP policy server for live Puppeteer bot play."""
-    model, device = load_model(args.model, 78)
+    model, device = load_model(args.model, 80)
     PolicyHandler.model = model
     PolicyHandler.device = device
 
