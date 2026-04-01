@@ -15,7 +15,12 @@ from collections import deque
 import time
 import argparse
 import json
+import random
 from pathlib import Path
+
+import wandb
+
+AVAILABLE_MAPS = ["plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean"]
 
 from env import OpenFrontEnv, NUM_ACTIONS
 
@@ -131,6 +136,17 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     return advantages, returns
 
 
+def find_latest_checkpoint(save_dir: Path):
+    """Find the checkpoint with the highest episode number."""
+    ckpts = list(save_dir.glob("checkpoint_*.pt"))
+    if not ckpts:
+        return None
+    # Extract episode numbers and find max
+    def ep_num(p):
+        return int(p.stem.split("_")[1])
+    return max(ckpts, key=ep_num)
+
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -154,13 +170,54 @@ def train(args):
     episode_lengths = deque(maxlen=100)
     best_reward = -float("inf")
     log_entries = []
+    start_episode = 0
+    global_step = 0
 
-    print(f"Training PPO on map={args.map}, opponents={args.opponents}")
+    # Resume from checkpoint if requested
+    if args.resume:
+        state_path = save_dir / "state.json"
+        ckpt = find_latest_checkpoint(save_dir)
+        if ckpt is not None:
+            print(f"Resuming from checkpoint: {ckpt}")
+            checkpoint = torch.load(ckpt, map_location=device, weights_only=True)
+            model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_episode = checkpoint["episode"]
+            global_step = checkpoint["global_step"]
+
+            # Restore best_reward from state.json
+            if state_path.exists():
+                with open(state_path) as f:
+                    state = json.load(f)
+                best_reward = state.get("best_reward", -float("inf"))
+
+            # Restore training log
+            log_path = save_dir / "training_log.json"
+            if log_path.exists():
+                with open(log_path) as f:
+                    log_entries = json.load(f)
+
+            print(f"Resumed at episode={start_episode}, global_step={global_step}, best_reward={best_reward:.2f}")
+        else:
+            print("No checkpoint found, starting fresh.")
+
+    maps = args.maps.split(",")
+
+    # Initialize wandb
+    wandb.init(
+        project="openfront-rl",
+        config=vars(args),
+        resume="allow",
+    )
+    wandb.config.update({"obs_dim": obs_dim, "maps": maps}, allow_val_change=True)
+
+    print(f"Training PPO on maps={maps}, opponents={args.opponents}")
     print(f"obs_dim={obs_dim}, device={device}")
     print(f"Saving checkpoints to {save_dir}")
 
-    global_step = 0
-    for episode in range(args.num_episodes):
+    for episode in range(start_episode, args.num_episodes):
+        # Randomize map each episode
+        env.map_name = random.choice(maps)
         obs, info = env.reset()
         buffer = RolloutBuffer()
         ep_reward = 0
@@ -250,6 +307,17 @@ def train(args):
                 "loss": float(loss.item()),
             }
             log_entries.append(entry)
+            wandb.log({
+                "episode": episode + 1,
+                "global_step": global_step,
+                "reward/mean": float(mean_r),
+                "reward/episode": float(ep_reward),
+                "episode_length": float(mean_l),
+                "loss/total": float(loss.item()),
+                "loss/policy": float(policy_loss.item()),
+                "loss/value": float(value_loss.item()),
+                "loss/entropy": float(entropy_loss.item()),
+            }, step=global_step)
             print(
                 f"[ep {episode+1}/{args.num_episodes}] "
                 f"reward={mean_r:.2f} len={mean_l:.0f} loss={loss.item():.4f} "
@@ -269,11 +337,20 @@ def train(args):
                 ckpt_path,
             )
 
-            # Save best
+            # Save best — only overwrite if actually better
             mean_r = np.mean(episode_rewards) if episode_rewards else -float("inf")
             if mean_r > best_reward:
                 best_reward = mean_r
                 torch.save(model.state_dict(), save_dir / "best_model.pt")
+                print(f"  New best model saved (reward={best_reward:.2f})")
+
+            # Save state.json for resume
+            with open(save_dir / "state.json", "w") as f:
+                json.dump({
+                    "episode": episode + 1,
+                    "global_step": global_step,
+                    "best_reward": float(best_reward),
+                }, f, indent=2)
 
             # Save log
             with open(save_dir / "training_log.json", "w") as f:
@@ -285,12 +362,23 @@ def train(args):
         json.dump(log_entries, f, indent=2)
 
     env.close()
+    wandb.finish()
     print(f"Training complete. Best reward: {best_reward:.2f}")
+
+    # Auto-push to HuggingFace
+    if (save_dir / "best_model.pt").exists():
+        try:
+            from push_to_hf import push as hf_push
+            hf_args = argparse.Namespace(repo=args.hf_repo, checkpoint_dir=str(save_dir))
+            hf_push(hf_args)
+        except Exception as e:
+            print(f"HuggingFace push failed (non-fatal): {e}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train OpenFront RL agent with PPO")
-    parser.add_argument("--map", default="plains", help="Map name")
+    parser.add_argument("--map", default="plains", help="Map for env init")
+    parser.add_argument("--maps", default=",".join(AVAILABLE_MAPS), help="Comma-separated maps to randomly sample each episode")
     parser.add_argument("--opponents", type=int, default=3)
     parser.add_argument("--difficulty", default="Medium")
     parser.add_argument("--ticks-per-step", type=int, default=10)
@@ -307,5 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--save-dir", default="./checkpoints")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--hf-repo", default="JoshuaFreeman/openfront-rl-agent", help="HuggingFace repo for auto-push")
     args = parser.parse_args()
     train(args)

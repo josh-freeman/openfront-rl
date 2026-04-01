@@ -22,5 +22,7 @@ eslint_out.txt
 # RL training artifacts
 rl/checkpoints/
 rl/__pycache__/
+rl/wandb/
+.venv/
 *.pt
 *.pth

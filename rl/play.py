@@ -38,7 +38,7 @@ def load_model(model_path: str, obs_dim: int, max_neighbors: int = 8):
 
 
 def play_headless(args):
-    """Play a full game headlessly and print results."""
+    """Play multiple games headlessly and report aggregate stats."""
     env = OpenFrontEnv(
         map_name=args.map,
         num_opponents=args.opponents,
@@ -48,30 +48,45 @@ def play_headless(args):
     obs_dim = env.observation_space.shape[0]
     model, device = load_model(args.model, obs_dim)
 
-    obs, info = env.reset()
-    total_reward = 0
-    steps = 0
+    wins = 0
+    survival_steps = []
+    territory_pcts = []
 
-    while True:
-        obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
-        with torch.no_grad():
-            action, _, _, value = model.get_action_and_value(obs_t)
-        action_np = action.squeeze(0).cpu().numpy()
+    for game in range(args.num_games):
+        obs, info = env.reset()
+        total_reward = 0
+        steps = 0
+        max_territory = 0
 
-        obs, reward, done, truncated, info = env.step(action_np)
-        total_reward += reward
-        steps += 1
+        while True:
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                action, _, _, value = model.get_action_and_value(obs_t)
+            action_np = action.squeeze(0).cpu().numpy()
 
-        if steps % 100 == 0:
-            print(f"  Step {steps}: reward={total_reward:.2f}, info={info}")
+            obs, reward, done, truncated, info = env.step(action_np)
+            total_reward += reward
+            steps += 1
+            territory = info.get("territoryPct", obs[3])
+            if territory > max_territory:
+                max_territory = territory
 
-        if done or truncated:
-            break
+            if done or truncated:
+                break
 
-    print(f"\nGame over after {steps} steps")
-    print(f"Total reward: {total_reward:.2f}")
-    print(f"Winner: {info.get('winner', 'none')}")
-    print(f"We won: {info.get('weWon', False)}")
+        won = info.get("weWon", False)
+        if won:
+            wins += 1
+        survival_steps.append(steps)
+        territory_pcts.append(max_territory)
+        print(f"  Game {game+1}/{args.num_games}: steps={steps}, reward={total_reward:.2f}, won={won}, territory={max_territory:.1%}")
+
+    print(f"\n{'='*50}")
+    print(f"Evaluation: {args.num_games} games on map={args.map}, opponents={args.opponents}")
+    print(f"  Win rate:          {wins}/{args.num_games} ({wins/args.num_games:.1%})")
+    print(f"  Avg survival:      {np.mean(survival_steps):.0f} steps")
+    print(f"  Avg max territory: {np.mean(territory_pcts):.1%}")
+    print(f"{'='*50}")
     env.close()
 
 
@@ -151,6 +166,7 @@ if __name__ == "__main__":
     parser.add_argument("--difficulty", default="Medium")
     parser.add_argument("--ticks-per-step", type=int, default=10)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--num-games", type=int, default=10, help="Number of games for headless evaluation")
     args = parser.parse_args()
 
     if args.mode == "headless":

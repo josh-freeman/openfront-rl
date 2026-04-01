@@ -1,0 +1,122 @@
+"""
+Push trained OpenFront RL model to HuggingFace Hub.
+
+Usage:
+  python push_to_hf.py --repo josh-freeman/openfront-rl-agent
+"""
+
+import argparse
+import json
+from pathlib import Path
+from huggingface_hub import HfApi, create_repo
+
+
+def create_model_card(checkpoint_dir: Path) -> str:
+    """Generate a model card from training state and logs."""
+    state = {}
+    state_path = checkpoint_dir / "state.json"
+    if state_path.exists():
+        with open(state_path) as f:
+            state = json.load(f)
+
+    log_path = checkpoint_dir / "training_log.json"
+    final_metrics = {}
+    if log_path.exists():
+        with open(log_path) as f:
+            logs = json.load(f)
+        if logs:
+            final_metrics = logs[-1]
+
+    return f"""---
+license: mit
+tags:
+  - reinforcement-learning
+  - ppo
+  - openfront
+  - game-ai
+---
+
+# OpenFront RL Agent
+
+PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territory control game.
+
+## Training Details
+
+- **Algorithm:** PPO (Proximal Policy Optimization)
+- **Architecture:** Actor-Critic with shared backbone (256→256→128)
+- **Map:** world
+- **Opponents:** 5 bots
+- **Episodes trained:** {state.get('episode', 'N/A')}
+- **Global steps:** {state.get('global_step', 'N/A')}
+- **Best mean reward:** {state.get('best_reward', 'N/A')}
+
+## Final Training Metrics
+
+- **Mean reward:** {final_metrics.get('mean_reward', 'N/A')}
+- **Mean episode length:** {final_metrics.get('mean_length', 'N/A')}
+- **Loss:** {final_metrics.get('loss', 'N/A')}
+
+## Usage
+
+```python
+from train import ActorCritic
+import torch
+
+model = ActorCritic(obs_dim=32, max_neighbors=8)
+model.load_state_dict(torch.load("best_model.pt", weights_only=True))
+model.eval()
+```
+
+## Repository
+
+Trained from [josh-freeman/openfront-rl](https://github.com/josh-freeman/openfront-rl).
+"""
+
+
+def push(args):
+    checkpoint_dir = Path(args.checkpoint_dir)
+    api = HfApi()
+
+    # Create repo if it doesn't exist
+    create_repo(args.repo, exist_ok=True)
+
+    # Upload best model
+    best_model = checkpoint_dir / "best_model.pt"
+    if not best_model.exists():
+        print(f"ERROR: {best_model} not found. Train first.")
+        return
+
+    print(f"Uploading {best_model} to {args.repo}...")
+    api.upload_file(
+        path_or_fileobj=str(best_model),
+        path_in_repo="best_model.pt",
+        repo_id=args.repo,
+    )
+
+    # Upload training log
+    log_path = checkpoint_dir / "training_log.json"
+    if log_path.exists():
+        print(f"Uploading {log_path}...")
+        api.upload_file(
+            path_or_fileobj=str(log_path),
+            path_in_repo="training_log.json",
+            repo_id=args.repo,
+        )
+
+    # Upload model card
+    card = create_model_card(checkpoint_dir)
+    api.upload_file(
+        path_or_fileobj=card.encode(),
+        path_in_repo="README.md",
+        repo_id=args.repo,
+    )
+
+    print(f"Done! Model at https://huggingface.co/{args.repo}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Push trained model to HuggingFace")
+    parser.add_argument("--repo", default="JoshuaFreeman/openfront-rl-agent")
+    parser.add_argument("--checkpoint-dir", default="./checkpoints")
+    args = parser.parse_args()
+    push(args)
