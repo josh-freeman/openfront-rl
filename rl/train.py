@@ -385,6 +385,16 @@ def train(args):
                     "global_step": global_step,
                     "num_episodes": num_episodes,
                     "best_reward": float(best_reward),
+                    "config": {
+                        "maps": maps,
+                        "opponents": args.opponents,
+                        "difficulty": args.difficulty,
+                        "obs_dim": obs_dim,
+                        "max_neighbors": max_neighbors,
+                        "num_envs": args.num_envs,
+                        "lr": args.lr,
+                        "rollout_steps": args.rollout_steps,
+                    },
                 }, f, indent=2)
 
             with open(save_dir / "training_log.json", "w") as f:

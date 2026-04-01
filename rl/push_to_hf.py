@@ -27,6 +27,19 @@ def create_model_card(checkpoint_dir: Path) -> str:
         if logs:
             final_metrics = logs[-1]
 
+    # Pull config from state.json (saved by train.py)
+    config = state.get("config", {})
+    maps = config.get("maps", "N/A")
+    if isinstance(maps, list):
+        maps = ", ".join(maps)
+    opponents = config.get("opponents", "N/A")
+    difficulty = config.get("difficulty", "N/A")
+    obs_dim = config.get("obs_dim", "N/A")
+    max_neighbors = config.get("max_neighbors", "N/A")
+    num_envs = config.get("num_envs", "N/A")
+    lr = config.get("lr", "N/A")
+    rollout_steps = config.get("rollout_steps", "N/A")
+
     return f"""---
 license: mit
 tags:
@@ -44,9 +57,14 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 
 - **Algorithm:** PPO (Proximal Policy Optimization)
 - **Architecture:** Actor-Critic with shared backbone (256→256→128)
-- **Map:** world
-- **Opponents:** 5 bots
-- **Episodes trained:** {state.get('episode', 'N/A')}
+- **Observation dim:** {obs_dim}
+- **Max neighbors:** {max_neighbors}
+- **Maps:** {maps} (random per episode)
+- **Opponents:** {opponents} {difficulty} bots
+- **Parallel envs:** {num_envs}
+- **Learning rate:** {lr}
+- **Rollout steps:** {rollout_steps}
+- **Updates trained:** {state.get('update', 'N/A')}
 - **Global steps:** {state.get('global_step', 'N/A')}
 - **Best mean reward:** {state.get('best_reward', 'N/A')}
 
@@ -62,7 +80,7 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 from train import ActorCritic
 import torch
 
-model = ActorCritic(obs_dim=78, max_neighbors=16)
+model = ActorCritic(obs_dim={obs_dim}, max_neighbors={max_neighbors})
 model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 model.eval()
 ```
