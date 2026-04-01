@@ -479,7 +479,7 @@ if __name__ == "__main__":
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=256)
     parser.add_argument("--vf-coef", type=float, default=0.5)
-    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--ent-coef", type=float, default=0.03)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--anneal-lr", action="store_true", help="Linear LR annealing to zero")
     parser.add_argument("--curriculum", action="store_true", help="Curriculum learning: ramp difficulty/opponents over training")

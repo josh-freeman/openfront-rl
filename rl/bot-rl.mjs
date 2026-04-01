@@ -21,7 +21,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 puppeteer.use(StealthPlugin());
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
-const BOT_NAME = process.argv[2] || "RLBot";
+const BOT_NAME = process.argv[2] || "xXDarkLord42Xx";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
 
 // Must match training: ticksPerStep (10) × turnIntervalMs (100) = 1000ms
@@ -30,8 +30,11 @@ const TICKS_PER_STEP = 10;
 const TURN_INTERVAL_MS = 100;
 const POLICY_INTERVAL_MS = TICKS_PER_STEP * TURN_INTERVAL_MS; // 1000ms
 
-// Shared zoom state — used by randomBorder/randomInterior
-let currentZoomLevel = 8;
+// Track actual game scale (game default is 1.8, range [0.2, 20])
+// The game zooms via: scale /= (1 + delta/600), clamped to [0.2, 20]
+let currentScale = 1.8;
+let lastGold = 0;
+let lastTerritoryPct = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function log(msg) {
@@ -94,7 +97,30 @@ async function joinGame(page) {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
-  await sleep(8000);
+  await sleep(5000);
+
+  // Set our bot name so we can identify ourselves on the leaderboard
+  await safeEval(
+    page,
+    (name) => {
+      const input = document.querySelector("username-input");
+      if (input) {
+        input.baseUsername = name;
+        // Also set any underlying input field
+        const textInput =
+          input.querySelector("input[type='text']") ||
+          input.querySelector("input");
+        if (textInput) {
+          textInput.value = name;
+          textInput.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        console.log("Set bot name to:", name);
+      }
+    },
+    BOT_NAME,
+  );
+  log(`Set player name to "${BOT_NAME}"`);
+  await sleep(3000);
   await snap(page, "01-lobby");
 
   const cardClicked = await safeEval(page, () => {
@@ -259,43 +285,132 @@ async function getCanvasBounds(page) {
   return box;
 }
 
-// Get the "safe zone" — the game area excluding HUD overlays and ad zones
+// Get the "safe zone" — game area excluding UI overlays:
+// - Top-left: leaderboard (~15% width, ~30% height)
+// - Bottom-left: ad banner (~15% width, ~30% height)
+// - Top-right: settings/clock (~10% width)
+// - Bottom: HUD bar (~15% height)
 function getSafeZone(box) {
   return {
-    left: box.x + box.width * 0.05,
-    right: box.x + box.width * 0.95,
+    left: box.x + box.width * 0.15, // clear of leaderboard + ad
+    right: box.x + box.width * 0.9, // clear of settings gear
     top: box.y + box.height * 0.05,
-    bottom: box.y + box.height * 0.8, // bottom 20% is HUD
-    cx: box.x + box.width / 2,
-    cy: box.y + box.height * 0.45, // slightly above center to avoid HUD
-    width: box.width,
-    height: box.height,
+    bottom: box.y + box.height * 0.82, // clear of bottom HUD
+    cx: box.x + box.width * 0.52, // slightly right of center (away from leaderboard)
+    cy: box.y + box.height * 0.42, // slightly above center (away from HUD)
+    width: box.width * 0.75, // effective playable width
+    height: box.height * 0.77, // effective playable height
   };
 }
 
-// Zoom-dependent spread: at max zoom (8), territory is tiny on screen.
-// At low zoom (0), territory fills much more of the screen.
-function getSpread(zoomLevel) {
-  // zoomLevel 8 → spread 0.05, zoomLevel 0 → spread 0.30
-  return 0.05 + (8 - Math.min(zoomLevel, 8)) * 0.03125;
+// Ensure the canvas has focus so keyboard events reach the game.
+// Clicks near center — this also sends troops, which is fine.
+async function focusCanvas(page) {
+  const canvas = await page.$("canvas");
+  if (canvas) {
+    await canvas.focus().catch(() => {});
+    // Also click to ensure the game's event handlers see activity
+    const box = await canvas.boundingBox();
+    if (box) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      await sleep(50);
+    }
+  }
 }
 
-// Generate a random point in our "interior" (tight around center after 'c')
-function randomInterior(zone, zoomLevel) {
-  const spread = getSpread(zoomLevel !== undefined ? zoomLevel : 8) * 0.7;
+// Center camera on our territory.
+// Strategy: try clicking our row in the leaderboard (reliable), fall back to 'c' key.
+async function centerCamera(page) {
+  // Method 1: Find our name in the leaderboard and click it
+  const clicked = await safeEval(
+    page,
+    (botName) => {
+      // The leaderboard rows contain player names. Find ours and click it.
+      for (const el of document.querySelectorAll("*")) {
+        const text = el.textContent?.trim() || "";
+        const r = el.getBoundingClientRect();
+        // Leaderboard is in the top-left, rows are narrow
+        if (r.x > window.innerWidth * 0.3 || r.y > window.innerHeight * 0.6)
+          continue;
+        if (r.width < 50 || r.height < 10 || r.height > 40) continue;
+        if (text.includes(botName)) {
+          el.click();
+          return {
+            x: r.x + r.width / 2,
+            y: r.y + r.height / 2,
+            method: "leaderboard",
+          };
+        }
+      }
+      return null;
+    },
+    BOT_NAME,
+  );
+
+  if (clicked) {
+    log(`Center: clicked leaderboard row for "${BOT_NAME}"`);
+    await sleep(800);
+    return;
+  }
+
+  // Method 2: Fall back to 'c' key
+  await focusCanvas(page);
+  await page.keyboard.press("c").catch(() => {});
+  await sleep(800);
+  log("Center: used 'c' key fallback");
+}
+
+// ── Zoom helpers ──────────────────────────────────────────────────
+// Apply a single zoom step matching the game's formula:
+//   scale /= (1 + delta/600), clamped [0.2, 20]
+// Use small deltas (~100) for ~20% zoom per step, NOT 500 (which is 6x per step!).
+async function zoomStep(page, delta) {
+  const box = await getCanvasBounds(page);
+  if (!box) return;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel({ deltaY: delta });
+  const zoomFactor = 1 + delta / 600;
+  currentScale = Math.max(0.2, Math.min(20, currentScale / zoomFactor));
+  await sleep(80);
+}
+
+// Estimate what fraction of the screen our territory occupies (after 'c' centering).
+// At min zoom (scale 0.2) the full map fills the screen, so territory linear fraction
+// ≈ sqrt(territoryPct). At higher scales we see less map, so territory appears bigger.
+// Result is territory's approximate linear fraction of the viewport (0 to ~1).
+function territoryScreenFraction() {
+  let tPct = lastTerritoryPct;
+  if (tPct < 0.0001) {
+    // HUD shows 0.0% for small nations — use gold as very conservative proxy.
+    // A nation earning 1K/s with 100K gold has been alive ~100s and probably
+    // owns ~0.002% of a large map. Be conservative to keep clicks tight.
+    tPct = Math.min(0.01, lastGold / 50_000_000);
+  }
+  const linear = Math.sqrt(Math.max(tPct, 0.00001));
+  // Calibration: at scale 5.4, 0.01% territory → sqrt(0.0001)*5.4*2 = 0.108 → 11%
+  // at scale 5.4, 0.1% territory → sqrt(0.001)*5.4*2 = 0.34 → 34%
+  // at scale 1.8, 1% territory → sqrt(0.01)*1.8*2 = 0.36 → 36%
+  return Math.min(0.4, linear * currentScale * 2);
+}
+
+// Generate a random point well inside our territory (tight around center after 'c')
+function randomInterior(zone) {
+  const frac = territoryScreenFraction();
+  // Stay at 40% of territory radius — guaranteed to be ours
+  const spread = Math.max(0.01, frac * 0.4);
   return {
     x: zone.cx + (Math.random() - 0.5) * zone.width * spread * 2,
     y: zone.cy + (Math.random() - 0.5) * zone.height * spread * 2,
   };
 }
 
-// Generate a random point just outside our territory (for expansion/attacks)
-// After 'c' centers us, our territory is at center. Just outside = wilderness/enemies.
-function randomBorder(zone, zoomLevel) {
-  const spread = getSpread(zoomLevel !== undefined ? zoomLevel : 8);
+// Generate a random point at/beyond our border (for expansion/attacks)
+function randomBorder(zone) {
+  const frac = territoryScreenFraction();
+  const spread = Math.max(0.03, frac);
   const angle = Math.random() * Math.PI * 2;
-  // Ring just beyond territory edge
-  const dist = spread + Math.random() * spread * 0.5;
+  // Ring around the edge of territory, extending slightly beyond
+  const dist = spread * (0.8 + Math.random() * 0.5);
   const x = zone.cx + Math.cos(angle) * zone.width * dist;
   const y = zone.cy + Math.sin(angle) * zone.height * dist;
   return {
@@ -354,7 +469,7 @@ async function executeRLAction(page, action, zone, goldAmount) {
   if (actionType === ACTION_NOOP) {
     // Expand into borders — click on border ring
     for (let i = 0; i < 5; i++) {
-      const { x, y } = randomBorder(zone, currentZoomLevel);
+      const { x, y } = randomBorder(zone);
       await page.mouse.click(x, y);
       await sleep(50);
     }
@@ -365,7 +480,7 @@ async function executeRLAction(page, action, zone, goldAmount) {
     // Click on enemy territory (outer ring beyond our borders)
     const nClicks = Math.max(5, Math.floor(15 * troopFraction));
     for (let i = 0; i < nClicks; i++) {
-      const { x, y } = randomBorder(zone, currentZoomLevel); // Click borders to expand into enemies
+      const { x, y } = randomBorder(zone); // Click borders to expand into enemies
       await page.mouse.click(x, y);
       await sleep(30);
     }
@@ -381,29 +496,60 @@ async function executeRLAction(page, action, zone, goldAmount) {
         `RL: Skip build ${name} — need ${(minGold / 1000).toFixed(0)}K gold, have ${(gold / 1000).toFixed(0)}K. Expanding instead.`,
       );
       for (let i = 0; i < 5; i++) {
-        const { x, y } = randomBorder(zone, currentZoomLevel);
+        const { x, y } = randomBorder(zone);
         await page.mouse.click(x, y);
         await sleep(50);
       }
       return;
     }
 
-    // Pick a spot inside our territory (near center)
-    const spot = randomInterior(zone, currentZoomLevel);
+    // Center camera so TRUE screen center = our territory
+    await centerCamera(page);
+    const box2 = await getCanvasBounds(page);
+    if (!box2) return;
 
-    // Step 1: Press build key → ghost structure mode
-    await page.keyboard.press(key).catch(() => {});
-    await sleep(300);
-    // Step 2: Move mouse to our interior tile
+    // After centering, our territory is at TRUE canvas center (not safe zone offset)
+    const trueCx = box2.x + box2.width / 2;
+    const trueCy = box2.y + box2.height / 2;
+
+    // Choose click location based on what we're building.
+    // After centerCamera, TRUE screen center = our territory center.
+    // Use FIXED pixel offsets — no fancy fraction math that can go wrong.
+    let spot;
+    const isBorderBuilding =
+      actionType === ACTION_BUILD_DEFENSE ||
+      actionType === ACTION_BUILD_SAM ||
+      actionType === ACTION_BUILD_PORT;
+    if (isBorderBuilding) {
+      // Click 80-150px from center (border region)
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 80 + Math.random() * 70;
+      spot = {
+        x: trueCx + Math.cos(angle) * dist,
+        y: trueCy + Math.sin(angle) * dist,
+      };
+    } else {
+      // Click within ±40px of center — guaranteed our territory
+      spot = {
+        x: trueCx + (Math.random() - 0.5) * 80,
+        y: trueCy + (Math.random() - 0.5) * 80,
+      };
+    }
+
+    // Step 1: Move mouse to spot
     await page.mouse.move(spot.x, spot.y);
-    await sleep(300);
-    // Step 3: Click to place
+    await sleep(100);
+    // Step 2: Press build key → ghost structure appears at mouse location
+    await focusCanvas(page);
+    await page.keyboard.press(key).catch(() => {});
+    await sleep(500); // ghost needs time to initialize + check buildability
+    // Step 3: Click to confirm placement
     await page.mouse.click(spot.x, spot.y);
     await sleep(200);
     // Step 4: Escape to exit build mode if placement failed
     await page.keyboard.press("Escape").catch(() => {});
     log(
-      `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) [gold=${(gold / 1000).toFixed(0)}K]`,
+      `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) cx=${Math.round(trueCx)} cy=${Math.round(trueCy)} [gold=${(gold / 1000).toFixed(0)}K]`,
     );
   } else if (NUKE_KEYS[actionType]) {
     const { key, name, minGold } = NUKE_KEYS[actionType];
@@ -426,7 +572,7 @@ async function executeRLAction(page, action, zone, goldAmount) {
     await page.keyboard.press("Escape").catch(() => {});
     log(`RL: Launch ${name} at (${Math.round(x)},${Math.round(y)})`);
   } else if (actionType === ACTION_UPGRADE) {
-    const spot = randomInterior(zone, currentZoomLevel);
+    const spot = randomInterior(zone);
     await page.mouse.click(spot.x, spot.y);
     await sleep(200);
     log("RL: Upgrade");
@@ -474,6 +620,7 @@ async function main() {
       "--disable-blink-features=AutomationControlled",
       "--no-restore-session-state",
       "--disable-session-crashed-bubble",
+      "--disable-notifications",
     ],
   });
 
@@ -505,6 +652,36 @@ async function main() {
     }
   });
 
+  // Block ad requests at the network level (before navigation)
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const url = req.url();
+    const blocked = [
+      "doubleclick.net",
+      "googlesyndication.com",
+      "googleadservices.com",
+      "adservice.google",
+      "pagead2.googlesyndication",
+      "ads.google.com",
+      "hrblock.com",
+      "amazon-adsystem",
+      "adnxs.com",
+      "adsrvr.org",
+      "criteo.com",
+      "taboola.com",
+      "outbrain.com",
+      "ad.doubleclick",
+      "googletagmanager.com/gtag",
+      "facebook.net/tr",
+    ];
+    if (blocked.some((d) => url.includes(d))) {
+      req.abort().catch(() => {});
+    } else {
+      req.continue().catch(() => {});
+    }
+  });
+  log("Ad blocking enabled (network-level request interception)");
+
   // ── Join game ──
   await joinGame(page);
 
@@ -518,9 +695,9 @@ async function main() {
   let lastPolicyQuery = 0;
   let currentAction = null;
   let lastRecenter = 0;
-  let lastGold = 0;
-  currentZoomLevel = 8; // reset at game start
-  let lastTerritoryPct = 0;
+  lastGold = 0;
+  currentScale = 1.8; // reset to game default at game start
+  lastTerritoryPct = 0;
   let spawnTime = 0;
 
   while (true) {
@@ -614,20 +791,11 @@ async function main() {
             `Spawned! troops=${hudState?.myTroops || "?"}, territory=${((hudState?.territoryPct || 0) * 100).toFixed(1)}%`,
           );
 
-          // CRITICAL: center camera on our territory and zoom in
-          await page.keyboard.press("c").catch(() => {});
-          await sleep(1000);
-          const zoomBox = await getCanvasBounds(page);
-          if (zoomBox) {
-            await page.mouse.move(
-              zoomBox.x + zoomBox.width / 2,
-              zoomBox.y + zoomBox.height / 2,
-            );
-            for (let i = 0; i < 8; i++) {
-              await page.mouse.wheel({ deltaY: -500 });
-              await sleep(100);
-            }
-          }
+          // CRITICAL: center camera on our territory and zoom in moderately
+          await centerCamera(page);
+          // Zoom in ~3x from default (1.8 → ~5.4) using sane deltas
+          // Each -100 delta → scale *= 1.2 (20% zoom in). 6 steps ≈ 1.2^6 ≈ 3x
+          for (let i = 0; i < 6; i++) await zoomStep(page, -100);
           await sleep(500);
           lastRecenter = Date.now();
         }
@@ -644,37 +812,29 @@ async function main() {
       // ── RECENTER & DYNAMIC ZOOM every 10 seconds ──
       if (Date.now() - lastRecenter > 10000) {
         lastRecenter = Date.now();
-        await page.keyboard.press("c").catch(() => {});
-        await sleep(300);
+        await centerCamera(page);
 
-        // Adjust zoom based on territory size:
-        // Tiny (<0.1%): zoom in tight (8 steps)
-        // Small (0.1-0.5%): moderate zoom (5 steps)
-        // Medium (0.5-2%): slight zoom (2 steps)
-        // Large (>2%): default zoom (0 steps)
-        let targetZoom;
-        if (lastTerritoryPct < 0.001) targetZoom = 8;
-        else if (lastTerritoryPct < 0.005) targetZoom = 5;
-        else if (lastTerritoryPct < 0.02) targetZoom = 2;
-        else targetZoom = 0;
+        // Target: territory fills ~30-50% of screen. territoryScreenFraction() tells us
+        // current coverage. If too small, zoom in; if too big, zoom out.
+        const screenFrac = territoryScreenFraction();
+        const TARGET_FRAC = 0.35; // we want ~35% of screen to be our territory
+        // ratio > 1 means territory too big on screen → zoom out
+        // ratio < 1 means territory too small → zoom in
+        const ratio = screenFrac / TARGET_FRAC;
 
-        const zoomDelta = targetZoom - currentZoomLevel;
-        if (zoomDelta !== 0) {
-          const cBox = await getCanvasBounds(page);
-          if (cBox) {
-            await page.mouse.move(
-              cBox.x + cBox.width / 2,
-              cBox.y + cBox.height / 2,
-            );
-            const steps = Math.abs(zoomDelta);
-            const direction = zoomDelta > 0 ? -500 : 500; // negative deltaY = zoom in
-            for (let i = 0; i < steps; i++) {
-              await page.mouse.wheel({ deltaY: direction });
-              await sleep(80);
-            }
-            currentZoomLevel = targetZoom;
+        if (ratio > 1.5 || ratio < 0.5) {
+          // Calculate how many 20%-zoom steps to get there
+          // Each step changes scale by 1.2x. We need scale to change by 1/ratio
+          // (since screenFrac ∝ scale). Steps = log(1/ratio) / log(1.2)
+          const stepsNeeded = Math.round(Math.log(1 / ratio) / Math.log(1.2));
+          const clamped = Math.max(-8, Math.min(8, stepsNeeded));
+          if (clamped !== 0) {
+            // Positive steps = zoom in (negative delta), negative = zoom out (positive delta)
+            const delta = clamped > 0 ? -100 : 100;
+            for (let i = 0; i < Math.abs(clamped); i++)
+              await zoomStep(page, delta);
             log(
-              `Zoom adjusted to ${targetZoom} (territory=${(lastTerritoryPct * 100).toFixed(1)}%)`,
+              `Zoom: scale=${currentScale.toFixed(1)}, territory screen=${(screenFrac * 100).toFixed(0)}% → ${Math.abs(clamped)} steps ${clamped > 0 ? "in" : "out"}`,
             );
           }
         }
@@ -723,13 +883,17 @@ async function main() {
         }
       }
 
-      // ── ALWAYS EXPAND: click borders to grow into wilderness ──
-      // In the headless env, troops auto-spread. In the live game, you must click.
-      // This runs every tick regardless of what the model says.
-      for (let i = 0; i < 8; i++) {
-        const { x, y } = randomBorder(zone, currentZoomLevel);
-        await page.mouse.click(x, y);
-        await sleep(15);
+      // ── EXPAND: click borders to grow ──
+      // Use explicit mousedown+mouseup at same position with gap between clicks
+      // to avoid rapid clicks being interpreted as drags (which pan the camera)
+      for (let i = 0; i < 3; i++) {
+        const { x, y } = randomBorder(zone);
+        await page.mouse.move(x, y);
+        await sleep(20);
+        await page.mouse.down();
+        await sleep(20);
+        await page.mouse.up();
+        await sleep(60);
       }
 
       // ── EXECUTE RL POLICY ACTION ──
@@ -757,7 +921,7 @@ async function main() {
         const pct = gs ? (gs.territoryPct * 100).toFixed(1) : "?";
         const troops = gs ? gs.myTroops : "?";
         log(
-          `[${elapsed.toFixed(0)}s] ${pct}% territory, troops=${troops}, action=${currentAction?.actionType ?? "none"}`,
+          `[${elapsed.toFixed(0)}s] ${pct}% territory, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, scale=${currentScale.toFixed(1)}, screenFrac=${(territoryScreenFraction() * 100).toFixed(0)}%, action=${currentAction?.actionType ?? "none"}`,
         );
       }
     } catch (err) {
