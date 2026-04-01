@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --partition=mit_normal_gpu
-#SBATCH --time=06:00:00
+#SBATCH --time=03:00:00
 #SBATCH --requeue
 
 set -euo pipefail
@@ -37,9 +37,13 @@ cd rl
 python -u train.py \
     --maps plains,big_plains,world,giantworldmap,ocean_and_land,half_land_half_ocean \
     --opponents 5 \
+    --difficulty Hard \
     --num-envs 4 \
     --rollout-steps 512 \
-    --num-updates 10000 \
+    --num-updates 4000 \
+    --lr 3e-5 \
+    --vf-coef 0.25 \
+    --anneal-lr \
     --save-interval 50 \
     --log-interval 5 \
     $RESUME_FLAG

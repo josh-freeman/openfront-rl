@@ -148,7 +148,7 @@ def train(args):
     )
 
     model = ActorCritic(obs_dim, max_neighbors).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     # Logging
     save_dir = Path(args.save_dir)
@@ -220,6 +220,13 @@ def train(args):
     for update in range(start_update, args.num_updates):
         t_start = time.time()
 
+        # Linear LR annealing
+        if args.anneal_lr:
+            frac = 1.0 - update / args.num_updates
+            lr_now = frac * args.lr
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_now
+
         # Collect rollout
         for step in range(args.rollout_steps):
             obs_buf[step] = obs
@@ -270,6 +277,7 @@ def train(args):
         b_logprobs = torch.FloatTensor(logprobs_buf.reshape(batch_size)).to(device)
         b_advantages = torch.FloatTensor(advantages.reshape(batch_size)).to(device)
         b_returns = torch.FloatTensor(returns.reshape(batch_size)).to(device)
+        b_values = torch.FloatTensor(values_buf.reshape(batch_size)).to(device)
 
         # Normalize advantages
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
@@ -291,7 +299,15 @@ def train(args):
                 policy_loss = -torch.min(
                     ratio * b_advantages[mb_idx], clipped * b_advantages[mb_idx]
                 ).mean()
-                value_loss = 0.5 * (new_values - b_returns[mb_idx]).pow(2).mean()
+
+                # Clipped value loss to prevent large value updates
+                v_clipped = b_values[mb_idx] + torch.clamp(
+                    new_values - b_values[mb_idx], -args.clip_eps, args.clip_eps
+                )
+                v_loss_unclipped = (new_values - b_returns[mb_idx]).pow(2)
+                v_loss_clipped = (v_clipped - b_returns[mb_idx]).pow(2)
+                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
                 entropy_loss = -entropy.mean()
 
                 loss = policy_loss + args.vf_coef * value_loss + args.ent_coef * entropy_loss
@@ -318,6 +334,7 @@ def train(args):
                 "sps": float(sps),
             }
             log_entries.append(entry)
+            current_lr = optimizer.param_groups[0]["lr"]
             wandb.log({
                 "update": update + 1,
                 "global_step": global_step,
@@ -329,6 +346,7 @@ def train(args):
                 "loss/value": float(value_loss.item()),
                 "loss/entropy": float(entropy_loss.item()),
                 "perf/sps": float(sps),
+                "lr": current_lr,
             }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
@@ -405,6 +423,7 @@ if __name__ == "__main__":
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--anneal-lr", action="store_true", help="Linear LR annealing to zero")
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")
