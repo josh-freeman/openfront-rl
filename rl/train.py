@@ -238,6 +238,22 @@ def train(args):
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_now
 
+        # Curriculum learning: ramp up difficulty and opponents over training
+        if args.curriculum:
+            progress = update / args.num_updates
+            if progress < 0.25:
+                new_diff, new_opp = "Easy", 2
+            elif progress < 0.50:
+                new_diff, new_opp = "Medium", 3
+            elif progress < 0.75:
+                new_diff, new_opp = "Hard", 5
+            else:
+                new_diff, new_opp = "Hard", 7
+            if envs.difficulty != new_diff or envs.num_opponents != new_opp:
+                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents (progress={progress:.0%})")
+                envs.difficulty = new_diff
+                envs.num_opponents = new_opp
+
         # Collect rollout
         for step in range(args.rollout_steps):
             obs_buf[step] = obs
@@ -451,6 +467,7 @@ if __name__ == "__main__":
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--anneal-lr", action="store_true", help="Linear LR annealing to zero")
+    parser.add_argument("--curriculum", action="store_true", help="Curriculum learning: ramp difficulty/opponents over training")
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")

@@ -36,14 +36,15 @@ fi
 cd rl
 python -u train.py \
     --maps plains,big_plains,world,giantworldmap,ocean_and_land,half_land_half_ocean \
-    --opponents 5 \
-    --difficulty Hard \
-    --num-envs 4 \
+    --opponents 2 \
+    --difficulty Easy \
+    --num-envs 8 \
     --rollout-steps 512 \
     --num-updates 4000 \
-    --lr 3e-5 \
+    --lr 2e-4 \
     --vf-coef 0.25 \
     --anneal-lr \
+    --curriculum \
     --save-interval 50 \
     --log-interval 5 \
     $RESUME_FLAG
