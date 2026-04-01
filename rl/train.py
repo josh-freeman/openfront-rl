@@ -136,7 +136,7 @@ def train(args):
 
     maps = args.maps.split(",")
     max_neighbors = 16
-    obs_dim = 14 + max_neighbors * 4  # 78
+    obs_dim = 16 + max_neighbors * 4  # 80
 
     # Create vectorized environment
     from vec_env import VecOpenFrontEnv
@@ -192,12 +192,13 @@ def train(args):
             print("No checkpoint found, starting fresh.")
 
     # Initialize wandb
-    wandb.init(
-        project="openfront-rl",
-        config=vars(args),
-        resume="allow",
-    )
-    wandb.config.update({"obs_dim": obs_dim, "maps": maps}, allow_val_change=True)
+    if wandb is not None:
+        wandb.init(
+            project="openfront-rl",
+            config=vars(args),
+            resume="allow",
+        )
+        wandb.config.update({"obs_dim": obs_dim, "maps": maps}, allow_val_change=True)
 
     print(f"Training PPO on maps={maps}, opponents={args.opponents}")
     print(f"num_envs={args.num_envs}, rollout_steps={args.rollout_steps}")
@@ -338,19 +339,20 @@ def train(args):
             }
             log_entries.append(entry)
             current_lr = optimizer.param_groups[0]["lr"]
-            wandb.log({
-                "update": update + 1,
-                "global_step": global_step,
-                "num_episodes": num_episodes,
-                "reward/mean": float(mean_r),
-                "episode_length": float(mean_l),
-                "loss/total": float(loss.item()),
-                "loss/policy": float(policy_loss.item()),
-                "loss/value": float(value_loss.item()),
-                "loss/entropy": float(entropy_loss.item()),
-                "perf/sps": float(sps),
-                "lr": current_lr,
-            }, step=global_step)
+            if wandb is not None:
+                wandb.log({
+                    "update": update + 1,
+                    "global_step": global_step,
+                    "num_episodes": num_episodes,
+                    "reward/mean": float(mean_r),
+                    "episode_length": float(mean_l),
+                    "loss/total": float(loss.item()),
+                    "loss/policy": float(policy_loss.item()),
+                    "loss/value": float(value_loss.item()),
+                    "loss/entropy": float(entropy_loss.item()),
+                    "perf/sps": float(sps),
+                    "lr": current_lr,
+                }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
                 f"episodes={num_episodes} reward={mean_r:.2f} len={mean_l:.0f} "
@@ -394,7 +396,8 @@ def train(args):
         json.dump(log_entries, f, indent=2)
 
     envs.close()
-    wandb.finish()
+    if wandb is not None:
+        wandb.finish()
     print(f"Training complete. Best reward: {best_reward:.2f}")
 
     # Auto-push to HuggingFace

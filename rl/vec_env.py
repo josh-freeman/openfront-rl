@@ -40,8 +40,8 @@ class VecOpenFrontEnv:
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
 
-        # 14 player stats + max_neighbors * 4 neighbor features
-        obs_size = 14 + max_neighbors * 4
+        # 16 player stats + max_neighbors * 4 neighbor features
+        obs_size = 16 + max_neighbors * 4
         self.obs_dim = obs_size
 
         self._procs: list[Optional[subprocess.Popen]] = [None] * num_envs
@@ -109,9 +109,19 @@ class VecOpenFrontEnv:
         vec[12] = obs.get("numNukes", 0) / 5
         vec[13] = obs.get("tick", 0) / 100000
 
+        # Build feedback
+        build_result = obs.get("lastBuildResult", "none")
+        if build_result == "success":
+            vec[14] = 1.0
+        elif build_result == "none":
+            vec[14] = 0.0
+        else:
+            vec[14] = -1.0
+        vec[15] = float(obs.get("lastActionSucceeded", False))
+
         self._neighbors_caches[idx] = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 14 + i * 4
+            base = 16 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
