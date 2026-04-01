@@ -256,11 +256,11 @@ def train(args):
         # Curriculum learning: ramp up difficulty and opponents over training
         if args.curriculum:
             progress = update / args.num_updates
-            if progress < 0.02:
+            if progress < 0.10:
                 new_diff, new_opp = "Easy", 2
-            elif progress < 0.05:
+            elif progress < 0.20:
                 new_diff, new_opp = "Medium", 5
-            elif progress < 0.15:
+            elif progress < 0.35:
                 new_diff, new_opp = "Hard", 8
             else:
                 new_diff, new_opp = "Hard", 12
