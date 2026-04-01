@@ -24,7 +24,22 @@ try:
 except ImportError:
     wandb = None
 
-AVAILABLE_MAPS = ["plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean"]
+AVAILABLE_MAPS = [
+    # Original testdata maps
+    "plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean",
+    # Resource maps (diverse geography)
+    "achiran", "aegean", "africa", "alps", "amazonriver", "amazonriverwide", "arctic",
+    "asia", "australia", "baikal", "beringstrait", "betweentwoseas", "blacksea",
+    "bosphorusstraits", "britannia", "britanniaclassic", "deglaciatedantarctica",
+    "eastasia", "europe", "europeclassic", "falklandislands", "faroeislands",
+    "fourislands", "gatewaytotheatlantic", "gulfofstlawrence", "halkidiki", "hawaii",
+    "iceland", "italia", "japan", "lemnos", "lisbon", "manicouagan", "mars",
+    "mediterranean", "mena", "milkyway", "montreal", "newyorkcity", "niledelta",
+    "northamerica", "oceania", "pangaea", "passage", "pluto", "reglaciatedantarctica",
+    "sanfrancisco", "southamerica", "straitofgibraltar", "straitofhormuz",
+    "surrounded", "thebox", "theboxplus", "tourney1", "tourney2", "tourney3", "tourney4",
+    "tradersdream", "twolakes", "worldrotated", "yenisei",
+]
 
 from env import NUM_ACTIONS
 

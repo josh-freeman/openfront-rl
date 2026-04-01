@@ -154,12 +154,25 @@ const GAME_ID = "rl-training";
 // ---------- Helper: Load map ----------
 
 async function loadMap(mapName: string) {
-  const mapsDir = path.join(__rldir, "../tests/testdata/maps");
-  const mapDir = path.join(mapsDir, mapName);
-
-  if (!fs.existsSync(mapDir)) {
+  // Try testdata maps first, then resources/maps
+  const mapsDirs = [
+    path.join(__rldir, "../tests/testdata/maps"),
+    path.join(__rldir, "../resources/maps"),
+  ];
+  let mapDir = "";
+  for (const dir of mapsDirs) {
+    const candidate = path.join(dir, mapName);
+    if (fs.existsSync(candidate)) {
+      mapDir = candidate;
+      break;
+    }
+  }
+  if (!mapDir) {
+    const allMaps = mapsDirs.flatMap((d) =>
+      fs.existsSync(d) ? fs.readdirSync(d) : [],
+    );
     throw new Error(
-      `Map not found: ${mapDir}. Available: ${fs.readdirSync(mapsDir).join(", ")}`,
+      `Map not found: ${mapName}. Available: ${allMaps.join(", ")}`,
     );
   }
 
