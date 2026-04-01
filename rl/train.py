@@ -285,27 +285,39 @@ def train(args):
                 advantages_t.std() + 1e-8
             )
 
-        # PPO epochs
+        # PPO epochs with minibatch updates
+        batch_size = len(advantages)
         for _ in range(args.ppo_epochs):
-            _, new_log_probs, entropy, new_values = model.get_action_and_value(
-                data["obs"], data["actions"]
-            )
+            indices = np.random.permutation(batch_size)
+            for start in range(0, batch_size, args.minibatch_size):
+                end = min(start + args.minibatch_size, batch_size)
+                mb_idx = indices[start:end]
 
-            ratio = torch.exp(new_log_probs - data["log_probs"])
-            clipped = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps)
+                mb_obs = data["obs"][mb_idx]
+                mb_actions = data["actions"][mb_idx]
+                mb_log_probs = data["log_probs"][mb_idx]
+                mb_advantages = advantages_t[mb_idx]
+                mb_returns = returns_t[mb_idx]
 
-            policy_loss = -torch.min(
-                ratio * advantages_t, clipped * advantages_t
-            ).mean()
-            value_loss = 0.5 * (new_values - returns_t).pow(2).mean()
-            entropy_loss = -entropy.mean()
+                _, new_log_probs, entropy, new_values = model.get_action_and_value(
+                    mb_obs, mb_actions
+                )
 
-            loss = policy_loss + args.vf_coef * value_loss + args.ent_coef * entropy_loss
+                ratio = torch.exp(new_log_probs - mb_log_probs)
+                clipped = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps)
 
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
+                policy_loss = -torch.min(
+                    ratio * mb_advantages, clipped * mb_advantages
+                ).mean()
+                value_loss = 0.5 * (new_values - mb_returns).pow(2).mean()
+                entropy_loss = -entropy.mean()
+
+                loss = policy_loss + args.vf_coef * value_loss + args.ent_coef * entropy_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
 
         # Logging
         if (episode + 1) % args.log_interval == 0:
@@ -402,6 +414,7 @@ if __name__ == "__main__":
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--minibatch-size", type=int, default=256)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
