@@ -25,7 +25,7 @@ from env import OpenFrontEnv, NUM_ACTIONS
 from train import ActorCritic
 
 
-def load_model(model_path: str, obs_dim: int, max_neighbors: int = 8):
+def load_model(model_path: str, obs_dim: int, max_neighbors: int = 16):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActorCritic(obs_dim, max_neighbors).to(device)
     state = torch.load(model_path, map_location=device, weights_only=True)
@@ -102,8 +102,9 @@ class PolicyHandler(BaseHTTPRequestHandler):
         obs_dict = json.loads(body)
 
         # Convert observation dict to vector (same as env.py)
-        obs_vec = np.zeros(32, dtype=np.float32)  # 8 + 8*3
-        obs_vec[0] = obs_dict.get("myTiles", 0) / max(obs_dict.get("totalMapTiles", 1), 1)
+        obs_vec = np.zeros(78, dtype=np.float32)  # 14 + 16*4
+        total = max(obs_dict.get("totalMapTiles", 1), 1)
+        obs_vec[0] = obs_dict.get("myTiles", 0) / total
         obs_vec[1] = obs_dict.get("myTroops", 0) / 100000
         obs_vec[2] = obs_dict.get("myGold", 0) / 1000000
         obs_vec[3] = obs_dict.get("territoryPct", 0)
@@ -111,12 +112,19 @@ class PolicyHandler(BaseHTTPRequestHandler):
         obs_vec[5] = obs_dict.get("outgoingAttacks", 0) / 10
         obs_vec[6] = len(obs_dict.get("units", [])) / 20
         neighbors = obs_dict.get("neighbors", [])
-        obs_vec[7] = len(neighbors) / 8
-        for i, n in enumerate(neighbors[:8]):
-            base = 8 + i * 3
-            obs_vec[base] = n.get("tiles", 0) / max(obs_dict.get("totalMapTiles", 1), 1)
+        obs_vec[7] = len(neighbors) / 16
+        obs_vec[8] = float(obs_dict.get("hasSilo", False))
+        obs_vec[9] = float(obs_dict.get("hasPort", False))
+        obs_vec[10] = float(obs_dict.get("hasSAM", False))
+        obs_vec[11] = obs_dict.get("numWarships", 0) / 5
+        obs_vec[12] = obs_dict.get("numNukes", 0) / 5
+        obs_vec[13] = obs_dict.get("tick", 0) / 100000
+        for i, n in enumerate(neighbors[:16]):
+            base = 14 + i * 4
+            obs_vec[base] = n.get("tiles", 0) / total
             obs_vec[base + 1] = n.get("troops", 0) / 100000
             obs_vec[base + 2] = n.get("relation", 0) / 3
+            obs_vec[base + 3] = float(n.get("alive", True))
 
         obs_t = torch.FloatTensor(obs_vec).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -147,7 +155,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
 
 def serve_policy(args):
     """Run HTTP policy server for live Puppeteer bot play."""
-    model, device = load_model(args.model, 32)
+    model, device = load_model(args.model, 78)
     PolicyHandler.model = model
     PolicyHandler.device = device
 

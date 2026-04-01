@@ -15,13 +15,22 @@ from typing import Any
 # Action types
 ACTION_NOOP = 0
 ACTION_ATTACK = 1
-ACTION_BUILD_CITY = 2
-ACTION_BUILD_FACTORY = 3
-ACTION_BUILD_DEFENSE = 4
-ACTION_BUILD_PORT = 5
-ACTION_BUILD_SAM = 6
-ACTION_BUILD_SILO = 7
-NUM_ACTIONS = 8
+ACTION_BOAT_ATTACK = 2
+ACTION_RETREAT = 3
+ACTION_BUILD_CITY = 4
+ACTION_BUILD_FACTORY = 5
+ACTION_BUILD_DEFENSE = 6
+ACTION_BUILD_PORT = 7
+ACTION_BUILD_SAM = 8
+ACTION_BUILD_SILO = 9
+ACTION_BUILD_WARSHIP = 10
+ACTION_LAUNCH_ATOM = 11
+ACTION_LAUNCH_HBOMB = 12
+ACTION_LAUNCH_MIRV = 13
+ACTION_MOVE_WARSHIP = 14
+ACTION_UPGRADE = 15
+ACTION_DELETE_UNIT = 16
+NUM_ACTIONS = 17
 
 BUILD_TYPES = {
     ACTION_BUILD_CITY: "city",
@@ -30,6 +39,13 @@ BUILD_TYPES = {
     ACTION_BUILD_PORT: "port",
     ACTION_BUILD_SAM: "sam_launcher",
     ACTION_BUILD_SILO: "missile_silo",
+    ACTION_BUILD_WARSHIP: "warship",
+}
+
+NUKE_TYPES = {
+    ACTION_LAUNCH_ATOM: "atom_bomb",
+    ACTION_LAUNCH_HBOMB: "hydrogen_bomb",
+    ACTION_LAUNCH_MIRV: "mirv",
 }
 
 
@@ -37,10 +53,8 @@ class OpenFrontEnv(gym.Env):
     """
     OpenFront RL environment.
 
-    Observation space: Dict with player stats, neighbor info, etc.
-    Action space: Discrete(8) x Discrete(max_neighbors) x Continuous(troop_fraction)
-
-    For simplicity, we use a flattened observation vector and MultiDiscrete actions.
+    Observation: fixed-size vector with player stats, unit counts, neighbor info.
+    Action: MultiDiscrete [action_type, target_idx, troop_fraction_bucket]
     """
 
     metadata = {"render_modes": []}
@@ -51,8 +65,8 @@ class OpenFrontEnv(gym.Env):
         num_opponents: int = 3,
         difficulty: str = "Medium",
         ticks_per_step: int = 10,
-        max_steps: int = 3000,
-        max_neighbors: int = 8,
+        max_steps: int = 10000,
+        max_neighbors: int = 16,
     ):
         super().__init__()
 
@@ -65,19 +79,32 @@ class OpenFrontEnv(gym.Env):
         self.step_count = 0
 
         # Observation: fixed-size vector
-        # [myTiles, myTroops, myGold, territoryPct, incomingAttacks, outgoingAttacks,
-        #  numUnits, numNeighbors,
-        #  neighbor_0_tiles, neighbor_0_troops, neighbor_0_relation, ...,
-        #  neighbor_N_tiles, neighbor_N_troops, neighbor_N_relation]
-        obs_size = 8 + max_neighbors * 3
+        # [8 player stats] + [max_neighbors * 3 neighbor features]
+        # Player stats:
+        #   0: territoryPct (myTiles / totalMapTiles)
+        #   1: myTroops (normalized)
+        #   2: myGold (normalized)
+        #   3: territoryPct (raw from server)
+        #   4: incomingAttacks (normalized)
+        #   5: outgoingAttacks (normalized)
+        #   6: numUnits (normalized)
+        #   7: numNeighbors (normalized)
+        #   8: hasSilo (0/1)
+        #   9: hasPort (0/1)
+        #   10: hasSAM (0/1)
+        #   11: numWarships (normalized)
+        #   12: numNukes (normalized)
+        #   13: tickProgress (normalized by max ticks)
+        # Neighbor features (per neighbor):
+        #   0: tiles (normalized)
+        #   1: troops (normalized)
+        #   2: relation (normalized)
+        #   3: isAlive (0/1)
+        obs_size = 14 + max_neighbors * 4
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
 
-        # Action: [action_type, target_neighbor_idx, troop_fraction_bucket]
-        # action_type: 0=noop, 1=attack, 2-7=build types
-        # target_neighbor: 0..max_neighbors-1 (for attacks)
-        # troop_fraction: 0..4 -> [0.2, 0.4, 0.6, 0.8, 1.0]
         self.action_space = spaces.MultiDiscrete(
             [NUM_ACTIONS, max_neighbors, 5]
         )
@@ -102,7 +129,6 @@ class OpenFrontEnv(gym.Env):
             bufsize=1,
         )
 
-        # Wait for "ready" message
         line = self._proc.stdout.readline()
         msg = json.loads(line)
         assert msg.get("status") == "ready", f"Server not ready: {msg}"
@@ -119,25 +145,33 @@ class OpenFrontEnv(gym.Env):
     def _obs_to_vec(self, obs: dict) -> np.ndarray:
         """Convert observation dict to fixed-size float vector."""
         vec = np.zeros(self.observation_space.shape[0], dtype=np.float32)
+        total = max(obs.get("totalMapTiles", 1), 1)
 
-        vec[0] = obs.get("myTiles", 0) / max(obs.get("totalMapTiles", 1), 1)
-        vec[1] = obs.get("myTroops", 0) / 100000  # normalize
+        # Player stats
+        vec[0] = obs.get("myTiles", 0) / total
+        vec[1] = obs.get("myTroops", 0) / 100000
         vec[2] = obs.get("myGold", 0) / 1000000
         vec[3] = obs.get("territoryPct", 0)
         vec[4] = obs.get("incomingAttacks", 0) / 10
         vec[5] = obs.get("outgoingAttacks", 0) / 10
         vec[6] = len(obs.get("units", [])) / 20
-        vec[7] = len(obs.get("neighbors", [])) / self.max_neighbors
+        neighbors = obs.get("neighbors", [])
+        vec[7] = len(neighbors) / self.max_neighbors
+        vec[8] = float(obs.get("hasSilo", False))
+        vec[9] = float(obs.get("hasPort", False))
+        vec[10] = float(obs.get("hasSAM", False))
+        vec[11] = obs.get("numWarships", 0) / 5
+        vec[12] = obs.get("numNukes", 0) / 5
+        vec[13] = obs.get("tick", 0) / 100000
 
         # Neighbor features
-        neighbors = obs.get("neighbors", [])
         self._neighbors_cache = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 8 + i * 3
-            total = max(obs.get("totalMapTiles", 1), 1)
-            vec[base + 0] = n.get("tiles", 0) / total
+            base = 14 + i * 4
+            vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
-            vec[base + 2] = n.get("relation", 0) / 3  # 0=hostile..3=friendly
+            vec[base + 2] = n.get("relation", 0) / 3
+            vec[base + 3] = float(n.get("alive", True))
 
         return vec
 
@@ -146,24 +180,44 @@ class OpenFrontEnv(gym.Env):
         action_type = int(action[0])
         target_idx = int(action[1])
         troop_bucket = int(action[2])
-        troop_fraction = (troop_bucket + 1) * 0.2  # 0.2, 0.4, 0.6, 0.8, 1.0
+        troop_fraction = (troop_bucket + 1) * 0.2
 
         if action_type == ACTION_NOOP:
             return {"type": "noop"}
-        elif action_type == ACTION_ATTACK:
+        elif action_type in (ACTION_ATTACK, ACTION_BOAT_ATTACK):
             if target_idx < len(self._neighbors_cache):
                 target = self._neighbors_cache[target_idx]
                 return {
-                    "type": "attack",
+                    "type": "boat_attack" if action_type == ACTION_BOAT_ATTACK else "attack",
                     "targetPlayerId": target["id"],
                     "troopFraction": troop_fraction,
                 }
             return {"type": "noop"}
+        elif action_type == ACTION_RETREAT:
+            return {"type": "retreat"}
         elif action_type in BUILD_TYPES:
-            return {
-                "type": "build",
-                "unitType": BUILD_TYPES[action_type],
-            }
+            return {"type": "build", "unitType": BUILD_TYPES[action_type]}
+        elif action_type in NUKE_TYPES:
+            if target_idx < len(self._neighbors_cache):
+                target = self._neighbors_cache[target_idx]
+                return {
+                    "type": "launch_nuke",
+                    "nukeType": NUKE_TYPES[action_type],
+                    "targetPlayerId": target["id"],
+                }
+            return {"type": "noop"}
+        elif action_type == ACTION_MOVE_WARSHIP:
+            if target_idx < len(self._neighbors_cache):
+                target = self._neighbors_cache[target_idx]
+                return {
+                    "type": "move_warship",
+                    "targetPlayerId": target["id"],
+                }
+            return {"type": "noop"}
+        elif action_type == ACTION_UPGRADE:
+            return {"type": "upgrade"}
+        elif action_type == ACTION_DELETE_UNIT:
+            return {"type": "delete_unit"}
         return {"type": "noop"}
 
     def reset(self, *, seed=None, options=None) -> tuple[np.ndarray, dict]:

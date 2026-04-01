@@ -19,7 +19,13 @@ import { fileURLToPath } from "url";
 import { DefaultConfig } from "../src/core/configuration/DefaultConfig";
 import { AttackExecution } from "../src/core/execution/AttackExecution";
 import { ConstructionExecution } from "../src/core/execution/ConstructionExecution";
+import { DeleteUnitExecution } from "../src/core/execution/DeleteUnitExecution";
+import { MoveWarshipExecution } from "../src/core/execution/MoveWarshipExecution";
+import { NukeExecution } from "../src/core/execution/NukeExecution";
+import { RetreatExecution } from "../src/core/execution/RetreatExecution";
 import { SpawnExecution } from "../src/core/execution/SpawnExecution";
+import { TransportShipExecution } from "../src/core/execution/TransportShipExecution";
+import { UpgradeStructureExecution } from "../src/core/execution/UpgradeStructureExecution";
 import {
   Difficulty,
   Game,
@@ -231,6 +237,18 @@ function getObservation() {
     isUs: p.id() === rlPlayer!.id(),
   }));
 
+  // Unit type counts
+  const hasSilo = units.some((u) => u.type === UnitType.MissileSilo);
+  const hasPort = units.some((u) => u.type === UnitType.Port);
+  const hasSAM = units.some((u) => u.type === UnitType.SAMLauncher);
+  const numWarships = units.filter((u) => u.type === UnitType.Warship).length;
+  const numNukes = units.filter(
+    (u) =>
+      u.type === UnitType.AtomBomb ||
+      u.type === UnitType.HydrogenBomb ||
+      u.type === UnitType.MIRV,
+  ).length;
+
   return {
     tick: tickCount,
     alive,
@@ -247,6 +265,11 @@ function getObservation() {
     allPlayers,
     totalMapTiles: width * height,
     territoryPct: myTiles / (width * height),
+    hasSilo,
+    hasPort,
+    hasSAM,
+    numWarships,
+    numNukes,
   };
 }
 
@@ -290,14 +313,40 @@ function calculateReward(): number {
 // ---------- Action execution ----------
 
 interface RLAction {
-  type: "attack" | "build" | "noop";
-  // For attack: targetPlayerId, troops (fraction 0-1)
+  type:
+    | "attack"
+    | "boat_attack"
+    | "retreat"
+    | "build"
+    | "launch_nuke"
+    | "move_warship"
+    | "upgrade"
+    | "delete_unit"
+    | "noop";
   targetPlayerId?: string;
   troopFraction?: number;
-  // For build: unitType, tileRef
   unitType?: string;
-  tileX?: number;
-  tileY?: number;
+  nukeType?: string;
+}
+
+function findClosestBorderTile(target: Player): TileRef | null {
+  if (!game || !rlPlayer) return null;
+  const borderArr = Array.from(rlPlayer.borderTiles());
+  if (borderArr.length === 0) return null;
+  const targetTiles = Array.from(target.borderTiles());
+  if (targetTiles.length === 0) return null;
+
+  const targetCenter = targetTiles[Math.floor(targetTiles.length / 2)];
+  let bestTile = borderArr[0];
+  let bestDist = Infinity;
+  for (const bt of borderArr) {
+    const d = game.manhattanDist(bt, targetCenter);
+    if (d < bestDist) {
+      bestDist = d;
+      bestTile = bt;
+    }
+  }
+  return bestTile;
 }
 
 function executeAction(action: RLAction) {
@@ -305,9 +354,8 @@ function executeAction(action: RLAction) {
 
   switch (action.type) {
     case "attack": {
-      if (!action.targetPlayerId) break;
-      if (!game.hasPlayer(action.targetPlayerId)) break;
-
+      if (!action.targetPlayerId || !game.hasPlayer(action.targetPlayerId))
+        break;
       const target = game.player(action.targetPlayerId);
       if (!target.isAlive()) break;
 
@@ -315,28 +363,42 @@ function executeAction(action: RLAction) {
       const troops = Math.floor(rlPlayer.troops() * fraction);
       if (troops < 10) break;
 
-      // Find a border tile closest to target
-      const borderArr = Array.from(rlPlayer.borderTiles());
-      if (borderArr.length === 0) break;
-
-      // Pick border tile closest to target's territory
-      const targetTiles = Array.from(target.borderTiles());
-      if (targetTiles.length === 0) break;
-
-      const targetCenter = targetTiles[Math.floor(targetTiles.length / 2)];
-      let bestTile = borderArr[0];
-      let bestDist = Infinity;
-      for (const bt of borderArr) {
-        const d = game.manhattanDist(bt, targetCenter);
-        if (d < bestDist) {
-          bestDist = d;
-          bestTile = bt;
-        }
-      }
+      const tile = findClosestBorderTile(target);
+      if (!tile) break;
 
       game.addExecution(
-        new AttackExecution(troops, rlPlayer, target.id(), bestTile, true),
+        new AttackExecution(troops, rlPlayer, target.id(), tile, true),
       );
+      break;
+    }
+
+    case "boat_attack": {
+      if (!action.targetPlayerId || !game.hasPlayer(action.targetPlayerId))
+        break;
+      const target = game.player(action.targetPlayerId);
+      if (!target.isAlive()) break;
+
+      const fraction = Math.max(0.1, Math.min(1, action.troopFraction ?? 0.5));
+      const troops = Math.floor(rlPlayer.troops() * fraction);
+      if (troops < 10) break;
+
+      // Find a port tile to launch from
+      const ports = rlPlayer.units().filter((u) => u.type() === UnitType.Port);
+      if (ports.length === 0) break;
+      const portTile = ports[0].tile();
+
+      game.addExecution(new TransportShipExecution(rlPlayer, portTile, troops));
+      break;
+    }
+
+    case "retreat": {
+      const attacks = rlPlayer.outgoingAttacks();
+      if (attacks.length === 0) break;
+      // Retreat the most recent attack
+      const attack = attacks[attacks.length - 1];
+      if (!attack.retreating()) {
+        game.addExecution(new RetreatExecution(rlPlayer, attack.id()));
+      }
       break;
     }
 
@@ -349,24 +411,109 @@ function executeAction(action: RLAction) {
         defense_post: UnitType.DefensePost,
         sam_launcher: UnitType.SAMLauncher,
         missile_silo: UnitType.MissileSilo,
+        warship: UnitType.Warship,
       };
       const ut = unitTypeMap[action.unitType];
       if (!ut) break;
 
-      let tile: TileRef;
-      if (action.tileX !== undefined && action.tileY !== undefined) {
-        tile = game.ref(action.tileX, action.tileY);
-      } else {
-        // Pick a random border tile
-        const borders = Array.from(rlPlayer.borderTiles());
-        if (borders.length === 0) break;
-        tile = borders[Math.floor(Math.random() * borders.length)];
+      // For warships, need a port
+      if (ut === UnitType.Warship) {
+        const ports = rlPlayer
+          .units()
+          .filter((u) => u.type() === UnitType.Port);
+        if (ports.length === 0) break;
+        const canBuild = rlPlayer.canBuild(ut, ports[0].tile());
+        if (canBuild !== false) {
+          game.addExecution(new ConstructionExecution(rlPlayer, ut, canBuild));
+        }
+        break;
       }
 
-      // Check if we can build
+      // Pick a random interior tile for building
+      const borders = Array.from(rlPlayer.borderTiles());
+      if (borders.length === 0) break;
+      const tile = borders[Math.floor(Math.random() * borders.length)];
+
       const canBuild = rlPlayer.canBuild(ut, tile);
       if (canBuild !== false) {
         game.addExecution(new ConstructionExecution(rlPlayer, ut, canBuild));
+      }
+      break;
+    }
+
+    case "launch_nuke": {
+      if (!action.targetPlayerId || !game.hasPlayer(action.targetPlayerId))
+        break;
+      if (!action.nukeType) break;
+      const target = game.player(action.targetPlayerId);
+      if (!target.isAlive()) break;
+
+      const nukeTypeMap: Record<string, UnitType> = {
+        atom_bomb: UnitType.AtomBomb,
+        hydrogen_bomb: UnitType.HydrogenBomb,
+        mirv: UnitType.MIRV,
+      };
+      const nukeUt = nukeTypeMap[action.nukeType];
+      if (!nukeUt) break;
+
+      // Find a missile silo
+      const silos = rlPlayer
+        .units()
+        .filter((u) => u.type() === UnitType.MissileSilo);
+      if (silos.length === 0) break;
+
+      // Target center of enemy territory
+      const targetTiles = Array.from(target.borderTiles());
+      if (targetTiles.length === 0) break;
+      const dst = targetTiles[Math.floor(targetTiles.length / 2)];
+
+      game.addExecution(
+        new NukeExecution(nukeUt as any, rlPlayer, dst, silos[0].tile()),
+      );
+      break;
+    }
+
+    case "move_warship": {
+      if (!action.targetPlayerId || !game.hasPlayer(action.targetPlayerId))
+        break;
+      const target = game.player(action.targetPlayerId);
+
+      const warships = rlPlayer
+        .units()
+        .filter((u) => u.type() === UnitType.Warship);
+      if (warships.length === 0) break;
+
+      // Move warship toward target's territory
+      const targetTiles = Array.from(target.borderTiles());
+      if (targetTiles.length === 0) break;
+      const dst = targetTiles[Math.floor(targetTiles.length / 2)];
+
+      game.addExecution(
+        new MoveWarshipExecution(rlPlayer, warships[0].id(), dst),
+      );
+      break;
+    }
+
+    case "upgrade": {
+      // Upgrade the first upgradeable structure
+      const units = rlPlayer.units();
+      for (const u of units) {
+        if (rlPlayer.canUpgradeUnit(u)) {
+          game.addExecution(new UpgradeStructureExecution(rlPlayer, u.id()));
+          break;
+        }
+      }
+      break;
+    }
+
+    case "delete_unit": {
+      // Delete the least useful unit (e.g. last built)
+      const units = rlPlayer.units();
+      if (units.length === 0) break;
+      if (rlPlayer.canDeleteUnit()) {
+        game.addExecution(
+          new DeleteUnitExecution(rlPlayer, units[units.length - 1].id()),
+        );
       }
       break;
     }

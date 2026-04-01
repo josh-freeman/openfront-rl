@@ -132,8 +132,8 @@ def train(args):
     print(f"Using device: {device}")
 
     maps = args.maps.split(",")
-    max_neighbors = 8
-    obs_dim = 8 + max_neighbors * 3  # 32
+    max_neighbors = 16
+    obs_dim = 14 + max_neighbors * 4  # 78
 
     # Create vectorized environment
     from vec_env import VecOpenFrontEnv

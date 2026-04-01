@@ -12,7 +12,11 @@ import random
 from pathlib import Path
 from typing import Optional
 
-from env import NUM_ACTIONS, BUILD_TYPES, ACTION_NOOP, ACTION_ATTACK
+from env import (
+    NUM_ACTIONS, BUILD_TYPES, NUKE_TYPES,
+    ACTION_NOOP, ACTION_ATTACK, ACTION_BOAT_ATTACK, ACTION_RETREAT,
+    ACTION_MOVE_WARSHIP, ACTION_UPGRADE, ACTION_DELETE_UNIT,
+)
 
 
 class VecOpenFrontEnv:
@@ -26,7 +30,7 @@ class VecOpenFrontEnv:
         difficulty: str = "Medium",
         ticks_per_step: int = 10,
         max_steps: int = 10000,
-        max_neighbors: int = 8,
+        max_neighbors: int = 16,
     ):
         self.num_envs = num_envs
         self.maps = maps or ["plains"]
@@ -36,7 +40,8 @@ class VecOpenFrontEnv:
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
 
-        obs_size = 8 + max_neighbors * 3
+        # 14 player stats + max_neighbors * 4 neighbor features
+        obs_size = 14 + max_neighbors * 4
         self.obs_dim = obs_size
 
         self._procs: list[Optional[subprocess.Popen]] = [None] * num_envs
@@ -87,6 +92,7 @@ class VecOpenFrontEnv:
     def _obs_to_vec(self, obs: dict, idx: int) -> np.ndarray:
         vec = np.zeros(self.obs_dim, dtype=np.float32)
         total = max(obs.get("totalMapTiles", 1), 1)
+
         vec[0] = obs.get("myTiles", 0) / total
         vec[1] = obs.get("myTroops", 0) / 100000
         vec[2] = obs.get("myGold", 0) / 1000000
@@ -96,12 +102,20 @@ class VecOpenFrontEnv:
         vec[6] = len(obs.get("units", [])) / 20
         neighbors = obs.get("neighbors", [])
         vec[7] = len(neighbors) / self.max_neighbors
+        vec[8] = float(obs.get("hasSilo", False))
+        vec[9] = float(obs.get("hasPort", False))
+        vec[10] = float(obs.get("hasSAM", False))
+        vec[11] = obs.get("numWarships", 0) / 5
+        vec[12] = obs.get("numNukes", 0) / 5
+        vec[13] = obs.get("tick", 0) / 100000
+
         self._neighbors_caches[idx] = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 8 + i * 3
+            base = 14 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
+            vec[base + 3] = float(n.get("alive", True))
         return vec
 
     def _decode_action(self, action: np.ndarray, idx: int) -> dict:
@@ -109,24 +123,44 @@ class VecOpenFrontEnv:
         target_idx = int(action[1])
         troop_bucket = int(action[2])
         troop_fraction = (troop_bucket + 1) * 0.2
+        neighbors = self._neighbors_caches[idx]
 
         if action_type == ACTION_NOOP:
             return {"type": "noop"}
-        elif action_type == ACTION_ATTACK:
-            neighbors = self._neighbors_caches[idx]
+        elif action_type in (ACTION_ATTACK, ACTION_BOAT_ATTACK):
             if target_idx < len(neighbors):
                 return {
-                    "type": "attack",
+                    "type": "boat_attack" if action_type == ACTION_BOAT_ATTACK else "attack",
                     "targetPlayerId": neighbors[target_idx]["id"],
                     "troopFraction": troop_fraction,
                 }
             return {"type": "noop"}
+        elif action_type == ACTION_RETREAT:
+            return {"type": "retreat"}
         elif action_type in BUILD_TYPES:
             return {"type": "build", "unitType": BUILD_TYPES[action_type]}
+        elif action_type in NUKE_TYPES:
+            if target_idx < len(neighbors):
+                return {
+                    "type": "launch_nuke",
+                    "nukeType": NUKE_TYPES[action_type],
+                    "targetPlayerId": neighbors[target_idx]["id"],
+                }
+            return {"type": "noop"}
+        elif action_type == ACTION_MOVE_WARSHIP:
+            if target_idx < len(neighbors):
+                return {
+                    "type": "move_warship",
+                    "targetPlayerId": neighbors[target_idx]["id"],
+                }
+            return {"type": "noop"}
+        elif action_type == ACTION_UPGRADE:
+            return {"type": "upgrade"}
+        elif action_type == ACTION_DELETE_UNIT:
+            return {"type": "delete_unit"}
         return {"type": "noop"}
 
     def reset_single(self, idx: int) -> np.ndarray:
-        """Reset a single environment and return its observation."""
         self._step_counts[idx] = 0
         map_name = random.choice(self.maps)
         try:
@@ -139,7 +173,6 @@ class VecOpenFrontEnv:
                 },
             })
         except (RuntimeError, BrokenPipeError):
-            # Server crashed, restart it
             self._start_server(idx)
             resp = self._send(idx, {
                 "cmd": "reset",
@@ -152,26 +185,12 @@ class VecOpenFrontEnv:
         return self._obs_to_vec(resp["obs"], idx)
 
     def reset_all(self) -> np.ndarray:
-        """Reset all environments. Returns (num_envs, obs_dim) array."""
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         for i in range(self.num_envs):
             obs[i] = self.reset_single(i)
         return obs
 
     def step(self, actions: np.ndarray):
-        """
-        Step all environments.
-
-        Args:
-            actions: (num_envs, 3) array of actions
-
-        Returns:
-            obs: (num_envs, obs_dim)
-            rewards: (num_envs,)
-            dones: (num_envs,) - true terminal
-            truncateds: (num_envs,)
-            infos: list of dicts
-        """
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         dones = np.zeros(self.num_envs, dtype=bool)
@@ -188,7 +207,6 @@ class VecOpenFrontEnv:
                     "ticksPerStep": self.ticks_per_step,
                 })
             except (RuntimeError, BrokenPipeError):
-                # Server crashed, mark as done and restart
                 dones[i] = True
                 obs[i] = self.reset_single(i)
                 continue

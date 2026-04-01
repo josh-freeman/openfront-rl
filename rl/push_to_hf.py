@@ -62,7 +62,7 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 from train import ActorCritic
 import torch
 
-model = ActorCritic(obs_dim=32, max_neighbors=8)
+model = ActorCritic(obs_dim=78, max_neighbors=16)
 model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 model.eval()
 ```
