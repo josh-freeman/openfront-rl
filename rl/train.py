@@ -244,11 +244,11 @@ def train(args):
             if progress < 0.05:
                 new_diff, new_opp = "Easy", 2
             elif progress < 0.15:
-                new_diff, new_opp = "Medium", 3
+                new_diff, new_opp = "Medium", 5
             elif progress < 0.35:
-                new_diff, new_opp = "Hard", 5
+                new_diff, new_opp = "Hard", 8
             else:
-                new_diff, new_opp = "Hard", 7
+                new_diff, new_opp = "Hard", 12
             if envs.difficulty != new_diff or envs.num_opponents != new_opp:
                 print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents (progress={progress:.0%})")
                 envs.difficulty = new_diff
