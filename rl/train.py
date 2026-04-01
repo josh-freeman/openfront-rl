@@ -5,6 +5,7 @@ Uses PyTorch for the policy/value networks and trains against
 built-in bot opponents in the headless OpenFront engine.
 
 GPU-ready: automatically uses CUDA if available.
+Supports vectorized environments for parallel rollout collection.
 """
 
 import torch
@@ -22,7 +23,7 @@ import wandb
 
 AVAILABLE_MAPS = ["plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean"]
 
-from env import OpenFrontEnv, NUM_ACTIONS
+from env import NUM_ACTIONS
 
 
 class ActorCritic(nn.Module):
@@ -87,55 +88,31 @@ class ActorCritic(nn.Module):
         return action, log_prob, entropy, out["value"]
 
 
-class RolloutBuffer:
-    """Stores trajectories for PPO updates."""
+def compute_gae_vec(rewards, values, dones, last_values, gamma=0.99, lam=0.95):
+    """Compute GAE for vectorized rollouts.
 
-    def __init__(self):
-        self.obs = []
-        self.actions = []
-        self.log_probs = []
-        self.rewards = []
-        self.dones = []
-        self.values = []
-
-    def add(self, obs, action, log_prob, reward, done, value):
-        self.obs.append(obs)
-        self.actions.append(action)
-        self.log_probs.append(log_prob)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        self.values.append(value)
-
-    def get(self, device):
-        return {
-            "obs": torch.FloatTensor(np.array(self.obs)).to(device),
-            "actions": torch.FloatTensor(np.array(self.actions)).to(device),
-            "log_probs": torch.FloatTensor(np.array(self.log_probs)).to(device),
-            "rewards": torch.FloatTensor(np.array(self.rewards)).to(device),
-            "dones": torch.FloatTensor(np.array(self.dones)).to(device),
-            "values": torch.FloatTensor(np.array(self.values)).to(device),
-        }
-
-    def clear(self):
-        self.__init__()
-
-
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95, last_value=0.0):
-    """Compute Generalized Advantage Estimation.
-
-    last_value: bootstrap value V(s_T) for truncated episodes. Should be 0 for
-    true terminal states, or the critic's estimate for the final obs if truncated.
+    Args:
+        rewards: (num_steps, num_envs)
+        values: (num_steps, num_envs)
+        dones: (num_steps, num_envs)
+        last_values: (num_envs,) bootstrap values for last step
+    Returns:
+        advantages: (num_steps, num_envs)
+        returns: (num_steps, num_envs)
     """
+    num_steps, num_envs = rewards.shape
     advantages = np.zeros_like(rewards)
-    last_gae = 0
-    for t in reversed(range(len(rewards))):
-        if t == len(rewards) - 1:
-            next_value = last_value
+    last_gae = np.zeros(num_envs)
+
+    for t in reversed(range(num_steps)):
+        if t == num_steps - 1:
+            next_values = last_values
         else:
-            next_value = values[t + 1]
-        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+            next_values = values[t + 1]
+        delta = rewards[t] + gamma * next_values * (1 - dones[t]) - values[t]
         last_gae = delta + gamma * lam * (1 - dones[t]) * last_gae
         advantages[t] = last_gae
+
     returns = advantages + values
     return advantages, returns
 
@@ -145,7 +122,6 @@ def find_latest_checkpoint(save_dir: Path):
     ckpts = list(save_dir.glob("checkpoint_*.pt"))
     if not ckpts:
         return None
-    # Extract episode numbers and find max
     def ep_num(p):
         return int(p.stem.split("_")[1])
     return max(ckpts, key=ep_num)
@@ -155,16 +131,23 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    env = OpenFrontEnv(
-        map_name=args.map,
+    maps = args.maps.split(",")
+    max_neighbors = 8
+    obs_dim = 8 + max_neighbors * 3  # 32
+
+    # Create vectorized environment
+    from vec_env import VecOpenFrontEnv
+    envs = VecOpenFrontEnv(
+        num_envs=args.num_envs,
+        maps=maps,
         num_opponents=args.opponents,
         difficulty=args.difficulty,
         ticks_per_step=args.ticks_per_step,
         max_steps=args.max_steps,
+        max_neighbors=max_neighbors,
     )
 
-    obs_dim = env.observation_space.shape[0]
-    model = ActorCritic(obs_dim, env.max_neighbors).to(device)
+    model = ActorCritic(obs_dim, max_neighbors).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # Logging
@@ -174,8 +157,9 @@ def train(args):
     episode_lengths = deque(maxlen=100)
     best_reward = -float("inf")
     log_entries = []
-    start_episode = 0
     global_step = 0
+    start_update = 0
+    num_episodes = 0
 
     # Resume from checkpoint if requested
     if args.resume:
@@ -186,26 +170,23 @@ def train(args):
             checkpoint = torch.load(ckpt, map_location=device, weights_only=True)
             model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
-            start_episode = checkpoint["episode"]
-            global_step = checkpoint["global_step"]
+            start_update = checkpoint.get("update", 0)
+            global_step = checkpoint.get("global_step", 0)
+            num_episodes = checkpoint.get("num_episodes", 0)
 
-            # Restore best_reward from state.json
             if state_path.exists():
                 with open(state_path) as f:
                     state = json.load(f)
                 best_reward = state.get("best_reward", -float("inf"))
 
-            # Restore training log
             log_path = save_dir / "training_log.json"
             if log_path.exists():
                 with open(log_path) as f:
                     log_entries = json.load(f)
 
-            print(f"Resumed at episode={start_episode}, global_step={global_step}, best_reward={best_reward:.2f}")
+            print(f"Resumed at update={start_update}, global_step={global_step}, best_reward={best_reward:.2f}")
         else:
             print("No checkpoint found, starting fresh.")
-
-    maps = args.maps.split(",")
 
     # Initialize wandb
     wandb.init(
@@ -216,100 +197,101 @@ def train(args):
     wandb.config.update({"obs_dim": obs_dim, "maps": maps}, allow_val_change=True)
 
     print(f"Training PPO on maps={maps}, opponents={args.opponents}")
+    print(f"num_envs={args.num_envs}, rollout_steps={args.rollout_steps}")
+    print(f"batch_size={args.num_envs * args.rollout_steps}, minibatch_size={args.minibatch_size}")
     print(f"obs_dim={obs_dim}, device={device}")
     print(f"Saving checkpoints to {save_dir}")
 
-    for episode in range(start_episode, args.num_episodes):
-        # Randomize map each episode
-        env.map_name = random.choice(maps)
-        obs, info = env.reset()
-        buffer = RolloutBuffer()
-        ep_reward = 0
-        ep_steps = 0
+    # Storage for rollouts: (num_steps, num_envs, ...)
+    obs_buf = np.zeros((args.rollout_steps, args.num_envs, obs_dim), dtype=np.float32)
+    actions_buf = np.zeros((args.rollout_steps, args.num_envs, 3), dtype=np.float32)
+    logprobs_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    rewards_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    dones_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    values_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
 
-        while True:
-            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+    # Track per-env episode stats
+    env_ep_rewards = np.zeros(args.num_envs, dtype=np.float32)
+    env_ep_lengths = np.zeros(args.num_envs, dtype=np.int32)
 
+    # Initialize
+    obs = envs.reset_all()  # (num_envs, obs_dim)
+
+    for update in range(start_update, args.num_updates):
+        t_start = time.time()
+
+        # Collect rollout
+        for step in range(args.rollout_steps):
+            obs_buf[step] = obs
+
+            obs_t = torch.FloatTensor(obs).to(device)
             with torch.no_grad():
                 action, log_prob, _, value = model.get_action_and_value(obs_t)
 
-            action_np = action.squeeze(0).cpu().numpy()
-            next_obs, reward, done, truncated, info = env.step(action_np)
+            actions_np = action.cpu().numpy()  # (num_envs, 3)
+            logprobs_buf[step] = log_prob.cpu().numpy()
+            values_buf[step] = value.cpu().numpy()
+            actions_buf[step] = actions_np
 
-            buffer.add(
-                obs,
-                action_np,
-                log_prob.item(),
-                reward,
-                float(done or truncated),
-                value.item(),
-            )
+            next_obs, rewards, dones, truncateds, infos = envs.step(actions_np)
+            rewards_buf[step] = rewards
+            dones_buf[step] = dones | truncateds
 
-            ep_reward += reward
-            ep_steps += 1
-            global_step += 1
+            # Track episode stats and auto-reset finished envs
+            env_ep_rewards += rewards
+            env_ep_lengths += 1
+            for i in range(args.num_envs):
+                if dones[i] or truncateds[i]:
+                    episode_rewards.append(float(env_ep_rewards[i]))
+                    episode_lengths.append(int(env_ep_lengths[i]))
+                    num_episodes += 1
+                    env_ep_rewards[i] = 0
+                    env_ep_lengths[i] = 0
+                    next_obs[i] = envs.reset_single(i)
+
+            global_step += args.num_envs
             obs = next_obs
 
-            if done or truncated:
-                break
-
-        # Bootstrap value for truncated episodes
-        last_value = 0.0
-        if truncated and not done:
-            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
-            with torch.no_grad():
-                _, _, _, v = model.get_action_and_value(obs_t)
-                last_value = v.item()
-
-        episode_rewards.append(ep_reward)
-        episode_lengths.append(ep_steps)
-
-        # PPO update
-        data = buffer.get(device)
+        # Bootstrap values for last step
         with torch.no_grad():
-            values_np = data["values"].cpu().numpy()
-        advantages, returns = compute_gae(
-            data["rewards"].cpu().numpy(),
-            values_np,
-            data["dones"].cpu().numpy(),
-            gamma=args.gamma,
-            lam=args.gae_lambda,
-            last_value=last_value,
+            last_values = model.get_action_and_value(torch.FloatTensor(obs).to(device))[3]
+            last_values = last_values.cpu().numpy()
+
+        # Compute GAE
+        advantages, returns = compute_gae_vec(
+            rewards_buf, values_buf, dones_buf, last_values,
+            gamma=args.gamma, lam=args.gae_lambda,
         )
-        advantages_t = torch.FloatTensor(advantages).to(device)
-        returns_t = torch.FloatTensor(returns).to(device)
+
+        # Flatten (num_steps, num_envs, ...) -> (batch_size, ...)
+        batch_size = args.rollout_steps * args.num_envs
+        b_obs = torch.FloatTensor(obs_buf.reshape(batch_size, -1)).to(device)
+        b_actions = torch.FloatTensor(actions_buf.reshape(batch_size, -1)).to(device)
+        b_logprobs = torch.FloatTensor(logprobs_buf.reshape(batch_size)).to(device)
+        b_advantages = torch.FloatTensor(advantages.reshape(batch_size)).to(device)
+        b_returns = torch.FloatTensor(returns.reshape(batch_size)).to(device)
 
         # Normalize advantages
-        if len(advantages) > 1:
-            advantages_t = (advantages_t - advantages_t.mean()) / (
-                advantages_t.std() + 1e-8
-            )
+        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         # PPO epochs with minibatch updates
-        batch_size = len(advantages)
         for _ in range(args.ppo_epochs):
             indices = np.random.permutation(batch_size)
             for start in range(0, batch_size, args.minibatch_size):
                 end = min(start + args.minibatch_size, batch_size)
                 mb_idx = indices[start:end]
 
-                mb_obs = data["obs"][mb_idx]
-                mb_actions = data["actions"][mb_idx]
-                mb_log_probs = data["log_probs"][mb_idx]
-                mb_advantages = advantages_t[mb_idx]
-                mb_returns = returns_t[mb_idx]
-
                 _, new_log_probs, entropy, new_values = model.get_action_and_value(
-                    mb_obs, mb_actions
+                    b_obs[mb_idx], b_actions[mb_idx]
                 )
 
-                ratio = torch.exp(new_log_probs - mb_log_probs)
+                ratio = torch.exp(new_log_probs - b_logprobs[mb_idx])
                 clipped = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps)
 
                 policy_loss = -torch.min(
-                    ratio * mb_advantages, clipped * mb_advantages
+                    ratio * b_advantages[mb_idx], clipped * b_advantages[mb_idx]
                 ).mean()
-                value_loss = 0.5 * (new_values - mb_returns).pow(2).mean()
+                value_loss = 0.5 * (new_values - b_returns[mb_idx]).pow(2).mean()
                 entropy_loss = -entropy.mean()
 
                 loss = policy_loss + args.vf_coef * value_loss + args.ent_coef * entropy_loss
@@ -320,64 +302,68 @@ def train(args):
                 optimizer.step()
 
         # Logging
-        if (episode + 1) % args.log_interval == 0:
+        t_elapsed = time.time() - t_start
+        sps = (args.rollout_steps * args.num_envs) / t_elapsed
+
+        if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
             mean_r = np.mean(episode_rewards)
             mean_l = np.mean(episode_lengths)
             entry = {
-                "episode": episode + 1,
+                "update": update + 1,
                 "global_step": global_step,
+                "num_episodes": num_episodes,
                 "mean_reward": float(mean_r),
                 "mean_length": float(mean_l),
-                "ep_reward": float(ep_reward),
                 "loss": float(loss.item()),
+                "sps": float(sps),
             }
             log_entries.append(entry)
             wandb.log({
-                "episode": episode + 1,
+                "update": update + 1,
                 "global_step": global_step,
+                "num_episodes": num_episodes,
                 "reward/mean": float(mean_r),
-                "reward/episode": float(ep_reward),
                 "episode_length": float(mean_l),
                 "loss/total": float(loss.item()),
                 "loss/policy": float(policy_loss.item()),
                 "loss/value": float(value_loss.item()),
                 "loss/entropy": float(entropy_loss.item()),
+                "perf/sps": float(sps),
             }, step=global_step)
             print(
-                f"[ep {episode+1}/{args.num_episodes}] "
-                f"reward={mean_r:.2f} len={mean_l:.0f} loss={loss.item():.4f} "
-                f"steps={global_step}"
+                f"[update {update+1}/{args.num_updates}] "
+                f"episodes={num_episodes} reward={mean_r:.2f} len={mean_l:.0f} "
+                f"loss={loss.item():.4f} sps={sps:.0f}"
             )
 
         # Save checkpoint
-        if (episode + 1) % args.save_interval == 0:
-            ckpt_path = save_dir / f"checkpoint_{episode+1}.pt"
+        if (update + 1) % args.save_interval == 0:
+            ckpt_path = save_dir / f"checkpoint_{update+1}.pt"
             torch.save(
                 {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "episode": episode + 1,
+                    "update": update + 1,
                     "global_step": global_step,
+                    "num_episodes": num_episodes,
                 },
                 ckpt_path,
             )
 
-            # Save best — only overwrite if actually better
             mean_r = np.mean(episode_rewards) if episode_rewards else -float("inf")
             if mean_r > best_reward:
                 best_reward = mean_r
                 torch.save(model.state_dict(), save_dir / "best_model.pt")
                 print(f"  New best model saved (reward={best_reward:.2f})")
 
-            # Save state.json for resume
             with open(save_dir / "state.json", "w") as f:
                 json.dump({
-                    "episode": episode + 1,
+                    "update": update + 1,
                     "global_step": global_step,
+                    "num_episodes": num_episodes,
                     "best_reward": float(best_reward),
                 }, f, indent=2)
 
-            # Save log
             with open(save_dir / "training_log.json", "w") as f:
                 json.dump(log_entries, f, indent=2)
 
@@ -386,7 +372,7 @@ def train(args):
     with open(save_dir / "training_log.json", "w") as f:
         json.dump(log_entries, f, indent=2)
 
-    env.close()
+    envs.close()
     wandb.finish()
     print(f"Training complete. Best reward: {best_reward:.2f}")
 
@@ -402,13 +388,14 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train OpenFront RL agent with PPO")
-    parser.add_argument("--map", default="plains", help="Map for env init")
     parser.add_argument("--maps", default=",".join(AVAILABLE_MAPS), help="Comma-separated maps to randomly sample each episode")
     parser.add_argument("--opponents", type=int, default=3)
     parser.add_argument("--difficulty", default="Medium")
     parser.add_argument("--ticks-per-step", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=10000)
-    parser.add_argument("--num-episodes", type=int, default=10000)
+    parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel environments")
+    parser.add_argument("--rollout-steps", type=int, default=512, help="Steps per env per rollout")
+    parser.add_argument("--num-updates", type=int, default=10000, help="Number of PPO updates")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
@@ -418,8 +405,8 @@ if __name__ == "__main__":
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--save-interval", type=int, default=100)
+    parser.add_argument("--log-interval", type=int, default=5)
+    parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--hf-repo", default="JoshuaFreeman/openfront-rl-agent", help="HuggingFace repo for auto-push")

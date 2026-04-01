@@ -37,9 +37,11 @@ cd rl
 python -u train.py \
     --maps plains,big_plains,world,giantworldmap,ocean_and_land,half_land_half_ocean \
     --opponents 5 \
-    --num-episodes 50000 \
+    --num-envs 4 \
+    --rollout-steps 512 \
+    --num-updates 10000 \
     --save-interval 50 \
-    --log-interval 10 \
+    --log-interval 5 \
     $RESUME_FLAG
 
 echo "=== Job $SLURM_JOB_ID finished at $(date) ==="
