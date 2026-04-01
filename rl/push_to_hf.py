@@ -2,7 +2,7 @@
 Push trained OpenFront RL model to HuggingFace Hub.
 
 Usage:
-  python push_to_hf.py --repo josh-freeman/openfront-rl-agent
+  python push_to_hf.py --repo mischievers/openfront-rl-agent
 """
 
 import argparse
@@ -134,7 +134,7 @@ def push(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Push trained model to HuggingFace")
-    parser.add_argument("--repo", default="JoshuaFreeman/openfront-rl-agent")
+    parser.add_argument("--repo", default="mischievers/openfront-rl-agent")
     parser.add_argument("--checkpoint-dir", default="./checkpoints")
     args = parser.parse_args()
     push(args)
