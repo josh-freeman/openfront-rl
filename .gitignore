@@ -18,3 +18,9 @@ src/assets/
 *.log
 *debug*.txt
 eslint_out.txt
+
+# RL training artifacts
+rl/checkpoints/
+rl/__pycache__/
+*.pt
+*.pth

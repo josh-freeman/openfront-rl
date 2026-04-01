@@ -1,0 +1,311 @@
+"""
+PPO Training for OpenFront RL Agent
+
+Uses PyTorch for the policy/value networks and trains against
+built-in bot opponents in the headless OpenFront engine.
+
+GPU-ready: automatically uses CUDA if available.
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import time
+import argparse
+import json
+from pathlib import Path
+
+from env import OpenFrontEnv, NUM_ACTIONS
+
+
+class ActorCritic(nn.Module):
+    """Shared-backbone actor-critic network for MultiDiscrete action space."""
+
+    def __init__(self, obs_dim: int, max_neighbors: int):
+        super().__init__()
+
+        self.backbone = nn.Sequential(
+            nn.Linear(obs_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
+
+        # Action heads (one per MultiDiscrete dimension)
+        self.action_type_head = nn.Linear(128, NUM_ACTIONS)
+        self.target_head = nn.Linear(128, max_neighbors)
+        self.troop_head = nn.Linear(128, 5)
+
+        # Value head
+        self.value_head = nn.Linear(128, 1)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return {
+            "action_type": self.action_type_head(features),
+            "target": self.target_head(features),
+            "troop": self.troop_head(features),
+            "value": self.value_head(features).squeeze(-1),
+        }
+
+    def get_action_and_value(self, x, action=None):
+        out = self.forward(x)
+
+        # Create categorical distributions for each action dimension
+        dist_type = torch.distributions.Categorical(logits=out["action_type"])
+        dist_target = torch.distributions.Categorical(logits=out["target"])
+        dist_troop = torch.distributions.Categorical(logits=out["troop"])
+
+        if action is None:
+            a_type = dist_type.sample()
+            a_target = dist_target.sample()
+            a_troop = dist_troop.sample()
+            action = torch.stack([a_type, a_target, a_troop], dim=-1)
+        else:
+            a_type = action[..., 0].long()
+            a_target = action[..., 1].long()
+            a_troop = action[..., 2].long()
+
+        log_prob = (
+            dist_type.log_prob(a_type)
+            + dist_target.log_prob(a_target)
+            + dist_troop.log_prob(a_troop)
+        )
+        entropy = (
+            dist_type.entropy() + dist_target.entropy() + dist_troop.entropy()
+        )
+
+        return action, log_prob, entropy, out["value"]
+
+
+class RolloutBuffer:
+    """Stores trajectories for PPO updates."""
+
+    def __init__(self):
+        self.obs = []
+        self.actions = []
+        self.log_probs = []
+        self.rewards = []
+        self.dones = []
+        self.values = []
+
+    def add(self, obs, action, log_prob, reward, done, value):
+        self.obs.append(obs)
+        self.actions.append(action)
+        self.log_probs.append(log_prob)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+
+    def get(self, device):
+        return {
+            "obs": torch.FloatTensor(np.array(self.obs)).to(device),
+            "actions": torch.FloatTensor(np.array(self.actions)).to(device),
+            "log_probs": torch.FloatTensor(np.array(self.log_probs)).to(device),
+            "rewards": torch.FloatTensor(np.array(self.rewards)).to(device),
+            "dones": torch.FloatTensor(np.array(self.dones)).to(device),
+            "values": torch.FloatTensor(np.array(self.values)).to(device),
+        }
+
+    def clear(self):
+        self.__init__()
+
+
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    """Compute Generalized Advantage Estimation."""
+    advantages = np.zeros_like(rewards)
+    last_gae = 0
+    for t in reversed(range(len(rewards))):
+        if t == len(rewards) - 1:
+            next_value = 0
+        else:
+            next_value = values[t + 1]
+        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+        last_gae = delta + gamma * lam * (1 - dones[t]) * last_gae
+        advantages[t] = last_gae
+    returns = advantages + values
+    return advantages, returns
+
+
+def train(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    env = OpenFrontEnv(
+        map_name=args.map,
+        num_opponents=args.opponents,
+        difficulty=args.difficulty,
+        ticks_per_step=args.ticks_per_step,
+        max_steps=args.max_steps,
+    )
+
+    obs_dim = env.observation_space.shape[0]
+    model = ActorCritic(obs_dim, env.max_neighbors).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # Logging
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    episode_rewards = deque(maxlen=100)
+    episode_lengths = deque(maxlen=100)
+    best_reward = -float("inf")
+    log_entries = []
+
+    print(f"Training PPO on map={args.map}, opponents={args.opponents}")
+    print(f"obs_dim={obs_dim}, device={device}")
+    print(f"Saving checkpoints to {save_dir}")
+
+    global_step = 0
+    for episode in range(args.num_episodes):
+        obs, info = env.reset()
+        buffer = RolloutBuffer()
+        ep_reward = 0
+        ep_steps = 0
+
+        while True:
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                action, log_prob, _, value = model.get_action_and_value(obs_t)
+
+            action_np = action.squeeze(0).cpu().numpy()
+            next_obs, reward, done, truncated, info = env.step(action_np)
+
+            buffer.add(
+                obs,
+                action_np,
+                log_prob.item(),
+                reward,
+                float(done or truncated),
+                value.item(),
+            )
+
+            ep_reward += reward
+            ep_steps += 1
+            global_step += 1
+            obs = next_obs
+
+            if done or truncated:
+                break
+
+        episode_rewards.append(ep_reward)
+        episode_lengths.append(ep_steps)
+
+        # PPO update
+        data = buffer.get(device)
+        with torch.no_grad():
+            values_np = data["values"].cpu().numpy()
+        advantages, returns = compute_gae(
+            data["rewards"].cpu().numpy(),
+            values_np,
+            data["dones"].cpu().numpy(),
+            gamma=args.gamma,
+            lam=args.gae_lambda,
+        )
+        advantages_t = torch.FloatTensor(advantages).to(device)
+        returns_t = torch.FloatTensor(returns).to(device)
+
+        # Normalize advantages
+        if len(advantages) > 1:
+            advantages_t = (advantages_t - advantages_t.mean()) / (
+                advantages_t.std() + 1e-8
+            )
+
+        # PPO epochs
+        for _ in range(args.ppo_epochs):
+            _, new_log_probs, entropy, new_values = model.get_action_and_value(
+                data["obs"], data["actions"]
+            )
+
+            ratio = torch.exp(new_log_probs - data["log_probs"])
+            clipped = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps)
+
+            policy_loss = -torch.min(
+                ratio * advantages_t, clipped * advantages_t
+            ).mean()
+            value_loss = 0.5 * (new_values - returns_t).pow(2).mean()
+            entropy_loss = -entropy.mean()
+
+            loss = policy_loss + args.vf_coef * value_loss + args.ent_coef * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+
+        # Logging
+        if (episode + 1) % args.log_interval == 0:
+            mean_r = np.mean(episode_rewards)
+            mean_l = np.mean(episode_lengths)
+            entry = {
+                "episode": episode + 1,
+                "global_step": global_step,
+                "mean_reward": float(mean_r),
+                "mean_length": float(mean_l),
+                "ep_reward": float(ep_reward),
+                "loss": float(loss.item()),
+            }
+            log_entries.append(entry)
+            print(
+                f"[ep {episode+1}/{args.num_episodes}] "
+                f"reward={mean_r:.2f} len={mean_l:.0f} loss={loss.item():.4f} "
+                f"steps={global_step}"
+            )
+
+        # Save checkpoint
+        if (episode + 1) % args.save_interval == 0:
+            ckpt_path = save_dir / f"checkpoint_{episode+1}.pt"
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "episode": episode + 1,
+                    "global_step": global_step,
+                },
+                ckpt_path,
+            )
+
+            # Save best
+            mean_r = np.mean(episode_rewards) if episode_rewards else -float("inf")
+            if mean_r > best_reward:
+                best_reward = mean_r
+                torch.save(model.state_dict(), save_dir / "best_model.pt")
+
+            # Save log
+            with open(save_dir / "training_log.json", "w") as f:
+                json.dump(log_entries, f, indent=2)
+
+    # Final save
+    torch.save(model.state_dict(), save_dir / "final_model.pt")
+    with open(save_dir / "training_log.json", "w") as f:
+        json.dump(log_entries, f, indent=2)
+
+    env.close()
+    print(f"Training complete. Best reward: {best_reward:.2f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train OpenFront RL agent with PPO")
+    parser.add_argument("--map", default="plains", help="Map name")
+    parser.add_argument("--opponents", type=int, default=3)
+    parser.add_argument("--difficulty", default="Medium")
+    parser.add_argument("--ticks-per-step", type=int, default=10)
+    parser.add_argument("--max-steps", type=int, default=3000)
+    parser.add_argument("--num-episodes", type=int, default=10000)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-eps", type=float, default=0.2)
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--ent-coef", type=float, default=0.01)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--save-interval", type=int, default=100)
+    parser.add_argument("--save-dir", default="./checkpoints")
+    args = parser.parse_args()
+    train(args)
