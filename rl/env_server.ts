@@ -362,14 +362,14 @@ function calculateReward(): number {
   const troopDelta = curTroops - prevTroops;
   reward += troopDelta * 0.0001;
 
-  // Death penalty
+  // Death penalty (kept small relative to per-step tile rewards ~0.01)
   if (!rlPlayer.isAlive()) {
-    reward -= 10;
+    reward -= 3;
   }
 
   // Win bonus
   if (game.getWinner()?.id() === rlPlayer.id()) {
-    reward += 100;
+    reward += 10;
   }
 
   // Update prev state
@@ -477,7 +477,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
 
   switch (unitType) {
     case UnitType.City:
-    case UnitType.Factory: { // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
+    case UnitType.Factory: {
+      // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
       const safeTiles = scored.slice(Math.floor(scored.length * 0.8));
       if (safeTiles.length === 0)
         return scored[scored.length - 1]?.tile ?? null;
@@ -485,7 +486,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     case UnitType.DefensePost:
-    case UnitType.SAMLauncher: { // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
+    case UnitType.SAMLauncher: {
+      // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
       const lo = Math.floor(scored.length * 0.2);
       const hi = Math.floor(scored.length * 0.4);
       const defTiles = scored.slice(lo, Math.max(hi, lo + 1));
