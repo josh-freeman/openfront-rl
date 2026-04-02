@@ -600,7 +600,7 @@ if __name__ == "__main__":
     parser.add_argument("--opponents", type=int, default=3)
     parser.add_argument("--difficulty", default="Medium")
     parser.add_argument("--ticks-per-step", type=int, default=10)
-    parser.add_argument("--max-steps", type=int, default=10000)
+    parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--rollout-steps", type=int, default=512, help="Steps per env per rollout")
     parser.add_argument("--num-updates", type=int, default=10000, help="Number of PPO updates")
