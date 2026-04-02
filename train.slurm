@@ -26,13 +26,6 @@ echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 
-# Auto-resume: if checkpoints exist, add --resume flag
-RESUME_FLAG=""
-if [ -f checkpoints/state.json ]; then
-    echo "Found existing checkpoint, will resume training"
-    RESUME_FLAG="--resume"
-fi
-
 cd rl
 python -u train.py \
     --opponents 2 \
@@ -46,6 +39,6 @@ python -u train.py \
     --curriculum \
     --save-interval 50 \
     --log-interval 5 \
-    $RESUME_FLAG
+    --save-dir ./checkpoints_v3
 
 echo "=== Job $SLURM_JOB_ID finished at $(date) ==="
