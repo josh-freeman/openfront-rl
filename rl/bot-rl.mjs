@@ -249,17 +249,71 @@ async function extractGameState(page, botName) {
         // The "X%" in the control panel is the attack ratio, NOT territory.
       }
 
-      // Fix 4: Read unit counts directly from <unit-display> Lit properties
-      // instead of fragile positional span parsing
+      // Fix 4: Read unit counts from <unit-display> Lit properties,
+      // falling back to DOM icon-adjacent span parsing
       const unitDisplay = document.querySelector("unit-display");
       if (unitDisplay) {
-        const cities = unitDisplay._cities || 0;
-        const factories = unitDisplay._factories || 0;
-        const ports = unitDisplay._port || 0;
-        const defenses = unitDisplay._defensePost || 0;
-        const silos = unitDisplay._missileSilo || 0;
-        const sams = unitDisplay._samLauncher || 0;
-        const warships = unitDisplay._warships || 0;
+        let cities = 0,
+          factories = 0,
+          ports = 0,
+          defenses = 0,
+          silos = 0,
+          sams = 0,
+          warships = 0;
+
+        // Try Lit properties first (private fields accessible at runtime)
+        if (typeof unitDisplay._cities === "number") {
+          cities = unitDisplay._cities;
+          factories = unitDisplay._factories || 0;
+          ports = unitDisplay._port || 0;
+          defenses = unitDisplay._defensePost || 0;
+          silos = unitDisplay._missileSilo || 0;
+          sams = unitDisplay._samLauncher || 0;
+          warships = unitDisplay._warships || 0;
+        } else {
+          // Fallback: match count spans by adjacent icon alt/title/src
+          const iconMap = {
+            CityIcon: "cities",
+            FactoryIcon: "factories",
+            PortIcon: "ports",
+            ShieldIcon: "defenses",
+            MissileSiloIcon: "silos",
+            SamLauncherIcon: "sams",
+            BattleshipIcon: "warships",
+          };
+          const counts = {
+            cities: 0,
+            factories: 0,
+            ports: 0,
+            defenses: 0,
+            silos: 0,
+            sams: 0,
+            warships: 0,
+          };
+          for (const img of unitDisplay.querySelectorAll("img")) {
+            const src = img.src || img.getAttribute("src") || "";
+            for (const [iconKey, countKey] of Object.entries(iconMap)) {
+              if (src.includes(iconKey)) {
+                // The count is in the closest button/container's text
+                const btn = img.closest("button") || img.parentElement;
+                if (btn) {
+                  const text = btn.textContent?.trim() || "";
+                  const num = parseInt(text.replace(/\D/g, ""), 10);
+                  if (!isNaN(num)) counts[countKey] = num;
+                }
+                break;
+              }
+            }
+          }
+          cities = counts.cities;
+          factories = counts.factories;
+          ports = counts.ports;
+          defenses = counts.defenses;
+          silos = counts.silos;
+          sams = counts.sams;
+          warships = counts.warships;
+        }
+
         state.hasSilo = silos > 0;
         state.hasPort = ports > 0;
         state.hasSAM = sams > 0;
@@ -270,7 +324,6 @@ async function extractGameState(page, botName) {
         state.numDefenses = defenses;
         state.numSilos = silos;
         state.numSAMs = sams;
-        // units array: one entry per building for the model's len(units)/20 calc
         const totalUnits =
           cities + factories + ports + defenses + silos + sams + warships;
         state.units = new Array(totalUnits).fill("unit");
@@ -293,14 +346,16 @@ async function extractGameState(page, botName) {
         if (attacksDisplay.incomingBoats)
           state.incomingAttacks += attacksDisplay.incomingBoats.length;
 
-        // Fix 2: Extract attacker names for relation tracking
+        // Fix 2: Extract attacker names from rendered attack rows
+        // The incoming attack rows render attacker names as visible text with
+        // class "truncate" inside red-colored buttons. Read directly from DOM.
         const attackerNames = [];
-        const game = attacksDisplay.game;
-        if (game && attacksDisplay.incomingAttacks) {
-          for (const atk of attacksDisplay.incomingAttacks) {
-            const p = game.playerBySmallID?.(atk.attackerID);
-            if (p) attackerNames.push(p.displayName?.() || "");
-          }
+        const attackRows = attacksDisplay.querySelectorAll(
+          ".text-red-400 .truncate",
+        );
+        for (const el of attackRows) {
+          const name = el.textContent?.trim();
+          if (name) attackerNames.push(name);
         }
         state._attackerNames = attackerNames;
       }
@@ -327,22 +382,32 @@ async function extractGameState(page, botName) {
       // Troop displays use renderTroops(v) = renderNumber(v/10), so multiply by 10
       const parseTroops = (s) => parseDisplayNum(s) * 10;
 
-      // Also parse leaderboard for territory % data
-      const lbData = {}; // name -> { pct, gold, troops }
+      // Read leaderboard data from <leader-board> Lit component's players array.
+      // Each entry has { name, score, player } where player is a PlayerView
+      // with numTilesOwned() and troops() methods giving exact values.
+      const lbData = {}; // name -> { tiles, troops }
       const lb2 = document.querySelector("leader-board");
-      if (lb2) {
-        const root = lb2.shadowRoot || lb2;
-        for (const el of root.querySelectorAll("tr, div, span")) {
-          const t = el.textContent?.trim() || "";
-          // Match rows like: "1 PlayerName 0.5% 148K 64.5K"
-          const rowMatch = t.match(
-            /^(\d+)\s+(.+?)\s+([\d.]+)%\s+([\d.]+[KMB]?)\s+([\d.]+[KMB]?)$/,
-          );
-          if (rowMatch) {
-            lbData[rowMatch[2].trim()] = {
-              pct: parseFloat(rowMatch[3]) / 100,
-              gold: parseDisplayNum(rowMatch[4]), // gold uses renderNumber (no /10)
-              troops: parseTroops(rowMatch[5]), // troops uses renderTroops (/10)
+      if (lb2 && lb2.players) {
+        for (const entry of lb2.players) {
+          const name = entry.name;
+          if (!name) continue;
+          const pv = entry.player;
+          if (pv) {
+            // Direct access to PlayerView — exact values, no parsing
+            const tiles =
+              typeof pv.numTilesOwned === "function"
+                ? pv.numTilesOwned()
+                : pv.numTilesOwned || 0;
+            const troops =
+              typeof pv.troops === "function" ? pv.troops() : pv.troops || 0;
+            lbData[name] = { tiles, troops };
+          } else {
+            // Fallback: parse score string "X.X%" for tiles
+            const pctMatch = entry.score?.match(/([\d.]+)%/);
+            const pct = pctMatch ? parseFloat(pctMatch[1]) / 100 : 0;
+            lbData[name] = {
+              tiles: Math.round(pct * state.totalMapTiles),
+              troops: 0,
             };
           }
         }
@@ -481,17 +546,15 @@ async function extractGameState(page, botName) {
         if (name.toLowerCase() === "wilderness") continue; // not a real player
 
         const lb = lbData[name] || {};
-        let tiles = lb.pct ? Math.round(lb.pct * state.totalMapTiles) : 0;
-        if (tiles === 0 && info.troops > 0) {
-          // Rough estimate: ~0.2 tiles per troop (troops already x10 corrected)
-          tiles = Math.round(info.troops * 0.2);
-        }
+        // Use exact tile/troop counts from leaderboard PlayerView
+        const tiles = lb.tiles || 0;
+        const troops = lb.troops || 0;
 
         neighbors.push({
           id: name,
           name: name,
           tiles,
-          troops: info.troops || lb.troops || 0,
+          troops,
           relation: 2, // Relation.Neutral = 2 (matches training env)
           alive: true,
           isLandNeighbor: landNeighborNames.has(name),
