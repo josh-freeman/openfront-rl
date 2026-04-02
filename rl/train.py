@@ -24,22 +24,33 @@ try:
 except ImportError:
     wandb = None
 
-AVAILABLE_MAPS = [
-    # Original testdata maps
+# Maps organized by complexity tier — curriculum adds more maps as training progresses
+MAP_TIER_1 = [
+    # Simple, balanced maps for learning basics
     "plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean",
-    # Resource maps (diverse geography)
-    "achiran", "aegean", "africa", "alps", "amazonriver", "amazonriverwide", "arctic",
-    "asia", "australia", "baikal", "beringstrait", "betweentwoseas", "blacksea",
-    "bosphorusstraits", "britannia", "britanniaclassic", "deglaciatedantarctica",
-    "eastasia", "europe", "europeclassic", "falklandislands", "faroeislands",
-    "fourislands", "gatewaytotheatlantic", "gulfofstlawrence", "halkidiki", "hawaii",
-    "iceland", "italia", "japan", "lemnos", "lisbon", "manicouagan", "mars",
-    "mediterranean", "mena", "milkyway", "montreal", "newyorkcity", "niledelta",
-    "northamerica", "oceania", "pangaea", "passage", "pluto", "reglaciatedantarctica",
-    "sanfrancisco", "southamerica", "straitofgibraltar", "straitofhormuz",
-    "surrounded", "thebox", "theboxplus", "tourney1", "tourney2", "tourney3", "tourney4",
-    "tradersdream", "twolakes", "worldrotated", "yenisei",
 ]
+MAP_TIER_2 = MAP_TIER_1 + [
+    # Mid-complexity: real geography, moderate water/chokepoints
+    "europe", "europeclassic", "northamerica", "africa", "asia", "australia",
+    "southamerica", "mediterranean", "britannia", "britanniaclassic",
+    "eastasia", "oceania", "pangaea", "mena",
+]
+MAP_TIER_3 = MAP_TIER_2 + [
+    # Harder: islands, straits, unusual layouts
+    "aegean", "alps", "amazonriver", "amazonriverwide", "arctic",
+    "baikal", "beringstrait", "betweentwoseas", "blacksea",
+    "bosphorusstraits", "deglaciatedantarctica",
+    "falklandislands", "faroeislands", "fourislands",
+    "gatewaytotheatlantic", "gulfofstlawrence", "halkidiki", "hawaii",
+    "iceland", "italia", "japan", "lemnos", "lisbon", "manicouagan",
+    "niledelta", "passage", "sanfrancisco",
+    "straitofgibraltar", "straitofhormuz", "surrounded",
+    "thebox", "theboxplus", "tourney1", "tourney2", "tourney3", "tourney4",
+    "tradersdream", "twolakes", "worldrotated", "yenisei",
+    "achiran", "mars", "milkyway", "montreal", "newyorkcity", "pluto",
+    "reglaciatedantarctica",
+]
+AVAILABLE_MAPS = MAP_TIER_3  # Full list for --maps default
 
 from env import NUM_ACTIONS
 
@@ -156,6 +167,9 @@ def train(args):
     print(f"Using device: {device}")
 
     maps = args.maps.split(",")
+    # When using curriculum, start with tier 1 maps regardless of --maps
+    if args.curriculum:
+        maps = MAP_TIER_1
     max_neighbors = 16
     obs_dim = 16 + max_neighbors * 4  # 80
 
@@ -253,21 +267,23 @@ def train(args):
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_now
 
-        # Curriculum learning: ramp up difficulty and opponents over training
+        # Curriculum learning: ramp difficulty, opponents, AND map pool over training
         if args.curriculum:
             progress = update / args.num_updates
-            if progress < 0.10:
-                new_diff, new_opp = "Easy", 2
-            elif progress < 0.20:
-                new_diff, new_opp = "Medium", 5
-            elif progress < 0.35:
-                new_diff, new_opp = "Hard", 8
+            if progress < 0.05:
+                new_diff, new_opp, new_maps = "Easy", 2, MAP_TIER_1
+            elif progress < 0.30:
+                new_diff, new_opp, new_maps = "Medium", 5, MAP_TIER_2
+            elif progress < 0.50:
+                new_diff, new_opp, new_maps = "Hard", 8, MAP_TIER_3
             else:
-                new_diff, new_opp = "Hard", 12
+                new_diff, new_opp, new_maps = "Hard", 12, MAP_TIER_3
             if envs.difficulty != new_diff or envs.num_opponents != new_opp:
-                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents (progress={progress:.0%})")
+                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%})")
                 envs.difficulty = new_diff
                 envs.num_opponents = new_opp
+            if len(envs.maps) != len(new_maps):
+                envs.maps = new_maps
 
         # Collect rollout
         for step in range(args.rollout_steps):
