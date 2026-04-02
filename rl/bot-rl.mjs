@@ -497,9 +497,13 @@ async function extractGameState(page, botName) {
         for (const el of allEls) {
           const t = el.textContent?.trim() || "";
           // Only match leaf-ish elements (short text containing our name + a %)
+          // Leaderboard truncates names: "xXDarkLord42Xx" → "[XXDAR] xX..."
           if (
             t.length < 200 &&
-            (t.includes(botName) || t.includes(botName.slice(0, 6)))
+            (t.includes(botName) ||
+              t.includes(botName.slice(0, 4)) ||
+              t.includes("XXDAR") ||
+              (t.includes(botName.slice(0, 2)) && t.includes("%")))
           ) {
             const pctMatch = t.match(/([\d.]+)%/);
             if (pctMatch) {
@@ -649,11 +653,12 @@ async function focusCanvas(page) {
   const canvas = await page.$("canvas");
   if (canvas) {
     await canvas.focus().catch(() => {});
-    // Also click to ensure the game's event handlers see activity
+    // Move mouse to canvas center but DON'T click — clicking center sends troops
+    // to our own territory (wastes them on internal movement)
     const box = await canvas.boundingBox();
     if (box) {
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-      await sleep(50);
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await sleep(30);
     }
   }
 }
@@ -715,23 +720,21 @@ async function zoomStep(page, delta) {
 }
 
 // Generate a random point well inside our territory (tight around center after 'c')
-// Distances scale inversely with zoom: at high zoom, territory is fewer pixels.
 function randomInterior(zone) {
-  const scaleFactor = 1.8 / currentScale; // 1.0 at default zoom, smaller at high zoom
-  const spread = 40 * scaleFactor;
+  const spread = 30;
   return {
     x: zone.cx + (Math.random() - 0.5) * spread * 2,
     y: zone.cy + (Math.random() - 0.5) * spread * 2,
   };
 }
 
-// Generate a random point at/beyond our border (for expansion/attacks)
-// At default zoom (1.8), border is ~80-150px from center.
-// At scale 8, territory is much smaller on screen, so border is ~18-34px.
+// Generate a random point at/beyond our border (for expansion/attacks).
+// After centering + dynamic zoom, our territory is always roughly centered.
+// Use 80-200px to ensure clicks reach BEYOND our territory into wilderness.
+// Clicking our own tiles does nothing (canAttack=false for own tiles).
 function randomBorder(zone) {
-  const scaleFactor = 1.8 / currentScale;
   const angle = Math.random() * Math.PI * 2;
-  const dist = (80 + Math.random() * 70) * scaleFactor;
+  const dist = 80 + Math.random() * 120;
   const x = zone.cx + Math.cos(angle) * dist;
   const y = zone.cy + Math.sin(angle) * dist;
   return {
@@ -780,12 +783,25 @@ const NUKE_KEYS = {
   [ACTION_LAUNCH_MIRV]: { key: "0", name: "MIRV", minGold: 10_000_000 },
 };
 
+// Clear ghost structure (build mode) so clicks register as attacks.
+// If ghostStructure is set from a previous build key, ALL attack clicks are
+// silently blocked by ClientGameRunner.inputEvent.
+async function clearBuildMode(page) {
+  await page.keyboard.press("Escape").catch(() => {});
+  await sleep(50);
+}
+
 async function executeRLAction(page, action, zone, goldAmount) {
   if (!action || !zone) return;
 
   const actionType = action.actionType;
   const troopFraction = action.troopFraction || 0.5;
   const gold = goldAmount || 0;
+
+  // Always clear build mode before non-build actions
+  if (!BUILD_KEYS[actionType] && !NUKE_KEYS[actionType]) {
+    await clearBuildMode(page);
+  }
 
   if (actionType === ACTION_NOOP) {
     // Expand into borders — click on border ring
@@ -1260,6 +1276,7 @@ async function main() {
       }
 
       // ── EXPAND: click borders to grow ──
+      await clearBuildMode(page);
       // Use explicit mousedown+mouseup at same position with gap between clicks
       // to avoid rapid clicks being interpreted as drags (which pan the camera)
       for (let i = 0; i < 3; i++) {
