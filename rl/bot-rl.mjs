@@ -205,6 +205,18 @@ async function extractGameState(page, botName) {
         numNukes: 0,
       };
 
+      // Fix 3: Read actual map dimensions and tick from game object
+      const sidebar = document.querySelector("game-right-sidebar");
+      if (sidebar && sidebar.game) {
+        const g = sidebar.game;
+        const w = typeof g.width === "function" ? g.width() : g.width;
+        const h = typeof g.height === "function" ? g.height() : g.height;
+        if (w && h) state.totalMapTiles = w * h;
+        // Read tick directly from game engine (always increasing)
+        const ticks = typeof g.ticks === "function" ? g.ticks() : g.ticks;
+        if (typeof ticks === "number") state.tick = ticks;
+      }
+
       // Parse HUD from the <control-panel> custom element
       const panel = document.querySelector("control-panel");
       if (panel) {
@@ -237,27 +249,17 @@ async function extractGameState(page, botName) {
         // The "X%" in the control panel is the attack ratio, NOT territory.
       }
 
-      // Parse unit counts from <unit-display> (light DOM, no shadow root)
-      // Structure: each unit type has an img + span.text-xs with the count
-      // Order: city(1), factory(2), port(3), defense(4), silo(5), SAM(6), warship(7)
+      // Fix 4: Read unit counts directly from <unit-display> Lit properties
+      // instead of fragile positional span parsing
       const unitDisplay = document.querySelector("unit-display");
       if (unitDisplay) {
-        const countSpans = unitDisplay.querySelectorAll("span.text-xs");
-        // Counts appear in order: cities, factories, ports, defenses, silos, SAMs, warships
-        const counts = [];
-        for (const span of countSpans) {
-          const t = span.textContent?.trim();
-          if (t !== undefined) counts.push(parseInt(t) || 0);
-        }
-        const [
-          cities = 0,
-          factories = 0,
-          ports = 0,
-          defenses = 0,
-          silos = 0,
-          sams = 0,
-          warships = 0,
-        ] = counts;
+        const cities = unitDisplay._cities || 0;
+        const factories = unitDisplay._factories || 0;
+        const ports = unitDisplay._port || 0;
+        const defenses = unitDisplay._defensePost || 0;
+        const silos = unitDisplay._missileSilo || 0;
+        const sams = unitDisplay._samLauncher || 0;
+        const warships = unitDisplay._warships || 0;
         state.hasSilo = silos > 0;
         state.hasPort = ports > 0;
         state.hasSAM = sams > 0;
@@ -283,19 +285,22 @@ async function extractGameState(page, botName) {
           state.outgoingAttacks += attacksDisplay.outgoingBoats.length;
         if (attacksDisplay.incomingBoats)
           state.incomingAttacks += attacksDisplay.incomingBoats.length;
+
+        // Fix 2: Extract attacker names for relation tracking
+        const attackerNames = [];
+        const game = attacksDisplay.game;
+        if (game && attacksDisplay.incomingAttacks) {
+          for (const atk of attacksDisplay.incomingAttacks) {
+            const p = game.playerBySmallID?.(atk.attackerID);
+            if (p) attackerNames.push(p.displayName?.() || "");
+          }
+        }
+        state._attackerNames = attackerNames;
       }
 
-      // Parse game tick from <game-right-sidebar>
-      // sidebar.timer can be a COUNTDOWN (maxTime - elapsed), not elapsed.
-      // Instead, read the game's actual tick count from the game view if possible.
-      const sidebar = document.querySelector("game-right-sidebar");
-      if (sidebar && sidebar.game) {
-        const ticks = sidebar.game.ticks?.();
-        if (typeof ticks === "number") {
-          state.tick = ticks;
-        } else if (typeof sidebar.timer === "number") {
-          state.tick = Math.round(sidebar.timer * 10);
-        }
+      // Fallback tick from sidebar timer if game.ticks() wasn't available
+      if (state.tick === 0 && sidebar && typeof sidebar.timer === "number") {
+        state.tick = Math.round(sidebar.timer * 10);
       }
 
       // Parse neighbor info from NameLayer DOM elements (much better than leaderboard)
@@ -966,6 +971,7 @@ async function executeRLAction(page, action, zone, goldAmount, neighbors) {
     log(
       `RL: Launch ${name} at ${nukeTargetName} (${Math.round(nx)},${Math.round(ny)})`,
     );
+    return { nukeLaunched: true };
   } else if (actionType === ACTION_UPGRADE) {
     const spot = randomInterior(zone);
     await page.mouse.click(spot.x, spot.y);
@@ -1096,6 +1102,8 @@ async function main() {
   lastTerritoryPct = 0;
   let spawnTime = 0;
   let lastNeighborScan = 0; // Brief zoom-out to refresh neighbor label data
+  const playerRelations = new Map(); // name -> Relation (0=Hostile,1=Distrustful,2=Neutral,3=Friendly)
+  let nukeCount = 0; // Track nukes launched (increment on launch, decrement on resolve)
 
   while (true) {
     try {
@@ -1237,12 +1245,13 @@ async function main() {
         }
       }
 
-      // ── NEIGHBOR SCAN: briefly zoom out every 30s to refresh player labels ──
+      // ── NEIGHBOR SCAN: briefly zoom out to refresh player labels ──
       // NameLayer only updates troop text when elements are visible (display !== none).
       // Visibility requires scale * baseSize >= 7. By zooming to ~1.5, even small
       // players (baseSize ~5) become visible, refreshing their troop counts.
+      // Fix 6: scan every 10s instead of 30s for better isLandNeighbor accuracy
       if (
-        Date.now() - lastNeighborScan > 30000 &&
+        Date.now() - lastNeighborScan > 10000 &&
         Date.now() - spawnTime > 5000
       ) {
         lastNeighborScan = Date.now();
@@ -1267,6 +1276,21 @@ async function main() {
 
         const gameState = await extractGameState(page, BOT_NAME);
         if (gameState) {
+          // Fix 2: Update relation tracking from incoming attacks
+          if (gameState._attackerNames) {
+            for (const name of gameState._attackerNames) {
+              if (name) playerRelations.set(name, 0); // Hostile
+            }
+          }
+          // Apply tracked relations to neighbors
+          for (const n of gameState.neighbors) {
+            if (playerRelations.has(n.name)) {
+              n.relation = playerRelations.get(n.name);
+            }
+          }
+          // Fix 5: Pass nuke count from bot state
+          gameState.numNukes = nukeCount;
+
           lastGold = gameState.myGold || 0;
           lastTerritoryPct = gameState.territoryPct || 0;
           const g = lastGold;
@@ -1325,7 +1349,14 @@ async function main() {
       }
 
       // ── EXECUTE RL POLICY ACTION ──
-      await executeRLAction(page, currentAction, zone, lastGold, lastNeighbors);
+      const actionResult = await executeRLAction(
+        page,
+        currentAction,
+        zone,
+        lastGold,
+        lastNeighbors,
+      );
+      if (actionResult?.nukeLaunched) nukeCount++;
 
       // ── Accept alliance requests ──
       if (tick % 10 === 0) {
