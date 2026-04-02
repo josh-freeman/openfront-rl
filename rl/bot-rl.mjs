@@ -226,11 +226,11 @@ async function extractGameState(page, botName) {
           }
         }
 
-        // Troops: "X / Y" pattern in the panel
+        // Troops: "X / Y" pattern in the panel (renderTroops divides by 10)
         const allText = panel.textContent || "";
         const troopMatch = allText.match(/([\d.]+[KM]?)\s*\/\s*([\d.]+[KM]?)/);
         if (troopMatch) {
-          state.myTroops = parse(troopMatch[1]);
+          state.myTroops = parse(troopMatch[1]) * 10; // undo renderTroops /10
         }
 
         // NOTE: Territory % is NOT in the control panel — it's in the leaderboard.
@@ -300,7 +300,8 @@ async function extractGameState(page, botName) {
       //   .player-name-span → display name
       //   .player-troops → troop count text (e.g., "12.3K")
       // These exist in DOM even when hidden, but troop text is stale when display:none.
-      const parseTroops = (s) => {
+      // Parse a display number like "32.2K" → 32200
+      const parseDisplayNum = (s) => {
         if (!s) return 0;
         s = s.trim();
         if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
@@ -308,6 +309,8 @@ async function extractGameState(page, botName) {
         if (s.endsWith("B")) return parseFloat(s) * 1_000_000_000;
         return parseFloat(s) || 0;
       };
+      // Troop displays use renderTroops(v) = renderNumber(v/10), so multiply by 10
+      const parseTroops = (s) => parseDisplayNum(s) * 10;
 
       // Also parse leaderboard for territory % data
       const lbData = {}; // name -> { pct, gold, troops }
@@ -323,8 +326,8 @@ async function extractGameState(page, botName) {
           if (rowMatch) {
             lbData[rowMatch[2].trim()] = {
               pct: parseFloat(rowMatch[3]) / 100,
-              gold: parseTroops(rowMatch[4]),
-              troops: parseTroops(rowMatch[5]),
+              gold: parseDisplayNum(rowMatch[4]), // gold uses renderNumber (no /10)
+              troops: parseTroops(rowMatch[5]), // troops uses renderTroops (/10)
             };
           }
         }
@@ -476,6 +479,8 @@ async function extractGameState(page, botName) {
           alive: true,
           isLandNeighbor: landNeighborNames.has(name),
           visible: info.visible,
+          labelX: info.labelX,
+          labelY: info.labelY,
         });
       }
 
@@ -487,29 +492,15 @@ async function extractGameState(page, botName) {
       });
       state.neighbors = neighbors.slice(0, 16);
 
-      // Find our territory % from the <leader-board> element.
-      // Our row is the highlighted one at the bottom of the leaderboard.
+      // Find our territory % from the <leader-board> Lit element.
+      // Access the component's `players` array directly (light DOM Lit component).
       const lb = document.querySelector("leader-board");
-      if (lb) {
-        // Search the shadow DOM and light DOM for our name
-        const root = lb.shadowRoot || lb;
-        const allEls = root.querySelectorAll("tr, div, span");
-        for (const el of allEls) {
-          const t = el.textContent?.trim() || "";
-          // Only match leaf-ish elements (short text containing our name + a %)
-          // Leaderboard truncates names: "xXDarkLord42Xx" → "[XXDAR] xX..."
-          if (
-            t.length < 200 &&
-            (t.includes(botName) ||
-              t.includes(botName.slice(0, 4)) ||
-              t.includes("XXDAR") ||
-              (t.includes(botName.slice(0, 2)) && t.includes("%")))
-          ) {
-            const pctMatch = t.match(/([\d.]+)%/);
-            if (pctMatch) {
-              state.territoryPct = parseFloat(pctMatch[1]) / 100;
-              break;
-            }
+      if (lb && lb.players) {
+        const myEntry = lb.players.find((p) => p.isMyPlayer);
+        if (myEntry && myEntry.score) {
+          const pctMatch = myEntry.score.match(/([\d.]+)%/);
+          if (pctMatch) {
+            state.territoryPct = parseFloat(pctMatch[1]) / 100;
           }
         }
       }
@@ -791,12 +782,13 @@ async function clearBuildMode(page) {
   await sleep(50);
 }
 
-async function executeRLAction(page, action, zone, goldAmount) {
+async function executeRLAction(page, action, zone, goldAmount, neighbors) {
   if (!action || !zone) return;
 
   const actionType = action.actionType;
   const troopFraction = action.troopFraction || 0.5;
   const gold = goldAmount || 0;
+  neighbors = neighbors || [];
 
   // Always clear build mode before non-build actions
   if (!BUILD_KEYS[actionType] && !NUKE_KEYS[actionType]) {
@@ -804,8 +796,8 @@ async function executeRLAction(page, action, zone, goldAmount) {
   }
 
   if (actionType === ACTION_NOOP) {
-    // Expand into borders — click on border ring
-    for (let i = 0; i < 5; i++) {
+    // Expand into borders — click on border ring (keep conservative to save troops)
+    for (let i = 0; i < 2; i++) {
       const { x, y } = randomBorder(zone);
       await page.mouse.click(x, y);
       await sleep(50);
@@ -824,11 +816,36 @@ async function executeRLAction(page, action, zone, goldAmount) {
       currentAttackRatio = troopFraction;
       await sleep(30);
     }
-    const { x, y } = randomBorder(zone);
+
+    // Aim toward the target neighbor's screen position (from NameLayer labels)
+    const targetIdx = action.targetIdx || 0;
+    const target = neighbors[targetIdx];
+    let x, y;
+    if (target && target.labelX && target.labelY) {
+      // Click on the line between our center and the target's label,
+      // at our border distance (80-200px from center) in that direction
+      const dx = target.labelX - zone.cx;
+      const dy = target.labelY - zone.cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > 10) {
+        // Aim toward target, 80-200px from our center (our border region)
+        const clickDist = 80 + Math.random() * 120;
+        x = zone.cx + (dx / dist) * clickDist;
+        y = zone.cy + (dy / dist) * clickDist;
+      } else {
+        // Target is very close to center — fall back to random border
+        ({ x, y } = randomBorder(zone));
+      }
+    } else {
+      // No position data for target — fall back to random border
+      ({ x, y } = randomBorder(zone));
+    }
+
     await page.mouse.click(x, y);
     await sleep(50);
+    const targetName = target ? target.name : "unknown";
     log(
-      `RL: Attack at (${Math.round(x)},${Math.round(y)}) ratio=${troopFraction}`,
+      `RL: Attack ${targetName} at (${Math.round(x)},${Math.round(y)}) ratio=${troopFraction}`,
     );
   } else if (actionType === ACTION_RETREAT) {
     log("RL: Retreat (noop in live)");
@@ -919,20 +936,32 @@ async function executeRLAction(page, action, zone, goldAmount) {
       log(`RL: Skip ${name} — need ${(minGold / 1000).toFixed(0)}K gold`);
       return;
     }
-    // Nukes: press key, then click on enemy territory (outer ring)
+    // Nukes: press key, then click on enemy territory
     await page.keyboard.press(key).catch(() => {});
     await sleep(300);
-    // Click far from center — enemy territory
-    const angle = Math.random() * Math.PI * 2;
-    const dist = 0.15 + Math.random() * 0.1; // Beyond border ring
-    const x = zone.cx + Math.cos(angle) * zone.width * dist;
-    const y = zone.cy + Math.sin(angle) * zone.height * dist;
-    await page.mouse.move(x, y);
+    // Aim toward target player's label position
+    const nukeTargetIdx = action.targetIdx || 0;
+    const nukeTarget = neighbors[nukeTargetIdx];
+    let nx, ny;
+    if (nukeTarget && nukeTarget.labelX && nukeTarget.labelY) {
+      // Click near/at the target's label (their territory center)
+      nx = nukeTarget.labelX + (Math.random() - 0.5) * 40;
+      ny = nukeTarget.labelY + (Math.random() - 0.5) * 40;
+    } else {
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 150 + Math.random() * 100;
+      nx = zone.cx + Math.cos(angle) * dist;
+      ny = zone.cy + Math.sin(angle) * dist;
+    }
+    await page.mouse.move(nx, ny);
     await sleep(300);
-    await page.mouse.click(x, y);
+    await page.mouse.click(nx, ny);
     await sleep(200);
     await page.keyboard.press("Escape").catch(() => {});
-    log(`RL: Launch ${name} at (${Math.round(x)},${Math.round(y)})`);
+    const nukeTargetName = nukeTarget ? nukeTarget.name : "unknown";
+    log(
+      `RL: Launch ${name} at ${nukeTargetName} (${Math.round(nx)},${Math.round(ny)})`,
+    );
   } else if (actionType === ACTION_UPGRADE) {
     const spot = randomInterior(zone);
     await page.mouse.click(spot.x, spot.y);
@@ -1056,6 +1085,7 @@ async function main() {
   let lastSnap = 0;
   let lastPolicyQuery = 0;
   let currentAction = null;
+  let lastNeighbors = [];
   let lastRecenter = 0;
   lastGold = 0;
   currentScale = 1.8; // reset to game default at game start
@@ -1266,6 +1296,7 @@ async function main() {
           const action = await queryPolicy(gameState);
           if (action) {
             currentAction = action;
+            lastNeighbors = gameState.neighbors || [];
             if (tick % 10 === 0) {
               log(
                 `RL action: type=${action.actionType} target=${action.targetIdx} troops=${action.troopFraction} gold=${(lastGold / 1000).toFixed(0)}K`,
@@ -1279,7 +1310,7 @@ async function main() {
       await clearBuildMode(page);
       // Use explicit mousedown+mouseup at same position with gap between clicks
       // to avoid rapid clicks being interpreted as drags (which pan the camera)
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 1; i++) {
         const { x, y } = randomBorder(zone);
         await page.mouse.move(x, y);
         await sleep(20);
@@ -1290,7 +1321,7 @@ async function main() {
       }
 
       // ── EXECUTE RL POLICY ACTION ──
-      await executeRLAction(page, currentAction, zone, lastGold);
+      await executeRLAction(page, currentAction, zone, lastGold, lastNeighbors);
 
       // ── Accept alliance requests ──
       if (tick % 10 === 0) {

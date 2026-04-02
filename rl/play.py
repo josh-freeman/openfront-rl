@@ -146,7 +146,18 @@ class PolicyHandler(BaseHTTPRequestHandler):
             mask_t = torch.FloatTensor(mask_arr).unsqueeze(0).to(self.device)
 
         obs_t = torch.FloatTensor(obs_vec).unsqueeze(0).to(self.device)
+
+        # Debug: log mask and raw logits to file
+        import sys
         with torch.no_grad():
+            out = self.model.forward(obs_t)
+            raw_logits = out["action_type"].squeeze(0).cpu().numpy()
+            if mask_t is not None:
+                mask_np = mask_t.squeeze(0).cpu().numpy()
+                masked_logits = raw_logits + (1 - mask_np) * (-1e8)
+                top3 = sorted(enumerate(masked_logits), key=lambda x: -x[1])[:3]
+                with open("/tmp/policy_debug.log", "a") as f:
+                    f.write(f"mask={mask_np.astype(int).tolist()} raw=[{', '.join(f'{x:.1f}' for x in raw_logits)}] top3={[(i, f'{v:.1f}') for i,v in top3]}\n")
             action, _, _, _ = self.model.get_action_and_value(obs_t, action_mask=mask_t)
 
         action_np = action.squeeze(0).cpu().numpy().tolist()
@@ -155,6 +166,8 @@ class PolicyHandler(BaseHTTPRequestHandler):
         action_type = int(action_np[0])
         target_idx = int(action_np[1])
         troop_bucket = int(action_np[2])
+        with open("/tmp/policy_debug.log", "a") as f:
+            f.write(f"→ type={action_type} target={target_idx} bucket={troop_bucket}\n")
 
         response = {
             "actionType": action_type,
