@@ -546,9 +546,14 @@ async function extractGameState(page, botName) {
         if (name.toLowerCase() === "wilderness") continue; // not a real player
 
         const lb = lbData[name] || {};
-        // Use exact tile/troop counts from leaderboard PlayerView
-        const tiles = lb.tiles || 0;
-        const troops = lb.troops || 0;
+        // Use exact values from leaderboard PlayerView when available,
+        // fall back to NameLayer DOM values (only top ~5 players are on leaderboard)
+        const troops = lb.troops || info.troops || 0;
+        let tiles = lb.tiles || 0;
+        if (tiles === 0 && troops > 0) {
+          // Rough estimate: tiles ≈ troops * 0.02 (troops are raw values)
+          tiles = Math.round(troops * 0.02);
+        }
 
         neighbors.push({
           id: name,
