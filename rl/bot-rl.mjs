@@ -33,6 +33,7 @@ const POLICY_INTERVAL_MS = TICKS_PER_STEP * TURN_INTERVAL_MS; // 1000ms
 // Track actual game scale (game default is 1.8, range [0.2, 20])
 // The game zooms via: scale /= (1 + delta/600), clamped to [0.2, 20]
 let currentScale = 1.8;
+let currentAttackRatio = 0.2; // Game default, adjusted via T/Y keys
 let lastGold = 0;
 let lastTerritoryPct = 0;
 
@@ -200,44 +201,36 @@ async function extractGameState(page) {
       numNukes: 0,
     };
 
-    // The bottom HUD bar contains: troops/maxTroops, territory%, gold
-    // Look for elements in the bottom 15% of the screen
-    const bottomEls = [];
-    for (const el of document.querySelectorAll("*")) {
-      const r = el.getBoundingClientRect();
-      if (r.y > window.innerHeight * 0.85 && r.width > 20 && r.height > 5) {
-        bottomEls.push({ el, text: el.textContent?.trim() || "", r });
-      }
-    }
+    // Parse HUD from the <control-panel> custom element
+    const panel = document.querySelector("control-panel");
+    if (panel) {
+      const parse = (s) => {
+        if (!s) return 0;
+        s = s.trim();
+        if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
+        if (s.endsWith("K")) return parseFloat(s) * 1000;
+        return parseFloat(s) || 0;
+      };
 
-    for (const { text } of bottomEls) {
-      // Match troops: "17.3K / 49.7K"
-      const troopMatch = text.match(/^([\d.]+[KM]?)\s*\/\s*([\d.]+[KM]?)$/);
+      // Gold: yellow-bordered div with gold coin icon
+      const goldDivs = panel.querySelectorAll(".border-yellow-400 span");
+      for (const span of goldDivs) {
+        const t = span.textContent?.trim();
+        if (t && /^[\d.]+[KMB]?$/.test(t)) {
+          state.myGold = parse(t);
+          break;
+        }
+      }
+
+      // Troops: "X / Y" pattern in the panel
+      const allText = panel.textContent || "";
+      const troopMatch = allText.match(/([\d.]+[KM]?)\s*\/\s*([\d.]+[KM]?)/);
       if (troopMatch) {
-        const parse = (s) => {
-          if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
-          if (s.endsWith("K")) return parseFloat(s) * 1000;
-          return parseFloat(s);
-        };
         state.myTroops = parse(troopMatch[1]);
       }
-      // Match territory: "20% (3.47K)" or just "20%"
-      const pctMatch = text.match(/([\d.]+)%/);
-      if (pctMatch && !troopMatch) {
-        state.territoryPct = parseFloat(pctMatch[1]) / 100;
-      }
-      // Match gold: look for standalone number near the gold icon (bottom-right HUD area)
-      const goldMatch = text.match(/^([\d.]+[KM]?)$/);
-      if (goldMatch && !troopMatch) {
-        const parse = (s) => {
-          if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
-          if (s.endsWith("K")) return parseFloat(s) * 1000;
-          return parseFloat(s);
-        };
-        const val = parse(goldMatch[1]);
-        // Gold is typically larger than territory% and troops number
-        if (val > state.myGold) state.myGold = val;
-      }
+
+      // NOTE: Territory % is NOT in the control panel — it's in the leaderboard.
+      // The "X%" in the control panel is the attack ratio, NOT territory.
     }
 
     // Parse leaderboard (top-left table) for neighbor info
@@ -271,6 +264,29 @@ async function extractGameState(page) {
       }
     }
     state.neighbors = rows.slice(0, 16);
+
+    // Find our territory % from the <leader-board> element.
+    // Our row is the highlighted one at the bottom of the leaderboard.
+    const lb = document.querySelector("leader-board");
+    if (lb) {
+      // Search the shadow DOM and light DOM for our name
+      const root = lb.shadowRoot || lb;
+      const allEls = root.querySelectorAll("tr, div, span");
+      for (const el of allEls) {
+        const t = el.textContent?.trim() || "";
+        // Only match leaf-ish elements (short text containing our name + a %)
+        if (
+          t.length < 200 &&
+          (t.includes("xXDarkLord") || t.includes("XXDAR"))
+        ) {
+          const pctMatch = t.match(/([\d.]+)%/);
+          if (pctMatch) {
+            state.territoryPct = parseFloat(pctMatch[1]) / 100;
+            break;
+          }
+        }
+      }
+    }
 
     return state;
   });
@@ -471,45 +487,23 @@ async function zoomStep(page, delta) {
   await sleep(80);
 }
 
-// Estimate what fraction of the screen our territory occupies (after 'c' centering).
-// At min zoom (scale 0.2) the full map fills the screen, so territory linear fraction
-// ≈ sqrt(territoryPct). At higher scales we see less map, so territory appears bigger.
-// Result is territory's approximate linear fraction of the viewport (0 to ~1).
-function territoryScreenFraction() {
-  let tPct = lastTerritoryPct;
-  if (tPct < 0.0001) {
-    // HUD shows 0.0% for small nations — use gold as very conservative proxy.
-    // A nation earning 1K/s with 100K gold has been alive ~100s and probably
-    // owns ~0.002% of a large map. Be conservative to keep clicks tight.
-    tPct = Math.min(0.01, lastGold / 50_000_000);
-  }
-  const linear = Math.sqrt(Math.max(tPct, 0.00001));
-  // Calibration: at scale 5.4, 0.01% territory → sqrt(0.0001)*5.4*2 = 0.108 → 11%
-  // at scale 5.4, 0.1% territory → sqrt(0.001)*5.4*2 = 0.34 → 34%
-  // at scale 1.8, 1% territory → sqrt(0.01)*1.8*2 = 0.36 → 36%
-  return Math.min(0.4, linear * currentScale * 2);
-}
-
 // Generate a random point well inside our territory (tight around center after 'c')
 function randomInterior(zone) {
-  const frac = territoryScreenFraction();
-  // Stay at 40% of territory radius — guaranteed to be ours
-  const spread = Math.max(0.01, frac * 0.4);
+  // Small fixed spread around center — after centering, our territory is near center
+  const spread = 40;
   return {
-    x: zone.cx + (Math.random() - 0.5) * zone.width * spread * 2,
-    y: zone.cy + (Math.random() - 0.5) * zone.height * spread * 2,
+    x: zone.cx + (Math.random() - 0.5) * spread * 2,
+    y: zone.cy + (Math.random() - 0.5) * spread * 2,
   };
 }
 
 // Generate a random point at/beyond our border (for expansion/attacks)
 function randomBorder(zone) {
-  const frac = territoryScreenFraction();
-  const spread = Math.max(0.03, frac);
   const angle = Math.random() * Math.PI * 2;
-  // Ring around the edge of territory, extending slightly beyond
-  const dist = spread * (0.8 + Math.random() * 0.5);
-  const x = zone.cx + Math.cos(angle) * zone.width * dist;
-  const y = zone.cy + Math.sin(angle) * zone.height * dist;
+  // Click 80-150px from center — border ring
+  const dist = 80 + Math.random() * 70;
+  const x = zone.cx + Math.cos(angle) * dist;
+  const y = zone.cy + Math.sin(angle) * dist;
   return {
     x: Math.max(zone.left, Math.min(zone.right, x)),
     y: Math.max(zone.top, Math.min(zone.bottom, y)),
@@ -574,14 +568,22 @@ async function executeRLAction(page, action, zone, goldAmount) {
     actionType === ACTION_ATTACK ||
     actionType === ACTION_BOAT_ATTACK
   ) {
-    // Click on enemy territory (outer ring beyond our borders)
-    const nClicks = Math.max(5, Math.floor(15 * troopFraction));
-    for (let i = 0; i < nClicks; i++) {
-      const { x, y } = randomBorder(zone); // Click borders to expand into enemies
-      await page.mouse.click(x, y);
+    // Adjust attack ratio using T (down 10%) / Y (up 10%) to match troopFraction
+    // troopFraction: 0.2, 0.4, 0.6, 0.8, or 1.0
+    const steps = Math.round((troopFraction - currentAttackRatio) / 0.1);
+    if (steps !== 0) {
+      await focusCanvas(page);
+      const key = steps > 0 ? "y" : "t";
+      for (let i = 0; i < Math.abs(steps); i++) await page.keyboard.press(key);
+      currentAttackRatio = troopFraction;
       await sleep(30);
     }
-    log(`RL: Attack (${nClicks} clicks, troop=${troopFraction.toFixed(1)})`);
+    const { x, y } = randomBorder(zone);
+    await page.mouse.click(x, y);
+    await sleep(50);
+    log(
+      `RL: Attack at (${Math.round(x)},${Math.round(y)}) ratio=${troopFraction}`,
+    );
   } else if (actionType === ACTION_RETREAT) {
     log("RL: Retreat (noop in live)");
   } else if (BUILD_KEYS[actionType]) {
@@ -600,63 +602,43 @@ async function executeRLAction(page, action, zone, goldAmount) {
       return;
     }
 
-    // Center camera so screen center = our territory, then scan pixels
+    // Center + zoom in close for precise build placement
     await centerCamera(page);
+    const savedScale = currentScale;
+    // Zoom in to scale ~12 so our territory fills the screen
+    const zoomInSteps = Math.max(
+      0,
+      Math.round(Math.log(12 / currentScale) / Math.log(1.2)),
+    );
+    for (let i = 0; i < Math.min(zoomInSteps, 10); i++)
+      await zoomStep(page, -100);
+    await sleep(200);
+
     const box2 = await getCanvasBounds(page);
     if (!box2) return;
+    const trueCx = box2.x + box2.width / 2;
+    const trueCy = box2.y + box2.height / 2;
 
     const isBorderBuilding =
       actionType === ACTION_BUILD_DEFENSE ||
       actionType === ACTION_BUILD_SAM ||
       actionType === ACTION_BUILD_PORT;
 
-    // Try pixel-based territory detection for precise placement
-    const scan = await scanTerritory(page);
+    // At high zoom, our territory should fill most of screen after centering
+    // Just click near center (interior) or slightly off-center (border)
     let spot;
-
-    if (scan && scan.totalMine > 5) {
-      // Pick from scanned territory tiles
-      const candidates = isBorderBuilding
-        ? scan.border.length > 0
-          ? scan.border
-          : scan.interior
-        : scan.interior.length > 0
-          ? scan.interior
-          : scan.border;
-      const pick = candidates[Math.floor(Math.random() * candidates.length)];
-      // Convert canvas pixel coords to page coords
-      // canvas.width/height = internal resolution, box2 = CSS layout size
-      const canvasDims = await safeEval(page, () => {
-        const c = document.querySelector("canvas");
-        return c ? { w: c.width, h: c.height } : null;
-      });
-      const cw = canvasDims?.w || box2.width;
-      const ch = canvasDims?.h || box2.height;
+    if (isBorderBuilding) {
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 60 + Math.random() * 40;
       spot = {
-        x: box2.x + (pick.x / cw) * box2.width,
-        y: box2.y + (pick.y / ch) * box2.height,
+        x: trueCx + Math.cos(angle) * dist,
+        y: trueCy + Math.sin(angle) * dist,
       };
-      log(
-        `RL: Scan found ${scan.interior.length} interior + ${scan.border.length} border tiles (color=${scan.myColor.r},${scan.myColor.g},${scan.myColor.b})`,
-      );
     } else {
-      // Fallback to fixed offset from center
-      const trueCx = box2.x + box2.width / 2;
-      const trueCy = box2.y + box2.height / 2;
-      if (isBorderBuilding) {
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 80 + Math.random() * 70;
-        spot = {
-          x: trueCx + Math.cos(angle) * dist,
-          y: trueCy + Math.sin(angle) * dist,
-        };
-      } else {
-        spot = {
-          x: trueCx + (Math.random() - 0.5) * 80,
-          y: trueCy + (Math.random() - 0.5) * 80,
-        };
-      }
-      log("RL: Scan failed, using center fallback");
+      spot = {
+        x: trueCx + (Math.random() - 0.5) * 60,
+        y: trueCy + (Math.random() - 0.5) * 60,
+      };
     }
 
     // Step 1: Move mouse to spot
@@ -665,15 +647,23 @@ async function executeRLAction(page, action, zone, goldAmount) {
     // Step 2: Press build key → ghost structure appears at mouse location
     await focusCanvas(page);
     await page.keyboard.press(key).catch(() => {});
-    await sleep(500); // ghost needs time to initialize + check buildability
+    await sleep(500);
     // Step 3: Click to confirm placement
     await page.mouse.click(spot.x, spot.y);
     await sleep(200);
     // Step 4: Escape to exit build mode if placement failed
     await page.keyboard.press("Escape").catch(() => {});
     log(
-      `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) cx=${Math.round(trueCx)} cy=${Math.round(trueCy)} [gold=${(gold / 1000).toFixed(0)}K]`,
+      `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) scale=${currentScale.toFixed(1)} [gold=${(gold / 1000).toFixed(0)}K]`,
     );
+
+    // Zoom back out to previous level
+    const zoomOutSteps = Math.max(
+      0,
+      Math.round(Math.log(currentScale / savedScale) / Math.log(1.2)),
+    );
+    for (let i = 0; i < Math.min(zoomOutSteps, 10); i++)
+      await zoomStep(page, 100);
   } else if (NUKE_KEYS[actionType]) {
     const { key, name, minGold } = NUKE_KEYS[actionType];
     if (gold < minGold) {
@@ -904,8 +894,10 @@ async function main() {
 
         // Check if we spawned: look for the troops HUD (only visible after spawning)
         const hudState = await extractGameState(page);
+        // Troops show ~1K even before spawn. Gold > 0 only after spawning.
+        // Also allow fallback after enough attempts.
         const didSpawn =
-          hudState && (hudState.myTroops > 0 || hudState.territoryPct > 0);
+          (hudState && hudState.myGold > 100) || spawnAttempts >= 15;
 
         if (didSpawn || spawnAttempts > 15) {
           spawned = true;
@@ -914,11 +906,9 @@ async function main() {
             `Spawned! troops=${hudState?.myTroops || "?"}, territory=${((hudState?.territoryPct || 0) * 100).toFixed(1)}%`,
           );
 
-          // CRITICAL: center camera on our territory and zoom in moderately
+          // Center camera and zoom in to ~7x (1.8 → ~6.4)
           await centerCamera(page);
-          // Zoom in ~3x from default (1.8 → ~5.4) using sane deltas
-          // Each -100 delta → scale *= 1.2 (20% zoom in). 6 steps ≈ 1.2^6 ≈ 3x
-          for (let i = 0; i < 6; i++) await zoomStep(page, -100);
+          for (let i = 0; i < 7; i++) await zoomStep(page, -100);
           await sleep(500);
           lastRecenter = Date.now();
         }
@@ -937,27 +927,27 @@ async function main() {
         lastRecenter = Date.now();
         await centerCamera(page);
 
-        // Target: territory fills ~30-50% of screen. territoryScreenFraction() tells us
-        // current coverage. If too small, zoom in; if too big, zoom out.
-        const screenFrac = territoryScreenFraction();
-        const TARGET_FRAC = 0.35; // we want ~35% of screen to be our territory
-        // ratio > 1 means territory too big on screen → zoom out
-        // ratio < 1 means territory too small → zoom in
-        const ratio = screenFrac / TARGET_FRAC;
+        // Zoom targets: need enough zoom to see and click on our territory
+        const tPct = lastTerritoryPct;
+        let targetScale;
+        if (tPct < 0.005) targetScale = 7.0;
+        else if (tPct < 0.01) targetScale = 5.0;
+        else if (tPct < 0.03) targetScale = 3.5;
+        else if (tPct < 0.05) targetScale = 2.5;
+        else targetScale = 1.8;
 
-        if (ratio > 1.5 || ratio < 0.5) {
-          // Calculate how many 20%-zoom steps to get there
-          // Each step changes scale by 1.2x. We need scale to change by 1/ratio
-          // (since screenFrac ∝ scale). Steps = log(1/ratio) / log(1.2)
-          const stepsNeeded = Math.round(Math.log(1 / ratio) / Math.log(1.2));
-          const clamped = Math.max(-8, Math.min(8, stepsNeeded));
+        const scaleRatio = currentScale / targetScale;
+        if (scaleRatio > 1.5 || scaleRatio < 0.67) {
+          const stepsNeeded = Math.round(
+            Math.log(targetScale / currentScale) / Math.log(1.2),
+          );
+          const clamped = Math.max(-6, Math.min(6, stepsNeeded));
           if (clamped !== 0) {
-            // Positive steps = zoom in (negative delta), negative = zoom out (positive delta)
             const delta = clamped > 0 ? -100 : 100;
             for (let i = 0; i < Math.abs(clamped); i++)
               await zoomStep(page, delta);
             log(
-              `Zoom: scale=${currentScale.toFixed(1)}, territory screen=${(screenFrac * 100).toFixed(0)}% → ${Math.abs(clamped)} steps ${clamped > 0 ? "in" : "out"}`,
+              `Zoom: ${currentScale.toFixed(1)} → target ${targetScale.toFixed(1)}, ${Math.abs(clamped)} steps ${clamped > 0 ? "in" : "out"} (territory=${(tPct * 100).toFixed(2)}%)`,
             );
           }
         }
@@ -1044,7 +1034,7 @@ async function main() {
         const pct = gs ? (gs.territoryPct * 100).toFixed(1) : "?";
         const troops = gs ? gs.myTroops : "?";
         log(
-          `[${elapsed.toFixed(0)}s] ${pct}% territory, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, scale=${currentScale.toFixed(1)}, screenFrac=${(territoryScreenFraction() * 100).toFixed(0)}%, action=${currentAction?.actionType ?? "none"}`,
+          `[${elapsed.toFixed(0)}s] ${pct}% territory, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, scale=${currentScale.toFixed(1)}, action=${currentAction?.actionType ?? "none"}`,
         );
       }
     } catch (err) {
