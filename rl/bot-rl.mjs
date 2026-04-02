@@ -285,6 +285,103 @@ async function getCanvasBounds(page) {
   return box;
 }
 
+// ── Territory pixel scanner ──────────────────────────────────────
+// Sample canvas pixels to find our territory tiles vs enemy/water/empty.
+// Returns { interior: [{x,y},...], border: [{x,y},...], myColor: {r,g,b} }
+// Call AFTER centerCamera() so screen center = our territory.
+async function scanTerritory(page) {
+  return safeEval(page, () => {
+    const canvas = document.querySelector("canvas");
+    if (!canvas) return null;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+
+    const W = canvas.width;
+    const H = canvas.height;
+    const STEP = 12; // sample every 12px (~120x75 grid on 1400x900)
+
+    // Read center pixel — that's our territory color (after centering)
+    const centerData = ctx.getImageData(
+      Math.floor(W / 2),
+      Math.floor(H / 2),
+      1,
+      1,
+    ).data;
+    const myR = centerData[0],
+      myG = centerData[1],
+      myB = centerData[2];
+
+    // Skip if center looks like water (very dark or very blue)
+    if (myR + myG + myB < 60) return null;
+    if (myB > myR + myG + 50) return null;
+
+    // Sample the canvas in a grid
+    const grid = []; // [{x, y, mine: bool}]
+    const cols = Math.floor(W / STEP);
+    const rows = Math.floor(H / STEP);
+    // Read all pixels at once (much faster than per-pixel getImageData)
+    const imgData = ctx.getImageData(0, 0, W, H).data;
+
+    for (let gx = 0; gx < cols; gx++) {
+      for (let gy = 0; gy < rows; gy++) {
+        const px = gx * STEP + Math.floor(STEP / 2);
+        const py = gy * STEP + Math.floor(STEP / 2);
+        const idx = (py * W + px) * 4;
+        const r = imgData[idx],
+          g = imgData[idx + 1],
+          b = imgData[idx + 2];
+
+        // Color similarity — allow some tolerance for shading/borders
+        const dr = r - myR,
+          dg = g - myG,
+          db = b - myB;
+        const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+        grid.push({ x: px, y: py, gx, gy, mine: dist < 45 });
+      }
+    }
+
+    // Build a 2D lookup grid for O(1) neighbor checks
+    const mineGrid = new Array(cols)
+      .fill(null)
+      .map(() => new Array(rows).fill(false));
+    for (const cell of grid) {
+      if (cell.mine) mineGrid[cell.gx][cell.gy] = true;
+    }
+
+    // Classify: interior = surrounded by our tiles, border = adjacent to non-ours
+    const interior = [];
+    const border = [];
+
+    for (const cell of grid) {
+      if (!cell.mine) continue;
+      // Skip UI regions: top-left leaderboard, bottom HUD
+      if (cell.x < W * 0.15 && cell.y < H * 0.35) continue;
+      if (cell.y > H * 0.82) continue;
+      if (cell.x > W * 0.9) continue;
+
+      const { gx, gy } = cell;
+      const allMine =
+        (gx > 0 ? mineGrid[gx - 1][gy] : false) &&
+        (gx < cols - 1 ? mineGrid[gx + 1][gy] : false) &&
+        (gy > 0 ? mineGrid[gx][gy - 1] : false) &&
+        (gy < rows - 1 ? mineGrid[gx][gy + 1] : false);
+
+      if (allMine) {
+        interior.push({ x: cell.x, y: cell.y });
+      } else {
+        border.push({ x: cell.x, y: cell.y });
+      }
+    }
+
+    return {
+      interior,
+      border,
+      myColor: { r: myR, g: myG, b: myB },
+      totalMine: interior.length + border.length,
+    };
+  });
+}
+
 // Get the "safe zone" — game area excluding UI overlays:
 // - Top-left: leaderboard (~15% width, ~30% height)
 // - Bottom-left: ad banner (~15% width, ~30% height)
@@ -503,37 +600,63 @@ async function executeRLAction(page, action, zone, goldAmount) {
       return;
     }
 
-    // Center camera so TRUE screen center = our territory
+    // Center camera so screen center = our territory, then scan pixels
     await centerCamera(page);
     const box2 = await getCanvasBounds(page);
     if (!box2) return;
 
-    // After centering, our territory is at TRUE canvas center (not safe zone offset)
-    const trueCx = box2.x + box2.width / 2;
-    const trueCy = box2.y + box2.height / 2;
-
-    // Choose click location based on what we're building.
-    // After centerCamera, TRUE screen center = our territory center.
-    // Use FIXED pixel offsets — no fancy fraction math that can go wrong.
-    let spot;
     const isBorderBuilding =
       actionType === ACTION_BUILD_DEFENSE ||
       actionType === ACTION_BUILD_SAM ||
       actionType === ACTION_BUILD_PORT;
-    if (isBorderBuilding) {
-      // Click 80-150px from center (border region)
-      const angle = Math.random() * Math.PI * 2;
-      const dist = 80 + Math.random() * 70;
+
+    // Try pixel-based territory detection for precise placement
+    const scan = await scanTerritory(page);
+    let spot;
+
+    if (scan && scan.totalMine > 5) {
+      // Pick from scanned territory tiles
+      const candidates = isBorderBuilding
+        ? scan.border.length > 0
+          ? scan.border
+          : scan.interior
+        : scan.interior.length > 0
+          ? scan.interior
+          : scan.border;
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      // Convert canvas pixel coords to page coords
+      // canvas.width/height = internal resolution, box2 = CSS layout size
+      const canvasDims = await safeEval(page, () => {
+        const c = document.querySelector("canvas");
+        return c ? { w: c.width, h: c.height } : null;
+      });
+      const cw = canvasDims?.w || box2.width;
+      const ch = canvasDims?.h || box2.height;
       spot = {
-        x: trueCx + Math.cos(angle) * dist,
-        y: trueCy + Math.sin(angle) * dist,
+        x: box2.x + (pick.x / cw) * box2.width,
+        y: box2.y + (pick.y / ch) * box2.height,
       };
+      log(
+        `RL: Scan found ${scan.interior.length} interior + ${scan.border.length} border tiles (color=${scan.myColor.r},${scan.myColor.g},${scan.myColor.b})`,
+      );
     } else {
-      // Click within ±40px of center — guaranteed our territory
-      spot = {
-        x: trueCx + (Math.random() - 0.5) * 80,
-        y: trueCy + (Math.random() - 0.5) * 80,
-      };
+      // Fallback to fixed offset from center
+      const trueCx = box2.x + box2.width / 2;
+      const trueCy = box2.y + box2.height / 2;
+      if (isBorderBuilding) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 80 + Math.random() * 70;
+        spot = {
+          x: trueCx + Math.cos(angle) * dist,
+          y: trueCy + Math.sin(angle) * dist,
+        };
+      } else {
+        spot = {
+          x: trueCx + (Math.random() - 0.5) * 80,
+          y: trueCy + (Math.random() - 0.5) * 80,
+        };
+      }
+      log("RL: Scan failed, using center fallback");
     }
 
     // Step 1: Move mouse to spot
