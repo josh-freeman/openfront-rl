@@ -1287,6 +1287,27 @@ async function main() {
           // Fix 5: Pass nuke count from bot state
           gameState.numNukes = nukeCount;
 
+          // Inject Wilderness as first neighbor so model can target it for expansion
+          const borderPt = randomBorder(zone);
+          gameState.neighbors.unshift({
+            id: "wilderness",
+            name: "Wilderness",
+            tiles: Math.round(
+              gameState.totalMapTiles * (1 - (gameState.territoryPct || 0)),
+            ),
+            troops: 0,
+            relation: 2, // Neutral
+            alive: true,
+            isLandNeighbor: true,
+            visible: true,
+            labelX: borderPt.x,
+            labelY: borderPt.y,
+          });
+          // Keep max 16 neighbors
+          if (gameState.neighbors.length > 16) {
+            gameState.neighbors = gameState.neighbors.slice(0, 16);
+          }
+
           lastGold = gameState.myGold || 0;
           lastTerritoryPct = gameState.territoryPct || 0;
           const g = lastGold;
