@@ -856,8 +856,7 @@ function stepGame(action: RLAction, ticksPerStep: number = 10) {
   }
 
   const reward = calculateReward();
-  const done =
-    !rlPlayer.isAlive() || game.getWinner() !== null || tickCount > 100000;
+  const done = !rlPlayer.isAlive() || game.getWinner() !== null;
 
   const obs = getObservation();
   const info = {
