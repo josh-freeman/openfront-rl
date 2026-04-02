@@ -137,6 +137,18 @@ class VecOpenFrontEnv:
         arr[0] = 1.0  # NOOP always valid
         return arr
 
+    def _extract_target_masks(self, obs: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Extract per-target masks for land and sea actions."""
+        land = obs.get("landTargetMask", [1] * self.max_neighbors)
+        sea = obs.get("seaTargetMask", [1] * self.max_neighbors)
+        land_arr = np.zeros(self.max_neighbors, dtype=np.float32)
+        sea_arr = np.zeros(self.max_neighbors, dtype=np.float32)
+        for i in range(min(len(land), self.max_neighbors)):
+            land_arr[i] = float(land[i])
+        for i in range(min(len(sea), self.max_neighbors)):
+            sea_arr[i] = float(sea[i])
+        return land_arr, sea_arr
+
     def _decode_action(self, action: np.ndarray, idx: int) -> dict:
         action_type = int(action[0])
         target_idx = int(action[1])
@@ -180,7 +192,7 @@ class VecOpenFrontEnv:
         return {"type": "noop"}
 
     def reset_single(self, idx: int):
-        """Returns (obs_vec, action_mask)."""
+        """Returns (obs_vec, action_mask, land_target_mask, sea_target_mask)."""
         self._step_counts[idx] = 0
         map_name = random.choice(self.maps)
         try:
@@ -202,19 +214,26 @@ class VecOpenFrontEnv:
                     "difficulty": self.difficulty,
                 },
             })
-        return self._obs_to_vec(resp["obs"], idx), self._extract_action_mask(resp["obs"])
+        land_mask, sea_mask = self._extract_target_masks(resp["obs"])
+        return (self._obs_to_vec(resp["obs"], idx),
+                self._extract_action_mask(resp["obs"]),
+                land_mask, sea_mask)
 
     def reset_all(self):
-        """Returns (obs, masks) each shape (num_envs, ...)."""
+        """Returns (obs, masks, land_target_masks, sea_target_masks) each shape (num_envs, ...)."""
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
+        land_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
+        sea_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
         for i in range(self.num_envs):
-            obs[i], masks[i] = self.reset_single(i)
-        return obs, masks
+            obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
+        return obs, masks, land_masks, sea_masks
 
     def step(self, actions: np.ndarray):
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
+        land_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
+        sea_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         dones = np.zeros(self.num_envs, dtype=bool)
         truncateds = np.zeros(self.num_envs, dtype=bool)
@@ -231,17 +250,18 @@ class VecOpenFrontEnv:
                 })
             except (RuntimeError, BrokenPipeError):
                 dones[i] = True
-                obs[i], masks[i] = self.reset_single(i)
+                obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
                 continue
 
             obs[i] = self._obs_to_vec(resp["obs"], i)
             masks[i] = self._extract_action_mask(resp["obs"])
+            land_masks[i], sea_masks[i] = self._extract_target_masks(resp["obs"])
             rewards[i] = float(resp.get("reward", 0))
             dones[i] = bool(resp.get("done", False))
             truncateds[i] = self._step_counts[i] >= self.max_steps and not dones[i]
             infos[i] = resp.get("info", {})
 
-        return obs, masks, rewards, dones, truncateds, infos
+        return obs, masks, land_masks, sea_masks, rewards, dones, truncateds, infos
 
     def close(self):
         for i, proc in enumerate(self._procs):

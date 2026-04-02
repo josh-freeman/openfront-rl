@@ -52,7 +52,11 @@ MAP_TIER_3 = MAP_TIER_2 + [
 ]
 AVAILABLE_MAPS = MAP_TIER_3  # Full list for --maps default
 
-from env import NUM_ACTIONS
+from env import (
+    NUM_ACTIONS, ACTION_ATTACK, ACTION_BOAT_ATTACK,
+    ACTION_LAUNCH_ATOM, ACTION_LAUNCH_HBOMB, ACTION_LAUNCH_MIRV,
+    ACTION_MOVE_WARSHIP,
+)
 
 
 class ActorCritic(nn.Module):
@@ -89,7 +93,8 @@ class ActorCritic(nn.Module):
             "value": self.value_head(features).squeeze(-1),
         }
 
-    def get_action_and_value(self, x, action=None, action_mask=None):
+    def get_action_and_value(self, x, action=None, action_mask=None,
+                            land_target_mask=None, sea_target_mask=None):
         out = self.forward(x)
 
         # Apply action mask: set logits of invalid actions to -inf
@@ -98,18 +103,45 @@ class ActorCritic(nn.Module):
             # action_mask: (batch, NUM_ACTIONS) with 1=valid, 0=invalid
             action_type_logits = action_type_logits + (1 - action_mask) * (-1e8)
 
-        # Create categorical distributions for each action dimension
+        # Create categorical distribution for action type
         dist_type = torch.distributions.Categorical(logits=action_type_logits)
-        dist_target = torch.distributions.Categorical(logits=out["target"])
-        dist_troop = torch.distributions.Categorical(logits=out["troop"])
 
         if action is None:
             a_type = dist_type.sample()
+        else:
+            a_type = action[..., 0].long()
+
+        # Apply conditional target mask based on sampled action type
+        target_logits = out["target"]
+        if land_target_mask is not None and sea_target_mask is not None:
+            is_land_attack = (a_type == ACTION_ATTACK)
+            is_sea_action = (
+                (a_type == ACTION_BOAT_ATTACK) |
+                (a_type == ACTION_LAUNCH_ATOM) |
+                (a_type == ACTION_LAUNCH_HBOMB) |
+                (a_type == ACTION_LAUNCH_MIRV) |
+                (a_type == ACTION_MOVE_WARSHIP)
+            )
+            # Pick the right mask per sample
+            tmask = torch.where(
+                is_land_attack.unsqueeze(-1),
+                land_target_mask,
+                torch.where(
+                    is_sea_action.unsqueeze(-1),
+                    sea_target_mask,
+                    torch.ones_like(land_target_mask),  # other actions: all valid
+                ),
+            )
+            target_logits = target_logits + (1 - tmask) * (-1e8)
+
+        dist_target = torch.distributions.Categorical(logits=target_logits)
+        dist_troop = torch.distributions.Categorical(logits=out["troop"])
+
+        if action is None:
             a_target = dist_target.sample()
             a_troop = dist_troop.sample()
             action = torch.stack([a_type, a_target, a_troop], dim=-1)
         else:
-            a_type = action[..., 0].long()
             a_target = action[..., 1].long()
             a_troop = action[..., 2].long()
 
@@ -273,6 +305,8 @@ def train(args):
     # Storage for rollouts: (num_steps, num_envs, ...)
     obs_buf = np.zeros((args.rollout_steps, args.num_envs, obs_dim), dtype=np.float32)
     masks_buf = np.ones((args.rollout_steps, args.num_envs, NUM_ACTIONS), dtype=np.float32)
+    land_masks_buf = np.ones((args.rollout_steps, args.num_envs, max_neighbors), dtype=np.float32)
+    sea_masks_buf = np.ones((args.rollout_steps, args.num_envs, max_neighbors), dtype=np.float32)
     actions_buf = np.zeros((args.rollout_steps, args.num_envs, 3), dtype=np.float32)
     logprobs_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
     rewards_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
@@ -286,7 +320,7 @@ def train(args):
     env_ep_lengths = np.zeros(args.num_envs, dtype=np.int32)
 
     # Initialize
-    obs, action_masks = envs.reset_all()  # (num_envs, obs_dim), (num_envs, NUM_ACTIONS)
+    obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all()
 
     # Curriculum: gradual ramp of (difficulty, opponents, maps)
     # Each step is a small increment to avoid distributional shock
@@ -348,18 +382,24 @@ def train(args):
         for step in range(args.rollout_steps):
             obs_buf[step] = obs
             masks_buf[step] = action_masks
+            land_masks_buf[step] = land_target_masks
+            sea_masks_buf[step] = sea_target_masks
 
             obs_t = torch.FloatTensor(obs).to(device)
             masks_t = torch.FloatTensor(action_masks).to(device)
+            land_t = torch.FloatTensor(land_target_masks).to(device)
+            sea_t = torch.FloatTensor(sea_target_masks).to(device)
             with torch.no_grad():
-                action, log_prob, _, value = model.get_action_and_value(obs_t, action_mask=masks_t)
+                action, log_prob, _, value = model.get_action_and_value(
+                    obs_t, action_mask=masks_t,
+                    land_target_mask=land_t, sea_target_mask=sea_t)
 
             actions_np = action.cpu().numpy()  # (num_envs, 3)
             logprobs_buf[step] = log_prob.cpu().numpy()
             values_buf[step] = value.cpu().numpy()
             actions_buf[step] = actions_np
 
-            next_obs, next_masks, rewards, dones, truncateds, infos = envs.step(actions_np)
+            next_obs, next_masks, next_land, next_sea, rewards, dones, truncateds, infos = envs.step(actions_np)
             rewards_buf[step] = rewards
             terminals_buf[step] = dones.astype(np.float32)
             truncateds_buf[step] = truncateds.astype(np.float32)
@@ -382,11 +422,13 @@ def train(args):
                     num_episodes += 1
                     env_ep_rewards[i] = 0
                     env_ep_lengths[i] = 0
-                    next_obs[i], next_masks[i] = envs.reset_single(i)
+                    next_obs[i], next_masks[i], next_land[i], next_sea[i] = envs.reset_single(i)
 
             global_step += args.num_envs
             obs = next_obs
             action_masks = next_masks
+            land_target_masks = next_land
+            sea_target_masks = next_sea
 
         # Bootstrap values for last step
         with torch.no_grad():
@@ -404,6 +446,8 @@ def train(args):
         batch_size = args.rollout_steps * args.num_envs
         b_obs = torch.FloatTensor(obs_buf.reshape(batch_size, -1)).to(device)
         b_masks = torch.FloatTensor(masks_buf.reshape(batch_size, -1)).to(device)
+        b_land_masks = torch.FloatTensor(land_masks_buf.reshape(batch_size, -1)).to(device)
+        b_sea_masks = torch.FloatTensor(sea_masks_buf.reshape(batch_size, -1)).to(device)
         b_actions = torch.FloatTensor(actions_buf.reshape(batch_size, -1)).to(device)
         b_logprobs = torch.FloatTensor(logprobs_buf.reshape(batch_size)).to(device)
         b_advantages = torch.FloatTensor(advantages.reshape(batch_size)).to(device)
@@ -421,7 +465,9 @@ def train(args):
                 mb_idx = indices[start:end]
 
                 _, new_log_probs, entropy, new_values = model.get_action_and_value(
-                    b_obs[mb_idx], b_actions[mb_idx], action_mask=b_masks[mb_idx]
+                    b_obs[mb_idx], b_actions[mb_idx], action_mask=b_masks[mb_idx],
+                    land_target_mask=b_land_masks[mb_idx],
+                    sea_target_mask=b_sea_masks[mb_idx],
                 )
 
                 ratio = torch.exp(new_log_probs - b_logprobs[mb_idx])

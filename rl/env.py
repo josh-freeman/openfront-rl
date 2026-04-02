@@ -156,6 +156,18 @@ class OpenFrontEnv(gym.Env):
         arr[0] = 1.0
         return arr
 
+    def _extract_target_masks(self, obs: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Extract per-target masks for land and sea actions."""
+        land = obs.get("landTargetMask", [1] * self.max_neighbors)
+        sea = obs.get("seaTargetMask", [1] * self.max_neighbors)
+        land_arr = np.zeros(self.max_neighbors, dtype=np.float32)
+        sea_arr = np.zeros(self.max_neighbors, dtype=np.float32)
+        for i in range(min(len(land), self.max_neighbors)):
+            land_arr[i] = float(land[i])
+        for i in range(min(len(sea), self.max_neighbors)):
+            sea_arr[i] = float(sea[i])
+        return land_arr, sea_arr
+
     def _obs_to_vec(self, obs: dict) -> np.ndarray:
         """Convert observation dict to fixed-size float vector."""
         vec = np.zeros(self.observation_space.shape[0], dtype=np.float32)
@@ -262,8 +274,11 @@ class OpenFrontEnv(gym.Env):
 
         obs_vec = self._obs_to_vec(resp["obs"])
         action_mask = self._extract_action_mask(resp["obs"])
+        land_target_mask, sea_target_mask = self._extract_target_masks(resp["obs"])
         info = resp.get("info", {})
         info["action_mask"] = action_mask
+        info["land_target_mask"] = land_target_mask
+        info["sea_target_mask"] = sea_target_mask
         return obs_vec, info
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
@@ -278,11 +293,14 @@ class OpenFrontEnv(gym.Env):
 
         obs_vec = self._obs_to_vec(resp["obs"])
         action_mask = self._extract_action_mask(resp["obs"])
+        land_target_mask, sea_target_mask = self._extract_target_masks(resp["obs"])
         reward = float(resp.get("reward", 0))
         done = bool(resp.get("done", False))
         truncated = self.step_count >= self.max_steps
         info = resp.get("info", {})
         info["action_mask"] = action_mask
+        info["land_target_mask"] = land_target_mask
+        info["sea_target_mask"] = sea_target_mask
 
         return obs_vec, reward, done, truncated, info
 

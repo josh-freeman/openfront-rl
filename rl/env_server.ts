@@ -312,13 +312,16 @@ function getObservation() {
   const hasUnits = units.length > 0;
   const canDelete = hasUnits && rlPlayer.canDeleteUnit();
 
-  // Check for non-allied neighbors (actual attackable targets)
-  const hasAttackableNeighbor = neighbors.some(
-    (n) => n.isLandNeighbor && !rlPlayer!.isAlliedWith(game!.player(n.id)),
-  );
-  const hasAttackableBySeaNeighbor = neighbors.some(
-    (n) => !rlPlayer!.isAlliedWith(game!.player(n.id)),
-  );
+  // Per-target masks: which neighbors are valid targets for land vs sea actions
+  const landTargetMask = new Array(16).fill(0);
+  const seaTargetMask = new Array(16).fill(0);
+  neighbors.slice(0, 16).forEach((n, i) => {
+    const notAllied = !rlPlayer!.isAlliedWith(game!.player(n.id));
+    if (n.isLandNeighbor && notAllied) landTargetMask[i] = 1;
+    if (notAllied) seaTargetMask[i] = 1; // boat/nuke/warship
+  });
+  const hasAttackableNeighbor = landTargetMask.some((v) => v === 1);
+  const hasAttackableBySeaNeighbor = seaTargetMask.some((v) => v === 1);
 
   // Action mask: 17 booleans, true = action is valid right now
   // Indices match env.py action IDs exactly
@@ -373,6 +376,8 @@ function getObservation() {
     canAffordSAM,
     canAffordWarship,
     actionMask,
+    landTargetMask,
+    seaTargetMask,
   };
 }
 
