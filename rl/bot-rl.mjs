@@ -36,6 +36,8 @@ let currentScale = 1.8;
 let currentAttackRatio = 0.2; // Game default, adjusted via T/Y keys
 let lastGold = 0;
 let lastTerritoryPct = 0;
+let lastBuildResult = "none"; // "success", "fail", or "none"
+let lastActionSucceeded = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function log(msg) {
@@ -181,115 +183,228 @@ function parseHudNumber(s) {
   return parseFloat(s) || 0;
 }
 
-async function extractGameState(page) {
-  return safeEval(page, () => {
-    const state = {
-      myTiles: 0,
-      myTroops: 0,
-      myGold: 0,
-      territoryPct: 0,
-      totalMapTiles: 10000,
-      incomingAttacks: 0,
-      outgoingAttacks: 0,
-      units: [],
-      neighbors: [],
-      tick: 0,
-      hasSilo: false,
-      hasPort: false,
-      hasSAM: false,
-      numWarships: 0,
-      numNukes: 0,
-    };
+async function extractGameState(page, botName) {
+  return safeEval(
+    page,
+    (botName) => {
+      const state = {
+        myTiles: 0,
+        myTroops: 0,
+        myGold: 0,
+        territoryPct: 0,
+        totalMapTiles: 10000,
+        incomingAttacks: 0,
+        outgoingAttacks: 0,
+        units: [],
+        neighbors: [],
+        tick: 0,
+        hasSilo: false,
+        hasPort: false,
+        hasSAM: false,
+        numWarships: 0,
+        numNukes: 0,
+      };
 
-    // Parse HUD from the <control-panel> custom element
-    const panel = document.querySelector("control-panel");
-    if (panel) {
-      const parse = (s) => {
+      // Parse HUD from the <control-panel> custom element
+      const panel = document.querySelector("control-panel");
+      if (panel) {
+        const parse = (s) => {
+          if (!s) return 0;
+          s = s.trim();
+          if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
+          if (s.endsWith("K")) return parseFloat(s) * 1000;
+          return parseFloat(s) || 0;
+        };
+
+        // Gold: yellow-bordered div with gold coin icon
+        const goldDivs = panel.querySelectorAll(".border-yellow-400 span");
+        for (const span of goldDivs) {
+          const t = span.textContent?.trim();
+          if (t && /^[\d.]+[KMB]?$/.test(t)) {
+            state.myGold = parse(t);
+            break;
+          }
+        }
+
+        // Troops: "X / Y" pattern in the panel
+        const allText = panel.textContent || "";
+        const troopMatch = allText.match(/([\d.]+[KM]?)\s*\/\s*([\d.]+[KM]?)/);
+        if (troopMatch) {
+          state.myTroops = parse(troopMatch[1]);
+        }
+
+        // NOTE: Territory % is NOT in the control panel — it's in the leaderboard.
+        // The "X%" in the control panel is the attack ratio, NOT territory.
+      }
+
+      // Parse unit counts from <unit-display> (light DOM, no shadow root)
+      // Structure: each unit type has an img + span.text-xs with the count
+      // Order: city(1), factory(2), port(3), defense(4), silo(5), SAM(6), warship(7)
+      const unitDisplay = document.querySelector("unit-display");
+      if (unitDisplay) {
+        const countSpans = unitDisplay.querySelectorAll("span.text-xs");
+        // Counts appear in order: cities, factories, ports, defenses, silos, SAMs, warships
+        const counts = [];
+        for (const span of countSpans) {
+          const t = span.textContent?.trim();
+          if (t !== undefined) counts.push(parseInt(t) || 0);
+        }
+        const [
+          cities = 0,
+          factories = 0,
+          ports = 0,
+          defenses = 0,
+          silos = 0,
+          sams = 0,
+          warships = 0,
+        ] = counts;
+        state.hasSilo = silos > 0;
+        state.hasPort = ports > 0;
+        state.hasSAM = sams > 0;
+        state.numWarships = warships;
+        // units array: one entry per building for the model's len(units)/20 calc
+        const totalUnits =
+          cities + factories + ports + defenses + silos + sams + warships;
+        state.units = new Array(totalUnits).fill("unit");
+      }
+
+      // Parse incoming/outgoing attacks from <attacks-display> (light DOM)
+      const attacksDisplay = document.querySelector("attacks-display");
+      if (attacksDisplay) {
+        // Count visible attack rows — incoming have sword icons, outgoing have different styling
+        // The element stores arrays directly as properties
+        if (attacksDisplay.incomingAttacks)
+          state.incomingAttacks = attacksDisplay.incomingAttacks.length;
+        if (attacksDisplay.outgoingAttacks)
+          state.outgoingAttacks = attacksDisplay.outgoingAttacks.length;
+        if (attacksDisplay.outgoingLandAttacks)
+          state.outgoingAttacks += attacksDisplay.outgoingLandAttacks.length;
+        if (attacksDisplay.outgoingBoats)
+          state.outgoingAttacks += attacksDisplay.outgoingBoats.length;
+        if (attacksDisplay.incomingBoats)
+          state.incomingAttacks += attacksDisplay.incomingBoats.length;
+      }
+
+      // Parse game tick from <game-right-sidebar> timer
+      const sidebar = document.querySelector("game-right-sidebar");
+      if (sidebar) {
+        // Timer is stored as a property (seconds elapsed or remaining)
+        if (typeof sidebar.timer === "number") {
+          // Convert seconds to approximate ticks (10 ticks/sec in game)
+          state.tick = Math.round(sidebar.timer * 10);
+        }
+      }
+
+      // Parse neighbor info from NameLayer DOM elements (much better than leaderboard)
+      // NameLayer.ts creates div elements for each player with:
+      //   .player-name-span → display name
+      //   .player-troops → troop count text (e.g., "12.3K")
+      // These exist in DOM even when hidden, but troop text is stale when display:none.
+      const parseTroops = (s) => {
         if (!s) return 0;
         s = s.trim();
         if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
         if (s.endsWith("K")) return parseFloat(s) * 1000;
+        if (s.endsWith("B")) return parseFloat(s) * 1_000_000_000;
         return parseFloat(s) || 0;
       };
 
-      // Gold: yellow-bordered div with gold coin icon
-      const goldDivs = panel.querySelectorAll(".border-yellow-400 span");
-      for (const span of goldDivs) {
-        const t = span.textContent?.trim();
-        if (t && /^[\d.]+[KMB]?$/.test(t)) {
-          state.myGold = parse(t);
-          break;
-        }
-      }
-
-      // Troops: "X / Y" pattern in the panel
-      const allText = panel.textContent || "";
-      const troopMatch = allText.match(/([\d.]+[KM]?)\s*\/\s*([\d.]+[KM]?)/);
-      if (troopMatch) {
-        state.myTroops = parse(troopMatch[1]);
-      }
-
-      // NOTE: Territory % is NOT in the control panel — it's in the leaderboard.
-      // The "X%" in the control panel is the attack ratio, NOT territory.
-    }
-
-    // Parse leaderboard (top-left table) for neighbor info
-    const rows = [];
-    for (const el of document.querySelectorAll("*")) {
-      const t = el.textContent?.trim() || "";
-      const r = el.getBoundingClientRect();
-      // Leaderboard is in the top-left area
-      if (r.x > window.innerWidth * 0.3 || r.y > window.innerHeight * 0.5)
-        continue;
-      // Match rows like: "1 PlayerName 0.5% 148K 64.5K"
-      const rowMatch = t.match(
-        /^(\d+)\s+(.+?)\s+([\d.]+)%\s+([\d.]+[KM]?)\s+([\d.]+[KM]?)$/,
-      );
-      if (rowMatch) {
-        const parse = (s) => {
-          if (s.endsWith("M")) return parseFloat(s) * 1_000_000;
-          if (s.endsWith("K")) return parseFloat(s) * 1000;
-          return parseFloat(s);
-        };
-        rows.push({
-          id: rowMatch[2].trim(),
-          name: rowMatch[2].trim(),
-          tiles: Math.round(
-            (parseFloat(rowMatch[3]) / 100) * state.totalMapTiles,
-          ),
-          troops: parse(rowMatch[5]),
-          relation: 0,
-          alive: true,
-        });
-      }
-    }
-    state.neighbors = rows.slice(0, 16);
-
-    // Find our territory % from the <leader-board> element.
-    // Our row is the highlighted one at the bottom of the leaderboard.
-    const lb = document.querySelector("leader-board");
-    if (lb) {
-      // Search the shadow DOM and light DOM for our name
-      const root = lb.shadowRoot || lb;
-      const allEls = root.querySelectorAll("tr, div, span");
-      for (const el of allEls) {
-        const t = el.textContent?.trim() || "";
-        // Only match leaf-ish elements (short text containing our name + a %)
-        if (
-          t.length < 200 &&
-          (t.includes("xXDarkLord") || t.includes("XXDAR"))
-        ) {
-          const pctMatch = t.match(/([\d.]+)%/);
-          if (pctMatch) {
-            state.territoryPct = parseFloat(pctMatch[1]) / 100;
-            break;
+      // Also parse leaderboard for territory % data
+      const lbData = {}; // name -> { pct, gold, troops }
+      const lb2 = document.querySelector("leader-board");
+      if (lb2) {
+        const root = lb2.shadowRoot || lb2;
+        for (const el of root.querySelectorAll("tr, div, span")) {
+          const t = el.textContent?.trim() || "";
+          // Match rows like: "1 PlayerName 0.5% 148K 64.5K"
+          const rowMatch = t.match(
+            /^(\d+)\s+(.+?)\s+([\d.]+)%\s+([\d.]+[KMB]?)\s+([\d.]+[KMB]?)$/,
+          );
+          if (rowMatch) {
+            lbData[rowMatch[2].trim()] = {
+              pct: parseFloat(rowMatch[3]) / 100,
+              gold: parseTroops(rowMatch[4]),
+              troops: parseTroops(rowMatch[5]),
+            };
           }
         }
       }
-    }
 
-    return state;
-  });
+      // Read all player labels from the NameLayer DOM
+      const playerMap = new Map(); // name -> { troops, visible }
+      const nameSpans = document.querySelectorAll(".player-name-span");
+      for (const span of nameSpans) {
+        const name = span.textContent?.trim();
+        if (!name) continue;
+        // Walk up to the container element to find the sibling troops div
+        const container = span.closest(".player-name")?.parentElement;
+        if (!container) continue;
+        const troopsEl = container.querySelector(".player-troops");
+        const troops = troopsEl ? parseTroops(troopsEl.textContent) : 0;
+        const visible = container.style.display !== "none";
+        playerMap.set(name, { troops, visible });
+      }
+
+      // Build neighbors list from DOM labels, enriched with leaderboard data
+      const neighbors = [];
+      for (const [name, info] of playerMap) {
+        // Skip our own entry
+        if (name === botName || name.includes(botName.slice(0, 6))) continue;
+        // Skip wilderness/unclaimed
+        if (name.toLowerCase() === "wilderness" || name === "") continue;
+
+        const lb = lbData[name] || {};
+        // Estimate tiles: use leaderboard % if available, otherwise estimate from
+        // troop count (rough heuristic: troops ≈ tiles * 0.5 in early/mid game)
+        let tiles = lb.pct ? Math.round(lb.pct * state.totalMapTiles) : 0;
+        if (tiles === 0 && info.troops > 0) {
+          tiles = Math.round(info.troops * 2); // rough estimate
+        }
+        neighbors.push({
+          id: name,
+          name: name,
+          tiles,
+          troops: info.troops || lb.troops || 0,
+          relation: 0, // 0 = neutral
+          alive: true,
+          visible: info.visible, // whether label was on screen (troop data fresh)
+        });
+      }
+
+      // Sort by troops descending (strongest neighbors first)
+      neighbors.sort((a, b) => b.troops - a.troops);
+      state.neighbors = neighbors.slice(0, 16);
+
+      // Find our territory % from the <leader-board> element.
+      // Our row is the highlighted one at the bottom of the leaderboard.
+      const lb = document.querySelector("leader-board");
+      if (lb) {
+        // Search the shadow DOM and light DOM for our name
+        const root = lb.shadowRoot || lb;
+        const allEls = root.querySelectorAll("tr, div, span");
+        for (const el of allEls) {
+          const t = el.textContent?.trim() || "";
+          // Only match leaf-ish elements (short text containing our name + a %)
+          if (
+            t.length < 200 &&
+            (t.includes(botName) || t.includes(botName.slice(0, 6)))
+          ) {
+            const pctMatch = t.match(/([\d.]+)%/);
+            if (pctMatch) {
+              state.territoryPct = parseFloat(pctMatch[1]) / 100;
+              break;
+            }
+          }
+        }
+      }
+
+      // Derive myTiles from territoryPct (so vec[0] = myTiles/total is non-zero)
+      state.myTiles = Math.round(state.territoryPct * state.totalMapTiles);
+
+      return state;
+    },
+    botName,
+  );
 }
 
 // ── Canvas helpers ───────────────────────────────────────────────
@@ -488,9 +603,10 @@ async function zoomStep(page, delta) {
 }
 
 // Generate a random point well inside our territory (tight around center after 'c')
+// Distances scale inversely with zoom: at high zoom, territory is fewer pixels.
 function randomInterior(zone) {
-  // Small fixed spread around center — after centering, our territory is near center
-  const spread = 40;
+  const scaleFactor = 1.8 / currentScale; // 1.0 at default zoom, smaller at high zoom
+  const spread = 40 * scaleFactor;
   return {
     x: zone.cx + (Math.random() - 0.5) * spread * 2,
     y: zone.cy + (Math.random() - 0.5) * spread * 2,
@@ -498,10 +614,12 @@ function randomInterior(zone) {
 }
 
 // Generate a random point at/beyond our border (for expansion/attacks)
+// At default zoom (1.8), border is ~80-150px from center.
+// At scale 8, territory is much smaller on screen, so border is ~18-34px.
 function randomBorder(zone) {
+  const scaleFactor = 1.8 / currentScale;
   const angle = Math.random() * Math.PI * 2;
-  // Click 80-150px from center — border ring
-  const dist = 80 + Math.random() * 70;
+  const dist = (80 + Math.random() * 70) * scaleFactor;
   const x = zone.cx + Math.cos(angle) * dist;
   const y = zone.cy + Math.sin(angle) * dist;
   return {
@@ -653,6 +771,9 @@ async function executeRLAction(page, action, zone, goldAmount) {
     await sleep(200);
     // Step 4: Escape to exit build mode if placement failed
     await page.keyboard.press("Escape").catch(() => {});
+    // Track build feedback: if gold dropped significantly, build likely succeeded
+    lastBuildResult = "none"; // will be updated on next extractGameState
+    lastActionSucceeded = true; // optimistic — model learns from actual results
     log(
       `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) scale=${currentScale.toFixed(1)} [gold=${(gold / 1000).toFixed(0)}K]`,
     );
@@ -812,6 +933,7 @@ async function main() {
   currentScale = 1.8; // reset to game default at game start
   lastTerritoryPct = 0;
   let spawnTime = 0;
+  let lastNeighborScan = 0; // Brief zoom-out to refresh neighbor label data
 
   while (true) {
     try {
@@ -893,7 +1015,7 @@ async function main() {
         await sleep(2000);
 
         // Check if we spawned: look for the troops HUD (only visible after spawning)
-        const hudState = await extractGameState(page);
+        const hudState = await extractGameState(page, BOT_NAME);
         // Troops show ~1K even before spawn. Gold > 0 only after spawning.
         // Also allow fallback after enough attempts.
         const didSpawn =
@@ -953,11 +1075,35 @@ async function main() {
         }
       }
 
+      // ── NEIGHBOR SCAN: briefly zoom out every 30s to refresh player labels ──
+      // NameLayer only updates troop text when elements are visible (display !== none).
+      // Visibility requires scale * baseSize >= 7. By zooming to ~1.5, even small
+      // players (baseSize ~5) become visible, refreshing their troop counts.
+      if (
+        Date.now() - lastNeighborScan > 30000 &&
+        Date.now() - spawnTime > 5000
+      ) {
+        lastNeighborScan = Date.now();
+        const savedScale2 = currentScale;
+        // Zoom out to ~1.5 to make most labels visible
+        if (currentScale > 2.0) {
+          const outSteps = Math.round(
+            Math.log(currentScale / 1.5) / Math.log(1.2),
+          );
+          const clamped = Math.min(outSteps, 8);
+          for (let i = 0; i < clamped; i++) await zoomStep(page, 100);
+          await sleep(600); // Wait for NameLayer to refresh (500ms rate)
+          // Zoom back in
+          for (let i = 0; i < clamped; i++) await zoomStep(page, -100);
+          log(`Neighbor scan: zoomed out ${clamped} steps to refresh labels`);
+        }
+      }
+
       // ── QUERY POLICY SERVER (interval matches training: TICKS_PER_STEP × TURN_INTERVAL_MS) ──
       if (Date.now() - lastPolicyQuery > POLICY_INTERVAL_MS) {
         lastPolicyQuery = Date.now();
 
-        const gameState = await extractGameState(page);
+        const gameState = await extractGameState(page, BOT_NAME);
         if (gameState) {
           lastGold = gameState.myGold || 0;
           lastTerritoryPct = gameState.territoryPct || 0;
@@ -984,6 +1130,11 @@ async function main() {
             g >= 50_000, // 15: UPGRADE
             false, // 16: DELETE_UNIT
           ];
+          // Add build feedback (tracked from previous action)
+          gameState.lastBuildResult = lastBuildResult;
+          gameState.lastActionSucceeded = lastActionSucceeded;
+          lastBuildResult = "none"; // reset after sending
+
           const action = await queryPolicy(gameState);
           if (action) {
             currentAction = action;
@@ -1030,11 +1181,22 @@ async function main() {
 
       // ── Status ──
       if (tick % 30 === 0) {
-        const gs = await extractGameState(page);
+        const gs = await extractGameState(page, BOT_NAME);
         const pct = gs ? (gs.territoryPct * 100).toFixed(1) : "?";
         const troops = gs ? gs.myTroops : "?";
+        const nNeighbors = gs ? gs.neighbors.length : 0;
+        const visNeighbors = gs
+          ? gs.neighbors.filter((n) => n.visible).length
+          : 0;
+        const units = gs ? gs.units.length : 0;
+        const attacks = gs
+          ? `in=${gs.incomingAttacks} out=${gs.outgoingAttacks}`
+          : "";
+        const bldgs = gs
+          ? `silo=${gs.hasSilo} port=${gs.hasPort} sam=${gs.hasSAM} ships=${gs.numWarships}`
+          : "";
         log(
-          `[${elapsed.toFixed(0)}s] ${pct}% territory, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, scale=${currentScale.toFixed(1)}, action=${currentAction?.actionType ?? "none"}`,
+          `[${elapsed.toFixed(0)}s] ${pct}% terr, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, tiles=${gs?.myTiles || 0}, tick=${gs?.tick || 0}, units=${units}, ${attacks}, ${bldgs}, neighbors=${nNeighbors}(${visNeighbors}vis), scale=${currentScale.toFixed(1)}`,
         );
       }
     } catch (err) {
