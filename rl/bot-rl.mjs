@@ -1430,18 +1430,30 @@ async function main() {
 
       // ── Accept alliance requests ──
       if (tick % 10 === 0) {
-        await safeEval(page, () => {
+        const allyName = await safeEval(page, () => {
           for (const el of document.querySelectorAll("*")) {
             if (el.textContent?.trim() === "Accept") {
               const r = el.getBoundingClientRect();
               if (r.width > 20 && r.width < 200) {
+                // Find the requester's name in a nearby element
+                const container =
+                  el.closest("[class*='alliance'], [class*='request'], div") ||
+                  el.parentElement?.parentElement;
+                const nameEl = container?.querySelector(
+                  ".truncate, [class*='name']",
+                );
+                const name = nameEl?.textContent?.trim() || null;
                 el.click();
-                return true;
+                return name;
               }
             }
           }
-          return false;
+          return null;
         });
+        if (allyName) {
+          playerRelations.set(allyName, 3); // Friendly
+          log(`Alliance accepted with ${allyName} → relation=3`);
+        }
       }
 
       // ── Status ──
