@@ -260,33 +260,50 @@ def train(args):
     # Initialize
     obs, action_masks = envs.reset_all()  # (num_envs, obs_dim), (num_envs, NUM_ACTIONS)
 
+    # Curriculum phase boundaries (fraction of num_updates)
+    CURRICULUM_BOUNDS = [0.05, 0.30, 0.50, 1.0]
+    curriculum_start_update = 0  # when current phase began
+    phase_end = int(CURRICULUM_BOUNDS[0] * args.num_updates) if args.curriculum else args.num_updates
+
     for update in range(start_update, args.num_updates):
         t_start = time.time()
-
-        # Linear LR annealing
-        if args.anneal_lr:
-            frac = 1.0 - update / args.num_updates
-            lr_now = frac * args.lr
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr_now
 
         # Curriculum learning: ramp difficulty, opponents, AND map pool over training
         if args.curriculum:
             progress = update / args.num_updates
-            if progress < 0.05:
+            if progress < CURRICULUM_BOUNDS[0]:
                 new_diff, new_opp, new_maps = "Easy", 2, MAP_TIER_1
-            elif progress < 0.30:
+                phase_end = int(CURRICULUM_BOUNDS[0] * args.num_updates)
+            elif progress < CURRICULUM_BOUNDS[1]:
                 new_diff, new_opp, new_maps = "Medium", 5, MAP_TIER_2
-            elif progress < 0.50:
+                phase_end = int(CURRICULUM_BOUNDS[1] * args.num_updates)
+            elif progress < CURRICULUM_BOUNDS[2]:
                 new_diff, new_opp, new_maps = "Hard", 8, MAP_TIER_3
+                phase_end = int(CURRICULUM_BOUNDS[2] * args.num_updates)
             else:
                 new_diff, new_opp, new_maps = "Hard", 12, MAP_TIER_3
+                phase_end = args.num_updates
             if envs.difficulty != new_diff or envs.num_opponents != new_opp:
-                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%})")
+                # Reset LR on curriculum transition — new task needs fresh learning rate
+                curriculum_start_update = update
+                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%}) — LR reset to {args.lr}")
                 envs.difficulty = new_diff
                 envs.num_opponents = new_opp
             if len(envs.maps) != len(new_maps):
                 envs.maps = new_maps
+
+        # LR annealing: within each curriculum phase (or globally if no curriculum)
+        if args.anneal_lr:
+            if args.curriculum:
+                # Anneal within current phase: full LR at phase start → 0 at phase end
+                phase_len = max(1, phase_end - curriculum_start_update)
+                phase_progress = (update - curriculum_start_update) / phase_len
+                lr_now = args.lr * (1.0 - phase_progress)
+            else:
+                # Global annealing
+                lr_now = args.lr * (1.0 - update / args.num_updates)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_now
 
         # Collect rollout
         for step in range(args.rollout_steps):
