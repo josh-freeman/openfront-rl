@@ -325,17 +325,17 @@ def train(args):
     # Curriculum: gradual ramp of (difficulty, opponents, maps)
     # Each step is a small increment to avoid distributional shock
     CURRICULUM_STAGES = [
-        # (progress_threshold, difficulty, opponents, maps)
-        (0.05, "Easy",   2,  MAP_TIER_1),
-        (0.10, "Easy",   3,  MAP_TIER_1),
-        (0.15, "Medium", 3,  MAP_TIER_2),
-        (0.20, "Medium", 4,  MAP_TIER_2),
-        (0.30, "Medium", 5,  MAP_TIER_2),
-        (0.38, "Hard",   5,  MAP_TIER_3),
-        (0.45, "Hard",   6,  MAP_TIER_3),
-        (0.50, "Hard",   8,  MAP_TIER_3),
-        (0.65, "Hard",  10,  MAP_TIER_3),
-        (1.00, "Hard",  12,  MAP_TIER_3),
+        # (progress_threshold, difficulty, opponents, maps, max_steps)
+        (0.05, "Easy",   2,  MAP_TIER_1, 5000),
+        (0.10, "Easy",   3,  MAP_TIER_1, 8000),
+        (0.15, "Medium", 3,  MAP_TIER_2, 10000),
+        (0.20, "Medium", 4,  MAP_TIER_2, 15000),
+        (0.30, "Medium", 5,  MAP_TIER_2, 20000),
+        (0.38, "Hard",   5,  MAP_TIER_3, 30000),
+        (0.45, "Hard",   6,  MAP_TIER_3, 40000),
+        (0.50, "Hard",   8,  MAP_TIER_3, 60000),
+        (0.65, "Hard",  10,  MAP_TIER_3, 80000),
+        (1.00, "Hard",  12,  MAP_TIER_3, 100000),
     ]
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES
@@ -350,20 +350,22 @@ def train(args):
         if args.curriculum:
             progress = update / args.num_updates
             # Find current stage
-            for thresh, diff, opp, maps in CURRICULUM_STAGES:
+            for thresh, diff, opp, maps, msteps in CURRICULUM_STAGES:
                 if progress < thresh:
-                    new_diff, new_opp, new_maps = diff, opp, maps
+                    new_diff, new_opp, new_maps, new_max_steps = diff, opp, maps, msteps
                     break
             else:
-                new_diff, new_opp, new_maps = CURRICULUM_STAGES[-1][1], CURRICULUM_STAGES[-1][2], CURRICULUM_STAGES[-1][3]
+                s = CURRICULUM_STAGES[-1]
+                new_diff, new_opp, new_maps, new_max_steps = s[1], s[2], s[3], s[4]
 
             if envs.difficulty != new_diff or envs.num_opponents != new_opp:
-                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%})")
+                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps, max_steps={new_max_steps} (progress={progress:.0%})")
                 envs.difficulty = new_diff
                 envs.num_opponents = new_opp
                 warmdown_counter = WARMDOWN_UPDATES  # trigger LR warmdown
             if len(envs.maps) != len(new_maps):
                 envs.maps = new_maps
+            envs.max_steps = new_max_steps
 
         # LR schedule: apply warmdown after curriculum transitions
         lr_now = args.lr
