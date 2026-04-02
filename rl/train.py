@@ -503,12 +503,15 @@ def train(args):
         if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
             mean_r = np.mean(episode_rewards)
             mean_l = np.mean(episode_lengths)
+            survival_pct = mean_l / envs.max_steps  # fraction of max episode length
             entry = {
                 "update": update + 1,
                 "global_step": global_step,
                 "num_episodes": num_episodes,
                 "mean_reward": float(mean_r),
                 "mean_length": float(mean_l),
+                "survival_pct": float(survival_pct),
+                "max_steps": envs.max_steps,
                 "loss": float(loss.item()),
                 "sps": float(sps),
             }
@@ -521,6 +524,8 @@ def train(args):
                     "num_episodes": num_episodes,
                     "reward/mean": float(mean_r),
                     "episode_length": float(mean_l),
+                    "episode_length/survival_pct": float(survival_pct),
+                    "episode_length/max_steps": envs.max_steps,
                     "loss/total": float(loss.item()),
                     "loss/policy": float(policy_loss.item()),
                     "loss/value": float(value_loss.item()),
@@ -530,7 +535,7 @@ def train(args):
                 }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
-                f"episodes={num_episodes} reward={mean_r:.2f} len={mean_l:.0f} "
+                f"episodes={num_episodes} reward={mean_r:.2f} len={mean_l:.0f} ({survival_pct:.0%}) "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
             )
 
