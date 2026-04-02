@@ -144,7 +144,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
             obs_vec[base] = n.get("tiles", 0) / total
             obs_vec[base + 1] = n.get("troops", 0) / 100000
             obs_vec[base + 2] = n.get("relation", 0) / 3
-            obs_vec[base + 3] = float(n.get("isLandNeighbor", True))
+            obs_vec[base + 3] = float(n.get("alive", True))
 
         # Extract action mask if provided
         action_mask = obs_dict.get("actionMask", None)
@@ -156,17 +156,26 @@ class PolicyHandler(BaseHTTPRequestHandler):
 
         obs_t = torch.FloatTensor(obs_vec).unsqueeze(0).to(self.device)
 
-        # Debug: log mask and raw logits to file
-        import sys
+        # Debug: log raw dict values AND obs vector
         with torch.no_grad():
             out = self.model.forward(obs_t)
             raw_logits = out["action_type"].squeeze(0).cpu().numpy()
-            if mask_t is not None:
-                mask_np = mask_t.squeeze(0).cpu().numpy()
-                masked_logits = raw_logits + (1 - mask_np) * (-1e8)
-                top3 = sorted(enumerate(masked_logits), key=lambda x: -x[1])[:3]
-                with open("/tmp/policy_debug.log", "a") as f:
-                    f.write(f"mask={mask_np.astype(int).tolist()} raw=[{', '.join(f'{x:.1f}' for x in raw_logits)}] top3={[(i, f'{v:.1f}') for i,v in top3]}\n")
+            with open("/tmp/policy_debug.log", "a") as f:
+                # Log raw values from bot
+                f.write(f"RAW: tiles={obs_dict.get('myTiles')} troops={obs_dict.get('myTroops')} gold={obs_dict.get('myGold')} pct={obs_dict.get('territoryPct')} total={obs_dict.get('totalMapTiles')} tick={obs_dict.get('tick')} in={obs_dict.get('incomingAttacks')} out={obs_dict.get('outgoingAttacks')} units={obs_dict.get('units')} nNeigh={len(neighbors)}\n")
+                # Log normalized obs vector
+                player = obs_vec[:16]
+                f.write(f"VEC: [{', '.join(f'{v:.5f}' for v in player)}]\n")
+                # Log first 3 neighbors
+                for ni in range(min(3, len(neighbors))):
+                    base = 16 + ni * 4
+                    n = neighbors[ni]
+                    f.write(f"  n{ni}: raw=[tiles={n.get('tiles')} troops={n.get('troops')} rel={n.get('relation')} alive={n.get('alive')}] vec=[{obs_vec[base]:.5f}, {obs_vec[base+1]:.4f}, {obs_vec[base+2]:.2f}, {obs_vec[base+3]:.0f}]\n")
+                if mask_t is not None:
+                    mask_np = mask_t.squeeze(0).cpu().numpy()
+                    masked_logits = raw_logits + (1 - mask_np) * (-1e8)
+                    top3 = sorted(enumerate(masked_logits), key=lambda x: -x[1])[:3]
+                    f.write(f"mask={mask_np.astype(int).tolist()} top3={[(i, f'{v:.1f}') for i,v in top3]}\n")
             action, _, _, _ = self.model.get_action_and_value(obs_t, action_mask=mask_t)
 
         action_np = action.squeeze(0).cpu().numpy().tolist()
@@ -176,7 +185,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
         target_idx = int(action_np[1])
         troop_bucket = int(action_np[2])
         with open("/tmp/policy_debug.log", "a") as f:
-            f.write(f"→ type={action_type} target={target_idx} bucket={troop_bucket}\n")
+            f.write(f"→ type={action_type} target={target_idx} bucket={troop_bucket}\n\n")
 
         response = {
             "actionType": action_type,

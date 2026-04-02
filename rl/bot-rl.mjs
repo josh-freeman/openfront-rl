@@ -192,7 +192,7 @@ async function extractGameState(page, botName) {
         myTroops: 0,
         myGold: 0,
         territoryPct: 0,
-        totalMapTiles: 10000,
+        totalMapTiles: 2000000, // Normal map: 2000x1000
         incomingAttacks: 0,
         outgoingAttacks: 0,
         units: [],
@@ -285,12 +285,15 @@ async function extractGameState(page, botName) {
           state.incomingAttacks += attacksDisplay.incomingBoats.length;
       }
 
-      // Parse game tick from <game-right-sidebar> timer
+      // Parse game tick from <game-right-sidebar>
+      // sidebar.timer can be a COUNTDOWN (maxTime - elapsed), not elapsed.
+      // Instead, read the game's actual tick count from the game view if possible.
       const sidebar = document.querySelector("game-right-sidebar");
-      if (sidebar) {
-        // Timer is stored as a property (seconds elapsed or remaining)
-        if (typeof sidebar.timer === "number") {
-          // Convert seconds to approximate ticks (10 ticks/sec in game)
+      if (sidebar && sidebar.game) {
+        const ticks = sidebar.game.ticks?.();
+        if (typeof ticks === "number") {
+          state.tick = ticks;
+        } else if (typeof sidebar.timer === "number") {
           state.tick = Math.round(sidebar.timer * 10);
         }
       }
@@ -467,7 +470,8 @@ async function extractGameState(page, botName) {
         const lb = lbData[name] || {};
         let tiles = lb.pct ? Math.round(lb.pct * state.totalMapTiles) : 0;
         if (tiles === 0 && info.troops > 0) {
-          tiles = Math.round(info.troops * 2);
+          // Rough estimate: ~0.2 tiles per troop (troops already x10 corrected)
+          tiles = Math.round(info.troops * 0.2);
         }
 
         neighbors.push({
@@ -984,7 +988,7 @@ async function main() {
       myTroops: 0,
       myGold: 0,
       territoryPct: 0,
-      totalMapTiles: 1,
+      totalMapTiles: 2000000,
       incomingAttacks: 0,
       outgoingAttacks: 0,
       units: [],
