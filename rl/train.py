@@ -295,12 +295,12 @@ def train(args):
         # LR annealing: within each curriculum phase (or globally if no curriculum)
         if args.anneal_lr:
             if args.curriculum:
-                # Anneal within current phase: full LR at phase start → 0 at phase end
+                # Anneal within phase: LR → 50% of starting LR by phase end, then reset
                 phase_len = max(1, phase_end - curriculum_start_update)
                 phase_progress = (update - curriculum_start_update) / phase_len
-                lr_now = args.lr * (1.0 - phase_progress)
+                lr_now = args.lr * (1.0 - 0.5 * phase_progress)
             else:
-                # Global annealing
+                # Global annealing to zero
                 lr_now = args.lr * (1.0 - update / args.num_updates)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_now
