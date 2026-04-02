@@ -71,8 +71,8 @@ def play_headless(args):
             obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
             # Use action mask from info if available
             mask_t = None
-            if "actionMask" in info:
-                mask_arr = np.array(info["actionMask"][:17], dtype=np.float32)
+            if "action_mask" in info:
+                mask_arr = np.array(info["action_mask"][:17], dtype=np.float32)
                 mask_arr[0] = 1.0
                 mask_t = torch.FloatTensor(mask_arr).unsqueeze(0).to(device)
             with torch.no_grad():

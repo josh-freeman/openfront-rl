@@ -386,12 +386,10 @@ function calculateReward(): number {
   const troopDelta = curTroops - prevTroops;
   reward += troopDelta * 0.0001;
 
-  // Survival bonus — being alive is good, indirectly rewards defense
-  reward += 0.001;
-
-  // Build bonus — encourages the model to try building structures
-  if (lastBuildResult === "success") {
-    reward += 0.3;
+  // Gold income growth (indirectly rewards factories/cities)
+  const goldDelta = curGold - Number(prevGold);
+  if (goldDelta > 0) {
+    reward += goldDelta * 0.00001;
   }
 
   // Death penalty
