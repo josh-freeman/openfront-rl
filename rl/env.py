@@ -195,7 +195,7 @@ class OpenFrontEnv(gym.Env):
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
-            vec[base + 3] = float(n.get("alive", True))
+            vec[base + 3] = float(n.get("isLandNeighbor", True))
 
         return vec
 

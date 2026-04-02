@@ -144,7 +144,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
             obs_vec[base] = n.get("tiles", 0) / total
             obs_vec[base + 1] = n.get("troops", 0) / 100000
             obs_vec[base + 2] = n.get("relation", 0) / 3
-            obs_vec[base + 3] = float(n.get("alive", True))
+            obs_vec[base + 3] = float(n.get("isLandNeighbor", True))
 
         # Extract action mask if provided
         action_mask = obs_dict.get("actionMask", None)
