@@ -27,12 +27,21 @@ from train import ActorCritic
 
 def load_model(model_path: str, obs_dim: int, max_neighbors: int = 16):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ActorCritic(obs_dim, max_neighbors).to(device)
     state = torch.load(model_path, map_location=device, weights_only=True)
     if isinstance(state, dict) and "model" in state:
-        model.load_state_dict(state["model"])
+        state_dict = state["model"]
     else:
-        model.load_state_dict(state)
+        state_dict = state
+    # Infer hidden sizes from backbone weights
+    hidden_sizes = []
+    i = 0
+    while f"backbone.{i}.weight" in state_dict:
+        hidden_sizes.append(state_dict[f"backbone.{i}.weight"].shape[0])
+        i += 2  # skip ReLU layers (no params, but Sequential indexes them)
+    if not hidden_sizes:
+        hidden_sizes = [256, 256, 128]
+    model = ActorCritic(obs_dim, max_neighbors, hidden_sizes=hidden_sizes).to(device)
+    model.load_state_dict(state_dict)
     model.eval()
     return model, device
 
