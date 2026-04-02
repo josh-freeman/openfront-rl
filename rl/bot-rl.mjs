@@ -264,10 +264,17 @@ async function extractGameState(page, botName) {
         state.hasPort = ports > 0;
         state.hasSAM = sams > 0;
         state.numWarships = warships;
+        state.numCities = cities;
+        state.numFactories = factories;
+        state.numPorts = ports;
+        state.numDefenses = defenses;
+        state.numSilos = silos;
+        state.numSAMs = sams;
         // units array: one entry per building for the model's len(units)/20 calc
         const totalUnits =
           cities + factories + ports + defenses + silos + sams + warships;
         state.units = new Array(totalUnits).fill("unit");
+        state.hasUnits = totalUnits > 0;
       }
 
       // Parse incoming/outgoing attacks from <attacks-display> (light DOM)
@@ -1313,25 +1320,38 @@ async function main() {
           const g = lastGold;
           const hasN = gameState.neighbors.length > 0;
           const hasT = gameState.myTroops > 10;
-          // Build action mask based on gold thresholds (matches env_server.ts logic)
+          const hasOut = (gameState.outgoingAttacks || 0) > 0;
+          const hasUnits = gameState.hasUnits || false;
+          const hasSilo = gameState.hasSilo || false;
+          const hasPort = gameState.hasPort || false;
+          const numWarships = gameState.numWarships || 0;
+          const numCities = gameState.numCities || 0;
+
+          // City cost scales: min(1M, 2^numCities * 125K) — matches DefaultConfig.ts
+          const cityCost = Math.min(
+            1_000_000,
+            Math.pow(2, numCities) * 125_000,
+          );
+
+          // Action mask matching env_server.ts canBuild checks
           gameState.actionMask = [
             true, // 0: NOOP
             hasN && hasT, // 1: ATTACK
-            false, // 2: BOAT_ATTACK (no port detection in HUD)
-            false, // 3: RETREAT (no outgoing attack detection)
-            g >= 125_000, // 4: BUILD_CITY
+            hasN && hasT && hasPort, // 2: BOAT_ATTACK
+            hasOut, // 3: RETREAT
+            g >= cityCost, // 4: BUILD_CITY (exponential cost)
             g >= 125_000, // 5: BUILD_FACTORY
             g >= 50_000, // 6: BUILD_DEFENSE
             g >= 125_000, // 7: BUILD_PORT
             g >= 1_500_000, // 8: BUILD_SAM
             g >= 1_000_000, // 9: BUILD_SILO
-            g >= 250_000, // 10: BUILD_WARSHIP
-            g >= 750_000, // 11: LAUNCH_ATOM
-            g >= 5_000_000, // 12: LAUNCH_HBOMB
-            g >= 10_000_000, // 13: LAUNCH_MIRV
-            false, // 14: MOVE_WARSHIP
-            g >= 50_000, // 15: UPGRADE
-            false, // 16: DELETE_UNIT
+            g >= 250_000 && hasPort, // 10: BUILD_WARSHIP
+            hasSilo && hasN && g >= 750_000, // 11: LAUNCH_ATOM
+            hasSilo && hasN && g >= 5_000_000, // 12: LAUNCH_HBOMB
+            hasSilo && hasN && g >= 10_000_000, // 13: LAUNCH_MIRV
+            numWarships > 0 && hasN, // 14: MOVE_WARSHIP
+            hasUnits && g >= 50_000, // 15: UPGRADE
+            hasUnits, // 16: DELETE_UNIT
           ];
           // Add build feedback (tracked from previous action)
           gameState.lastBuildResult = lastBuildResult;
