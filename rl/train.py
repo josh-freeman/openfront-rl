@@ -262,8 +262,6 @@ def train(args):
 
     # Curriculum phase boundaries (fraction of num_updates)
     CURRICULUM_BOUNDS = [0.05, 0.30, 0.50, 1.0]
-    curriculum_start_update = 0  # when current phase began
-    phase_end = int(CURRICULUM_BOUNDS[0] * args.num_updates) if args.curriculum else args.num_updates
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
@@ -273,35 +271,23 @@ def train(args):
             progress = update / args.num_updates
             if progress < CURRICULUM_BOUNDS[0]:
                 new_diff, new_opp, new_maps = "Easy", 2, MAP_TIER_1
-                phase_end = int(CURRICULUM_BOUNDS[0] * args.num_updates)
             elif progress < CURRICULUM_BOUNDS[1]:
                 new_diff, new_opp, new_maps = "Medium", 5, MAP_TIER_2
-                phase_end = int(CURRICULUM_BOUNDS[1] * args.num_updates)
             elif progress < CURRICULUM_BOUNDS[2]:
                 new_diff, new_opp, new_maps = "Hard", 8, MAP_TIER_3
-                phase_end = int(CURRICULUM_BOUNDS[2] * args.num_updates)
             else:
                 new_diff, new_opp, new_maps = "Hard", 12, MAP_TIER_3
-                phase_end = args.num_updates
             if envs.difficulty != new_diff or envs.num_opponents != new_opp:
-                # Reset LR on curriculum transition — new task needs fresh learning rate
-                curriculum_start_update = update
-                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%}) — LR reset to {args.lr}")
+                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%})")
                 envs.difficulty = new_diff
                 envs.num_opponents = new_opp
             if len(envs.maps) != len(new_maps):
                 envs.maps = new_maps
 
-        # LR annealing: within each curriculum phase (or globally if no curriculum)
+        # Global LR annealing
         if args.anneal_lr:
-            if args.curriculum:
-                # Anneal within phase: LR → 50% of starting LR by phase end, then reset
-                phase_len = max(1, phase_end - curriculum_start_update)
-                phase_progress = (update - curriculum_start_update) / phase_len
-                lr_now = args.lr * (1.0 - 0.5 * phase_progress)
-            else:
-                # Global annealing to zero
-                lr_now = args.lr * (1.0 - update / args.num_updates)
+            frac = 1.0 - update / args.num_updates
+            lr_now = frac * args.lr
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_now
 
