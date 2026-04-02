@@ -2,7 +2,7 @@
 Push trained OpenFront RL model to HuggingFace Hub.
 
 Usage:
-  python push_to_hf.py --repo josh-freeman/openfront-rl-agent
+  python push_to_hf.py --repo mischievers/openfront-rl-agent
 """
 
 import argparse
@@ -39,6 +39,8 @@ def create_model_card(checkpoint_dir: Path) -> str:
     num_envs = config.get("num_envs", "N/A")
     lr = config.get("lr", "N/A")
     rollout_steps = config.get("rollout_steps", "N/A")
+    hidden_sizes = config.get("hidden_sizes", [256, 256, 128])
+    arch_str = "→".join(str(h) for h in hidden_sizes)
 
     return f"""---
 license: mit
@@ -56,7 +58,7 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 ## Training Details
 
 - **Algorithm:** PPO (Proximal Policy Optimization)
-- **Architecture:** Actor-Critic with shared backbone (256→256→128)
+- **Architecture:** Actor-Critic with shared backbone ({arch_str})
 - **Observation dim:** {obs_dim}
 - **Max neighbors:** {max_neighbors}
 - **Maps:** {maps} (random per episode)
@@ -80,7 +82,7 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 from train import ActorCritic
 import torch
 
-model = ActorCritic(obs_dim={obs_dim}, max_neighbors={max_neighbors})
+model = ActorCritic(obs_dim={obs_dim}, max_neighbors={max_neighbors}, hidden_sizes={hidden_sizes})
 model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 model.eval()
 ```
@@ -89,6 +91,21 @@ model.eval()
 
 Trained from [josh-freeman/openfront-rl](https://github.com/josh-freeman/openfront-rl).
 """
+
+
+def get_remote_best_reward(api: HfApi, repo: str) -> float:
+    """Fetch the best_reward from the remote HF repo's training_log.json."""
+    try:
+        import tempfile
+        path = api.hf_hub_download(repo_id=repo, filename="training_log.json",
+                                    cache_dir=tempfile.mkdtemp())
+        with open(path) as f:
+            logs = json.load(f)
+        if logs:
+            return float(logs[-1].get("mean_reward", -float("inf")))
+    except Exception:
+        pass
+    return -float("inf")
 
 
 def push(args):
@@ -102,6 +119,20 @@ def push(args):
     best_model = checkpoint_dir / "best_model.pt"
     if not best_model.exists():
         print(f"ERROR: {best_model} not found. Train first.")
+        return
+
+    # Compare against current HF model before overwriting
+    local_state_path = checkpoint_dir / "state.json"
+    local_reward = -float("inf")
+    if local_state_path.exists():
+        with open(local_state_path) as f:
+            local_reward = float(json.load(f).get("best_reward", -float("inf")))
+
+    remote_reward = get_remote_best_reward(api, args.repo)
+    print(f"Local best reward: {local_reward:.2f}, Remote best reward: {remote_reward:.2f}")
+
+    if remote_reward > local_reward and not args.force:
+        print(f"SKIPPING push: remote model is better ({remote_reward:.2f} > {local_reward:.2f}). Use --force to override.")
         return
 
     print(f"Uploading {best_model} to {args.repo}...")
@@ -134,7 +165,8 @@ def push(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Push trained model to HuggingFace")
-    parser.add_argument("--repo", default="JoshuaFreeman/openfront-rl-agent")
+    parser.add_argument("--repo", default="mischievers/openfront-rl-agent")
     parser.add_argument("--checkpoint-dir", default="./checkpoints")
+    parser.add_argument("--force", action="store_true", help="Push even if remote model has higher reward")
     args = parser.parse_args()
     push(args)

@@ -97,13 +97,13 @@ class OpenFrontEnv(gym.Env):
         #   13: tickProgress (normalized by max ticks)
         #   14: lastBuildSuccess (1=success, 0=none, -1=fail)
         #   15: lastActionSucceeded (0/1)
-        #   16-22: canAfford flags (city, defense, factory, port, silo, SAM, warship)
-        # Neighbor features (per neighbor):
+        # Neighbor features (per neighbor, starting at index 16):
         #   0: tiles (normalized)
         #   1: troops (normalized)
         #   2: relation (normalized)
         #   3: isAlive (0/1)
-        obs_size = 23 + max_neighbors * 4
+        # Action mask (17 bools) is passed via info dict, NOT in obs vector
+        obs_size = 16 + max_neighbors * 4
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -145,6 +145,17 @@ class OpenFrontEnv(gym.Env):
             raise RuntimeError("Server closed connection")
         return json.loads(line)
 
+    def _extract_action_mask(self, obs: dict) -> np.ndarray:
+        """Extract 17-element action mask from observation dict."""
+        mask = obs.get("actionMask", [True] * NUM_ACTIONS)
+        arr = np.array(mask[:NUM_ACTIONS], dtype=np.float32)
+        # Pad if shorter than NUM_ACTIONS
+        if len(arr) < NUM_ACTIONS:
+            arr = np.concatenate([arr, np.ones(NUM_ACTIONS - len(arr), dtype=np.float32)])
+        # Ensure at least NOOP is always valid
+        arr[0] = 1.0
+        return arr
+
     def _obs_to_vec(self, obs: dict) -> np.ndarray:
         """Convert observation dict to fixed-size float vector."""
         vec = np.zeros(self.observation_space.shape[0], dtype=np.float32)
@@ -177,19 +188,10 @@ class OpenFrontEnv(gym.Env):
             vec[14] = -1.0  # any failure
         vec[15] = float(obs.get("lastActionSucceeded", False))
 
-        # Affordability flags — what can we actually build right now?
-        vec[16] = float(obs.get("canAffordCity", False))
-        vec[17] = float(obs.get("canAffordDefense", False))
-        vec[18] = float(obs.get("canAffordFactory", False))
-        vec[19] = float(obs.get("canAffordPort", False))
-        vec[20] = float(obs.get("canAffordSilo", False))
-        vec[21] = float(obs.get("canAffordSAM", False))
-        vec[22] = float(obs.get("canAffordWarship", False))
-
         # Neighbor features
         self._neighbors_cache = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 23 + i * 4
+            base = 16 + i * 4
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
@@ -258,9 +260,11 @@ class OpenFrontEnv(gym.Env):
             },
         })
 
-        obs = self._obs_to_vec(resp["obs"])
+        obs_vec = self._obs_to_vec(resp["obs"])
+        action_mask = self._extract_action_mask(resp["obs"])
         info = resp.get("info", {})
-        return obs, info
+        info["action_mask"] = action_mask
+        return obs_vec, info
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         self.step_count += 1
@@ -272,13 +276,15 @@ class OpenFrontEnv(gym.Env):
             "ticksPerStep": self.ticks_per_step,
         })
 
-        obs = self._obs_to_vec(resp["obs"])
+        obs_vec = self._obs_to_vec(resp["obs"])
+        action_mask = self._extract_action_mask(resp["obs"])
         reward = float(resp.get("reward", 0))
         done = bool(resp.get("done", False))
         truncated = self.step_count >= self.max_steps
         info = resp.get("info", {})
+        info["action_mask"] = action_mask
 
-        return obs, reward, done, truncated, info
+        return obs_vec, reward, done, truncated, info
 
     def close(self):
         if self._proc:

@@ -154,12 +154,25 @@ const GAME_ID = "rl-training";
 // ---------- Helper: Load map ----------
 
 async function loadMap(mapName: string) {
-  const mapsDir = path.join(__rldir, "../tests/testdata/maps");
-  const mapDir = path.join(mapsDir, mapName);
-
-  if (!fs.existsSync(mapDir)) {
+  // Try testdata maps first, then resources/maps
+  const mapsDirs = [
+    path.join(__rldir, "../tests/testdata/maps"),
+    path.join(__rldir, "../resources/maps"),
+  ];
+  let mapDir = "";
+  for (const dir of mapsDirs) {
+    const candidate = path.join(dir, mapName);
+    if (fs.existsSync(candidate)) {
+      mapDir = candidate;
+      break;
+    }
+  }
+  if (!mapDir) {
+    const allMaps = mapsDirs.flatMap((d) =>
+      fs.existsSync(d) ? fs.readdirSync(d) : [],
+    );
     throw new Error(
-      `Map not found: ${mapDir}. Available: ${fs.readdirSync(mapsDir).join(", ")}`,
+      `Map not found: ${mapName}. Available: ${allMaps.join(", ")}`,
     );
   }
 
@@ -190,20 +203,31 @@ function getObservation() {
   const myGold = Number(rlPlayer.gold());
   const alive = rlPlayer.isAlive();
 
-  // Neighbors (other players bordering us)
-  const neighbors = rlPlayer
-    .neighbors()
-    .filter((n) => n.isPlayer())
-    .map((n) => {
-      const p = n as Player;
-      return {
-        id: p.id(),
-        name: p.name(),
-        tiles: p.numTilesOwned(),
-        troops: p.troops(),
-        alive: p.isAlive(),
-        relation: rlPlayer!.relation(p),
-      };
+  // All alive players (not just land neighbors) — sorted by relevance
+  // Land neighbors first (immediate threats), then others sorted by size
+  const landNeighborIds = new Set(
+    rlPlayer
+      .neighbors()
+      .filter((n) => n.isPlayer())
+      .map((n) => (n as Player).id()),
+  );
+  const neighbors = game
+    .players()
+    .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
+    .map((p) => ({
+      id: p.id(),
+      name: p.name(),
+      tiles: p.numTilesOwned(),
+      troops: p.troops(),
+      alive: p.isAlive(),
+      relation: rlPlayer!.relation(p),
+      isLandNeighbor: landNeighborIds.has(p.id()),
+    }))
+    .sort((a, b) => {
+      // Land neighbors first, then by territory size (biggest threat)
+      if (a.isLandNeighbor !== b.isLandNeighbor)
+        return a.isLandNeighbor ? -1 : 1;
+      return b.tiles - a.tiles;
     });
 
   // Our units
@@ -277,6 +301,38 @@ function getObservation() {
     sampleTile !== null &&
     rlPlayer.canBuild(UnitType.Warship, sampleTile) !== false;
 
+  // Nuke affordability (need silo + gold)
+  const canAffordAtom = hasSilo && myGold >= 750_000;
+  const canAffordHBomb = hasSilo && myGold >= 5_000_000;
+  const canAffordMIRV = hasSilo && myGold >= 10_000_000;
+
+  const hasNeighbors = neighbors.length > 0;
+  const hasTroops = myTroops > 10;
+  const hasOutgoingAttacks = outgoing > 0;
+  const hasUnits = units.length > 0;
+
+  // Action mask: 17 booleans, true = action is valid right now
+  // Indices match env.py action IDs exactly
+  const actionMask = [
+    true, // 0: NOOP — always valid
+    hasNeighbors && hasTroops, // 1: ATTACK
+    hasNeighbors && hasTroops && hasPort, // 2: BOAT_ATTACK
+    hasOutgoingAttacks, // 3: RETREAT
+    canAffordCity, // 4: BUILD_CITY
+    canAffordFactory, // 5: BUILD_FACTORY
+    canAffordDefense, // 6: BUILD_DEFENSE
+    canAffordPort, // 7: BUILD_PORT
+    canAffordSAM, // 8: BUILD_SAM
+    canAffordSilo, // 9: BUILD_SILO
+    canAffordWarship && hasPort, // 10: BUILD_WARSHIP
+    canAffordAtom && hasNeighbors, // 11: LAUNCH_ATOM
+    canAffordHBomb && hasNeighbors, // 12: LAUNCH_HBOMB
+    canAffordMIRV && hasNeighbors, // 13: LAUNCH_MIRV
+    numWarships > 0 && hasNeighbors, // 14: MOVE_WARSHIP
+    hasUnits && myGold >= 50_000, // 15: UPGRADE (rough check)
+    hasUnits, // 16: DELETE_UNIT
+  ];
+
   return {
     tick: tickCount,
     alive,
@@ -307,6 +363,7 @@ function getObservation() {
     canAffordSilo,
     canAffordSAM,
     canAffordWarship,
+    actionMask,
   };
 }
 
@@ -329,14 +386,22 @@ function calculateReward(): number {
   const troopDelta = curTroops - prevTroops;
   reward += troopDelta * 0.0001;
 
+  // Survival bonus — being alive is good, indirectly rewards defense
+  reward += 0.001;
+
+  // Build bonus — encourages the model to try building structures
+  if (lastBuildResult === "success") {
+    reward += 0.3;
+  }
+
   // Death penalty
   if (!rlPlayer.isAlive()) {
-    reward -= 10;
+    reward -= 3;
   }
 
   // Win bonus
   if (game.getWinner()?.id() === rlPlayer.id()) {
-    reward += 100;
+    reward += 10;
   }
 
   // Update prev state
@@ -444,8 +509,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
 
   switch (unitType) {
     case UnitType.City:
-    case UnitType.Factory: // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
-    {
+    case UnitType.Factory: {
+      // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
       const safeTiles = scored.slice(Math.floor(scored.length * 0.8));
       if (safeTiles.length === 0)
         return scored[scored.length - 1]?.tile ?? null;
@@ -453,8 +518,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     case UnitType.DefensePost:
-    case UnitType.SAMLauncher: // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
-    {
+    case UnitType.SAMLauncher: {
+      // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
       const lo = Math.floor(scored.length * 0.2);
       const hi = Math.floor(scored.length * 0.4);
       const defTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -463,7 +528,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
       return defTiles[Math.floor(Math.random() * defTiles.length)].tile;
     }
 
-    case UnitType.MissileSilo: { // Silos: medium distance, ~40-60% back from front
+    case UnitType.MissileSilo: {
+      // Silos: medium distance, ~40-60% back from front
       const lo = Math.floor(scored.length * 0.4);
       const hi = Math.floor(scored.length * 0.6);
       const siloTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -472,7 +538,8 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
       return siloTiles[Math.floor(Math.random() * siloTiles.length)].tile;
     }
 
-    case UnitType.Port: { // Ports need water adjacency — try multiple border tiles, canBuild will validate
+    case UnitType.Port: {
+      // Ports need water adjacency — try multiple border tiles, canBuild will validate
       const shuffled = [...scored].sort(() => Math.random() - 0.5);
       for (const s of shuffled.slice(0, 20)) {
         if (rlPlayer.canBuild(unitType, s.tile) !== false) {
