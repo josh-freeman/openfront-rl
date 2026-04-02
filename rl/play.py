@@ -69,9 +69,24 @@ def play_headless(args):
 
         while True:
             obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            # Use action mask from info if available
+            mask_t = None
+            if "actionMask" in info:
+                mask_arr = np.array(info["actionMask"][:17], dtype=np.float32)
+                mask_arr[0] = 1.0
+                mask_t = torch.FloatTensor(mask_arr).unsqueeze(0).to(device)
             with torch.no_grad():
-                action, _, _, value = model.get_action_and_value(obs_t)
+                action, _, _, value = model.get_action_and_value(obs_t, action_mask=mask_t)
             action_np = action.squeeze(0).cpu().numpy()
+
+            if steps % 20 == 0 and game == 0:
+                act_type = int(action_np[0])
+                act_names = ["NOOP","ATK","BOAT","RET","CITY","FAC","DEF","PORT","SAM","SILO","WSHIP","ATOM","HBOMB","MIRV","MVWSH","UPG","DEL"]
+                name = act_names[act_type] if act_type < len(act_names) else str(act_type)
+                troops = obs[1] * 100000
+                gold = obs[2] * 1000000
+                pct = obs[3] * 100
+                print(f"    [{steps:4d}] {name:5s} tgt={int(action_np[1])} | troops={troops:.0f} gold={gold:.0f} terr={pct:.2f}% val={value.item():.1f}")
 
             obs, reward, done, truncated, info = env.step(action_np)
             total_reward += reward
