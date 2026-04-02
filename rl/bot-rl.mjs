@@ -330,6 +330,15 @@ async function extractGameState(page, botName) {
         state.hasUnits = totalUnits > 0;
       }
 
+      // Read delete cooldown from game engine (PlayerView.deleteUnitCooldown())
+      // Returns remaining seconds; 0 means can delete now
+      if (sidebar && sidebar.game) {
+        const me = sidebar.game.myPlayer?.();
+        if (me && typeof me.deleteUnitCooldown === "function") {
+          state.canDeleteUnit = me.deleteUnitCooldown() === 0;
+        }
+      }
+
       // Parse incoming/outgoing attacks from <attacks-display> (light DOM)
       const attacksDisplay = document.querySelector("attacks-display");
       if (attacksDisplay) {
@@ -1146,6 +1155,7 @@ async function executeRLAction(
     log(
       `RL: Delete unit at (${Math.round(unit.x)},${Math.round(unit.y)}) ${deleted ? "✓" : "no menu"}`,
     );
+    if (deleted) return { deleted: true };
   }
 }
 
@@ -1495,7 +1505,7 @@ async function main() {
             hasSilo && hasN && g >= 10_000_000, // 13: LAUNCH_MIRV
             numWarships > 0 && hasN, // 14: MOVE_WARSHIP
             hasUnits && g >= 50_000, // 15: UPGRADE
-            hasUnits, // 16: DELETE_UNIT
+            hasUnits && gameState.canDeleteUnit !== false, // 16: DELETE_UNIT (respects game cooldown)
           ];
           // Add build feedback (tracked from previous action)
           gameState.lastBuildResult = lastBuildResult;
@@ -1526,6 +1536,18 @@ async function main() {
         lastUnitPositions,
       );
       if (actionResult?.nukeLaunched) nukeCount++;
+      // One-shot actions should only execute once, not every tick until next policy query.
+      // Attack/boat_attack are fine to repeat (clicks on different border tiles).
+      // NOOP and RETREAT are also fine to repeat.
+      if (
+        currentAction &&
+        currentAction.actionType !== ACTION_NOOP &&
+        currentAction.actionType !== ACTION_ATTACK &&
+        currentAction.actionType !== ACTION_BOAT_ATTACK &&
+        currentAction.actionType !== ACTION_RETREAT
+      ) {
+        currentAction = null;
+      }
 
       // ── Accept alliance requests ──
       if (tick % 10 === 0) {

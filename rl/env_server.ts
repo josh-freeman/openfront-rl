@@ -310,6 +310,7 @@ function getObservation() {
   const hasTroops = myTroops > 10;
   const hasOutgoingAttacks = outgoing > 0;
   const hasUnits = units.length > 0;
+  const canDelete = hasUnits && rlPlayer.canDeleteUnit();
 
   // Check for non-allied neighbors (actual attackable targets)
   const hasAttackableNeighbor = neighbors.some(
@@ -338,7 +339,7 @@ function getObservation() {
     canAffordMIRV && hasAttackableBySeaNeighbor, // 13: LAUNCH_MIRV
     numWarships > 0 && hasAttackableBySeaNeighbor, // 14: MOVE_WARSHIP
     hasUnits && myGold >= 50_000, // 15: UPGRADE (rough check)
-    hasUnits, // 16: DELETE_UNIT
+    canDelete, // 16: DELETE_UNIT (respects 300-tick cooldown)
   ];
 
   return {
