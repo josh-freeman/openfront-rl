@@ -479,7 +479,7 @@ async function extractGameState(page, botName) {
           name: name,
           tiles,
           troops: info.troops || lb.troops || 0,
-          relation: 0, // 0 = neutral
+          relation: 2, // Relation.Neutral = 2 (matches training env)
           alive: true,
           isLandNeighbor: landNeighborNames.has(name),
           visible: info.visible,
