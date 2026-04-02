@@ -311,12 +311,20 @@ function getObservation() {
   const hasOutgoingAttacks = outgoing > 0;
   const hasUnits = units.length > 0;
 
+  // Check for non-allied neighbors (actual attackable targets)
+  const hasAttackableNeighbor = neighbors.some(
+    (n) => n.isLandNeighbor && !rlPlayer!.isAlliedWith(game!.player(n.id)),
+  );
+  const hasAttackableBySeaNeighbor = neighbors.some(
+    (n) => !rlPlayer!.isAlliedWith(game!.player(n.id)),
+  );
+
   // Action mask: 17 booleans, true = action is valid right now
   // Indices match env.py action IDs exactly
   const actionMask = [
     true, // 0: NOOP — always valid
-    hasNeighbors && hasTroops, // 1: ATTACK
-    hasNeighbors && hasTroops && hasPort, // 2: BOAT_ATTACK
+    hasAttackableNeighbor && hasTroops, // 1: ATTACK
+    hasAttackableBySeaNeighbor && hasTroops && hasPort, // 2: BOAT_ATTACK
     hasOutgoingAttacks, // 3: RETREAT
     canAffordCity, // 4: BUILD_CITY
     canAffordFactory, // 5: BUILD_FACTORY
@@ -325,10 +333,10 @@ function getObservation() {
     canAffordSAM, // 8: BUILD_SAM
     canAffordSilo, // 9: BUILD_SILO
     canAffordWarship && hasPort, // 10: BUILD_WARSHIP
-    canAffordAtom && hasNeighbors, // 11: LAUNCH_ATOM
-    canAffordHBomb && hasNeighbors, // 12: LAUNCH_HBOMB
-    canAffordMIRV && hasNeighbors, // 13: LAUNCH_MIRV
-    numWarships > 0 && hasNeighbors, // 14: MOVE_WARSHIP
+    canAffordAtom && hasAttackableBySeaNeighbor, // 11: LAUNCH_ATOM
+    canAffordHBomb && hasAttackableBySeaNeighbor, // 12: LAUNCH_HBOMB
+    canAffordMIRV && hasAttackableBySeaNeighbor, // 13: LAUNCH_MIRV
+    numWarships > 0 && hasAttackableBySeaNeighbor, // 14: MOVE_WARSHIP
     hasUnits && myGold >= 50_000, // 15: UPGRADE (rough check)
     hasUnits, // 16: DELETE_UNIT
   ];
