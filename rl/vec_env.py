@@ -253,6 +253,12 @@ class VecOpenFrontEnv:
                 obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
                 continue
 
+            if "obs" not in resp:
+                print(f"[env {i}] bad response (no 'obs' key), resetting: {resp}")
+                dones[i] = True
+                obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
+                continue
+
             obs[i] = self._obs_to_vec(resp["obs"], i)
             masks[i] = self._extract_action_mask(resp["obs"])
             land_masks[i], sea_masks[i] = self._extract_target_masks(resp["obs"])

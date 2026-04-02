@@ -905,6 +905,7 @@ async function main() {
         send({ error: `unknown cmd: ${msg.cmd}` });
       }
     } catch (e: any) {
+      process.stderr.write(`[env_server] error: ${e.message}\n${e.stack}\n`);
       send({ error: e.message });
     }
   }
