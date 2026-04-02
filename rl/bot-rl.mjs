@@ -602,6 +602,40 @@ async function extractGameState(page, botName) {
       // Derive myTiles from territoryPct (so vec[0] = myTiles/total is non-zero)
       state.myTiles = Math.round(state.territoryPct * state.totalMapTiles);
 
+      // Read unit screen positions for upgrade/delete targeting
+      // Uses game.myPlayer().units() → tile positions → transform to screen coords
+      state.unitPositions = [];
+      try {
+        const buildMenu = document.querySelector("build-menu");
+        const th = buildMenu?.transformHandler;
+        const g = sidebar?.game;
+        if (th && g) {
+          const me = g.myPlayer?.();
+          if (me) {
+            const allUnits = typeof me.units === "function" ? me.units() : [];
+            for (const u of allUnits) {
+              const tile = typeof u.tile === "function" ? u.tile() : u.tile;
+              if (tile == null) continue;
+              const gx = typeof g.x === "function" ? g.x(tile) : 0;
+              const gy = typeof g.y === "function" ? g.y(tile) : 0;
+              if (!gx && !gy) continue;
+              const screen = th.worldToScreenCoordinates({ x: gx, y: gy });
+              if (screen && screen.x > 0 && screen.y > 0) {
+                const typeName =
+                  typeof u.type === "function" ? u.type() : u.type;
+                state.unitPositions.push({
+                  x: screen.x,
+                  y: screen.y,
+                  type: typeName,
+                });
+              }
+            }
+          }
+        }
+      } catch (e) {
+        // Silently fail — unit positions are optional
+      }
+
       return state;
     },
     botName,
@@ -876,7 +910,14 @@ async function clearBuildMode(page) {
   await sleep(50);
 }
 
-async function executeRLAction(page, action, zone, goldAmount, neighbors) {
+async function executeRLAction(
+  page,
+  action,
+  zone,
+  goldAmount,
+  neighbors,
+  unitPositions,
+) {
   if (!action || !zone) return;
 
   const actionType = action.actionType;
@@ -1053,12 +1094,67 @@ async function executeRLAction(page, action, zone, goldAmount, neighbors) {
     );
     return { nukeLaunched: true };
   } else if (actionType === ACTION_UPGRADE) {
-    const spot = randomInterior(zone);
-    await page.mouse.click(spot.x, spot.y);
-    await sleep(200);
-    log("RL: Upgrade");
+    // Click on a unit to select it, then click the upgrade button in the radial menu
+    unitPositions = unitPositions || [];
+    if (unitPositions.length === 0) {
+      log("RL: Upgrade — no unit positions");
+      return;
+    }
+    // Pick first unit (training upgrades first upgradeable)
+    const unit = unitPositions[0];
+    await page.mouse.click(unit.x, unit.y);
+    await sleep(300);
+    // Look for upgrade button in the radial/context menu
+    const upgraded = await safeEval(page, () => {
+      // Radial menu or context menu may have an upgrade button
+      for (const el of document.querySelectorAll(
+        "button, [class*='upgrade'], [class*='radial']",
+      )) {
+        const text = el.textContent?.trim().toLowerCase() || "";
+        const src = el.querySelector("img")?.getAttribute("src") || "";
+        if (text.includes("upgrade") || src.includes("Upgrade")) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    log(
+      `RL: Upgrade at (${Math.round(unit.x)},${Math.round(unit.y)}) ${upgraded ? "✓" : "no button"}`,
+    );
   } else if (actionType === ACTION_DELETE_UNIT) {
-    log("RL: Delete unit (noop)");
+    // Click on a unit to select it, then click the delete button
+    unitPositions = unitPositions || [];
+    if (unitPositions.length === 0) {
+      log("RL: Delete unit — no unit positions");
+      return;
+    }
+    // Pick last unit (training deletes last built)
+    const unit = unitPositions[unitPositions.length - 1];
+    await page.mouse.click(unit.x, unit.y);
+    await sleep(300);
+    // Look for delete button
+    const deleted = await safeEval(page, () => {
+      for (const el of document.querySelectorAll(
+        "button, [class*='delete'], [class*='radial']",
+      )) {
+        const text = el.textContent?.trim().toLowerCase() || "";
+        const src = el.querySelector("img")?.getAttribute("src") || "";
+        if (
+          text.includes("delete") ||
+          text.includes("destroy") ||
+          src.includes("Delete") ||
+          src.includes("Trash")
+        ) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    log(
+      `RL: Delete unit at (${Math.round(unit.x)},${Math.round(unit.y)}) ${deleted ? "✓" : "no button"}`,
+    );
   }
 }
 
@@ -1176,6 +1272,7 @@ async function main() {
   let lastPolicyQuery = 0;
   let currentAction = null;
   let lastNeighbors = [];
+  let lastUnitPositions = [];
   let lastRecenter = 0;
   lastGold = 0;
   currentScale = 1.8; // reset to game default at game start
@@ -1418,6 +1515,7 @@ async function main() {
           if (action) {
             currentAction = action;
             lastNeighbors = gameState.neighbors || [];
+            lastUnitPositions = gameState.unitPositions || [];
             if (tick % 10 === 0) {
               log(
                 `RL action: type=${action.actionType} target=${action.targetIdx} troops=${action.troopFraction} gold=${(lastGold / 1000).toFixed(0)}K`,
@@ -1434,6 +1532,7 @@ async function main() {
         zone,
         lastGold,
         lastNeighbors,
+        lastUnitPositions,
       );
       if (actionResult?.nukeLaunched) nukeCount++;
 
