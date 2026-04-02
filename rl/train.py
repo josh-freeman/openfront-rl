@@ -326,13 +326,13 @@ def train(args):
     # Each step is a small increment to avoid distributional shock
     CURRICULUM_STAGES = [
         # (progress_threshold, difficulty, opponents, maps, max_steps)
-        (0.05, "Easy",   2,  MAP_TIER_1, 5000),
-        (0.10, "Easy",   3,  MAP_TIER_1, 8000),
-        (0.15, "Medium", 3,  MAP_TIER_2, 10000),
-        (0.20, "Medium", 4,  MAP_TIER_2, 15000),
-        (0.30, "Medium", 5,  MAP_TIER_2, 20000),
-        (0.38, "Hard",   5,  MAP_TIER_3, 30000),
-        (0.45, "Hard",   6,  MAP_TIER_3, 40000),
+        (0.05, "Easy",   2,  MAP_TIER_1, 10000),
+        (0.10, "Easy",   3,  MAP_TIER_1, 15000),
+        (0.15, "Medium", 3,  MAP_TIER_2, 20000),
+        (0.20, "Medium", 4,  MAP_TIER_2, 25000),
+        (0.30, "Medium", 5,  MAP_TIER_2, 30000),
+        (0.38, "Hard",   5,  MAP_TIER_3, 40000),
+        (0.45, "Hard",   6,  MAP_TIER_3, 50000),
         (0.50, "Hard",   8,  MAP_TIER_3, 60000),
         (0.65, "Hard",  10,  MAP_TIER_3, 80000),
         (1.00, "Hard",  12,  MAP_TIER_3, 100000),
