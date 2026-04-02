@@ -1094,66 +1094,57 @@ async function executeRLAction(
     );
     return { nukeLaunched: true };
   } else if (actionType === ACTION_UPGRADE) {
-    // Click on a unit to select it, then click the upgrade button in the radial menu
+    // Right-click near a unit to open radial menu, then click "build" slot,
+    // then click the unit type to upgrade it
     unitPositions = unitPositions || [];
     if (unitPositions.length === 0) {
       log("RL: Upgrade — no unit positions");
       return;
     }
-    // Pick first unit (training upgrades first upgradeable)
     const unit = unitPositions[0];
-    await page.mouse.click(unit.x, unit.y);
-    await sleep(300);
-    // Look for upgrade button in the radial/context menu
-    const upgraded = await safeEval(page, () => {
-      // Radial menu or context menu may have an upgrade button
-      for (const el of document.querySelectorAll(
-        "button, [class*='upgrade'], [class*='radial']",
-      )) {
-        const text = el.textContent?.trim().toLowerCase() || "";
-        const src = el.querySelector("img")?.getAttribute("src") || "";
-        if (text.includes("upgrade") || src.includes("Upgrade")) {
-          el.click();
-          return true;
-        }
+    await page.mouse.click(unit.x, unit.y, { button: "right" });
+    await sleep(400);
+    // Click the "build" slot in the SVG radial menu
+    const opened = await safeEval(page, () => {
+      const el =
+        document.querySelector('path[data-id="build"]') ||
+        document.querySelector('g[data-id="build"]');
+      if (el) {
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        return true;
       }
       return false;
     });
+    if (opened) {
+      await sleep(300);
+      // In the build submenu, clicking near an existing unit upgrades it
+      await page.mouse.click(unit.x, unit.y);
+    }
     log(
-      `RL: Upgrade at (${Math.round(unit.x)},${Math.round(unit.y)}) ${upgraded ? "✓" : "no button"}`,
+      `RL: Upgrade at (${Math.round(unit.x)},${Math.round(unit.y)}) ${opened ? "✓" : "no menu"}`,
     );
   } else if (actionType === ACTION_DELETE_UNIT) {
-    // Click on a unit to select it, then click the delete button
+    // Right-click near a unit to open radial menu, then click "delete" slot
     unitPositions = unitPositions || [];
     if (unitPositions.length === 0) {
       log("RL: Delete unit — no unit positions");
       return;
     }
-    // Pick last unit (training deletes last built)
     const unit = unitPositions[unitPositions.length - 1];
-    await page.mouse.click(unit.x, unit.y);
-    await sleep(300);
-    // Look for delete button
+    await page.mouse.click(unit.x, unit.y, { button: "right" });
+    await sleep(400);
     const deleted = await safeEval(page, () => {
-      for (const el of document.querySelectorAll(
-        "button, [class*='delete'], [class*='radial']",
-      )) {
-        const text = el.textContent?.trim().toLowerCase() || "";
-        const src = el.querySelector("img")?.getAttribute("src") || "";
-        if (
-          text.includes("delete") ||
-          text.includes("destroy") ||
-          src.includes("Delete") ||
-          src.includes("Trash")
-        ) {
-          el.click();
-          return true;
-        }
+      const el =
+        document.querySelector('path[data-id="delete"]') ||
+        document.querySelector('g[data-id="delete"]');
+      if (el) {
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        return true;
       }
       return false;
     });
     log(
-      `RL: Delete unit at (${Math.round(unit.x)},${Math.round(unit.y)}) ${deleted ? "✓" : "no button"}`,
+      `RL: Delete unit at (${Math.round(unit.x)},${Math.round(unit.y)}) ${deleted ? "✓" : "no menu"}`,
     );
   }
 }
