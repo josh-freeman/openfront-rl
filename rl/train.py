@@ -125,14 +125,21 @@ class ActorCritic(nn.Module):
         return action, log_prob, entropy, out["value"]
 
 
-def compute_gae_vec(rewards, values, dones, last_values, gamma=0.99, lam=0.95):
-    """Compute GAE for vectorized rollouts.
+def compute_gae_vec(rewards, values, terminals, truncateds, last_values,
+                    truncated_values=None, gamma=0.99, lam=0.95):
+    """Compute GAE for vectorized rollouts with proper truncation handling.
+
+    Terminal episodes (death) zero out bootstrapping.
+    Truncated episodes (max_steps) bootstrap from the value estimate,
+    because the episode was artificially cut short.
 
     Args:
         rewards: (num_steps, num_envs)
         values: (num_steps, num_envs)
-        dones: (num_steps, num_envs)
+        terminals: (num_steps, num_envs) - true episode ends (death/win)
+        truncateds: (num_steps, num_envs) - forced episode ends (max_steps)
         last_values: (num_envs,) bootstrap values for last step
+        truncated_values: (num_steps, num_envs) - value estimates at truncation points
     Returns:
         advantages: (num_steps, num_envs)
         returns: (num_steps, num_envs)
@@ -141,13 +148,24 @@ def compute_gae_vec(rewards, values, dones, last_values, gamma=0.99, lam=0.95):
     advantages = np.zeros_like(rewards)
     last_gae = np.zeros(num_envs)
 
+    # Only terminal deaths should zero out bootstrapping
+    # Truncations should bootstrap from the value function
     for t in reversed(range(num_steps)):
         if t == num_steps - 1:
             next_values = last_values
         else:
             next_values = values[t + 1]
-        delta = rewards[t] + gamma * next_values * (1 - dones[t]) - values[t]
-        last_gae = delta + gamma * lam * (1 - dones[t]) * last_gae
+
+        # At truncation, bootstrap from value estimate of the truncated state
+        if truncated_values is not None:
+            next_values = np.where(truncateds[t], truncated_values[t], next_values)
+
+        # Only terminals zero out the future (not truncations)
+        not_terminal = 1.0 - terminals[t]
+        delta = rewards[t] + gamma * next_values * not_terminal - values[t]
+        last_gae = delta + gamma * lam * not_terminal * last_gae
+        # Reset GAE at truncation boundaries too (new episode starts)
+        last_gae = np.where(truncateds[t], delta, last_gae)
         advantages[t] = last_gae
 
     returns = advantages + values
@@ -258,7 +276,9 @@ def train(args):
     actions_buf = np.zeros((args.rollout_steps, args.num_envs, 3), dtype=np.float32)
     logprobs_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
     rewards_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
-    dones_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    terminals_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    truncateds_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    truncated_values_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
     values_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
 
     # Track per-env episode stats
@@ -268,36 +288,61 @@ def train(args):
     # Initialize
     obs, action_masks = envs.reset_all()  # (num_envs, obs_dim), (num_envs, NUM_ACTIONS)
 
-    # Curriculum phase boundaries (fraction of num_updates)
-    CURRICULUM_BOUNDS = [0.05, 0.30, 0.50, 1.0]
+    # Curriculum: gradual ramp of (difficulty, opponents, maps)
+    # Each step is a small increment to avoid distributional shock
+    CURRICULUM_STAGES = [
+        # (progress_threshold, difficulty, opponents, maps)
+        (0.05, "Easy",   2,  MAP_TIER_1),
+        (0.10, "Easy",   3,  MAP_TIER_1),
+        (0.15, "Medium", 3,  MAP_TIER_2),
+        (0.20, "Medium", 4,  MAP_TIER_2),
+        (0.30, "Medium", 5,  MAP_TIER_2),
+        (0.38, "Hard",   5,  MAP_TIER_3),
+        (0.45, "Hard",   6,  MAP_TIER_3),
+        (0.50, "Hard",   8,  MAP_TIER_3),
+        (0.65, "Hard",  10,  MAP_TIER_3),
+        (1.00, "Hard",  12,  MAP_TIER_3),
+    ]
+    # LR warmdown: after a curriculum transition, temporarily reduce LR
+    # then ramp back up over WARMDOWN_UPDATES
+    WARMDOWN_UPDATES = 50
+    warmdown_counter = 0
+    WARMDOWN_FACTOR = 0.3  # drop LR to 30% at transition, ramp back to 100%
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
 
-        # Curriculum learning: ramp difficulty, opponents, AND map pool over training
+        # Curriculum learning: gradual ramp
         if args.curriculum:
             progress = update / args.num_updates
-            if progress < CURRICULUM_BOUNDS[0]:
-                new_diff, new_opp, new_maps = "Easy", 2, MAP_TIER_1
-            elif progress < CURRICULUM_BOUNDS[1]:
-                new_diff, new_opp, new_maps = "Medium", 5, MAP_TIER_2
-            elif progress < CURRICULUM_BOUNDS[2]:
-                new_diff, new_opp, new_maps = "Hard", 8, MAP_TIER_3
+            # Find current stage
+            for thresh, diff, opp, maps in CURRICULUM_STAGES:
+                if progress < thresh:
+                    new_diff, new_opp, new_maps = diff, opp, maps
+                    break
             else:
-                new_diff, new_opp, new_maps = "Hard", 12, MAP_TIER_3
+                new_diff, new_opp, new_maps = CURRICULUM_STAGES[-1][1], CURRICULUM_STAGES[-1][2], CURRICULUM_STAGES[-1][3]
+
             if envs.difficulty != new_diff or envs.num_opponents != new_opp:
                 print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps (progress={progress:.0%})")
                 envs.difficulty = new_diff
                 envs.num_opponents = new_opp
+                warmdown_counter = WARMDOWN_UPDATES  # trigger LR warmdown
             if len(envs.maps) != len(new_maps):
                 envs.maps = new_maps
 
-        # Global LR annealing
+        # LR schedule: apply warmdown after curriculum transitions
+        lr_now = args.lr
         if args.anneal_lr:
             frac = 1.0 - update / args.num_updates
             lr_now = frac * args.lr
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr_now
+        if warmdown_counter > 0:
+            # Linearly ramp from WARMDOWN_FACTOR back to 1.0
+            warmdown_frac = WARMDOWN_FACTOR + (1.0 - WARMDOWN_FACTOR) * (1.0 - warmdown_counter / WARMDOWN_UPDATES)
+            lr_now *= warmdown_frac
+            warmdown_counter -= 1
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_now
 
         # Collect rollout
         for step in range(args.rollout_steps):
@@ -316,7 +361,16 @@ def train(args):
 
             next_obs, next_masks, rewards, dones, truncateds, infos = envs.step(actions_np)
             rewards_buf[step] = rewards
-            dones_buf[step] = dones | truncateds
+            terminals_buf[step] = dones.astype(np.float32)
+            truncateds_buf[step] = truncateds.astype(np.float32)
+
+            # For truncated envs, estimate the value of the terminal state
+            # before resetting — this is the bootstrap target
+            if np.any(truncateds):
+                trunc_obs = torch.FloatTensor(next_obs[truncateds]).to(device)
+                with torch.no_grad():
+                    trunc_vals = model.get_action_and_value(trunc_obs)[3]
+                truncated_values_buf[step, truncateds] = trunc_vals.cpu().numpy()
 
             # Track episode stats and auto-reset finished envs
             env_ep_rewards += rewards
@@ -339,9 +393,10 @@ def train(args):
             last_values = model.get_action_and_value(torch.FloatTensor(obs).to(device))[3]
             last_values = last_values.cpu().numpy()
 
-        # Compute GAE
+        # Compute GAE with proper truncation bootstrapping
         advantages, returns = compute_gae_vec(
-            rewards_buf, values_buf, dones_buf, last_values,
+            rewards_buf, values_buf, terminals_buf, truncateds_buf,
+            last_values, truncated_values_buf,
             gamma=args.gamma, lam=args.gae_lambda,
         )
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ofrl-big
+#SBATCH --job-name=ofrl-res
 #SBATCH --output=logs/train_%j.log
 #SBATCH --error=logs/train_%j.log
 #SBATCH --gres=gpu:1
@@ -21,7 +21,7 @@ source "$REPO_DIR/.venv/bin/activate"
 echo "=== Job $SLURM_JOB_ID starting at $(date) ==="
 echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
-echo "Using BIGGER model (512,512,256)"
+echo "CONTINUING warmstart model from checkpoint with optimizer state"
 
 cd rl
 python -u train.py \
@@ -36,6 +36,7 @@ python -u train.py \
     --hidden-sizes 512,512,256 \
     --save-interval 10 \
     --log-interval 5 \
-    --save-dir ./checkpoints_big
+    --save-dir ./checkpoints_warmstart \
+    --resume
 
 echo "=== Job $SLURM_JOB_ID finished at $(date) ==="

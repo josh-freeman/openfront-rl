@@ -238,7 +238,7 @@ class VecOpenFrontEnv:
             masks[i] = self._extract_action_mask(resp["obs"])
             rewards[i] = float(resp.get("reward", 0))
             dones[i] = bool(resp.get("done", False))
-            truncateds[i] = self._step_counts[i] >= self.max_steps
+            truncateds[i] = self._step_counts[i] >= self.max_steps and not dones[i]
             infos[i] = resp.get("info", {})
 
         return obs, masks, rewards, dones, truncateds, infos

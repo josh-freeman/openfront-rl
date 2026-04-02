@@ -39,6 +39,8 @@ def create_model_card(checkpoint_dir: Path) -> str:
     num_envs = config.get("num_envs", "N/A")
     lr = config.get("lr", "N/A")
     rollout_steps = config.get("rollout_steps", "N/A")
+    hidden_sizes = config.get("hidden_sizes", [256, 256, 128])
+    arch_str = "→".join(str(h) for h in hidden_sizes)
 
     return f"""---
 license: mit
@@ -56,7 +58,7 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 ## Training Details
 
 - **Algorithm:** PPO (Proximal Policy Optimization)
-- **Architecture:** Actor-Critic with shared backbone (256→256→128)
+- **Architecture:** Actor-Critic with shared backbone ({arch_str})
 - **Observation dim:** {obs_dim}
 - **Max neighbors:** {max_neighbors}
 - **Maps:** {maps} (random per episode)
@@ -80,7 +82,7 @@ PPO-trained agent for [OpenFront.io](https://openfront.io), a multiplayer territ
 from train import ActorCritic
 import torch
 
-model = ActorCritic(obs_dim={obs_dim}, max_neighbors={max_neighbors})
+model = ActorCritic(obs_dim={obs_dim}, max_neighbors={max_neighbors}, hidden_sizes={hidden_sizes})
 model.load_state_dict(torch.load("best_model.pt", weights_only=True))
 model.eval()
 ```
