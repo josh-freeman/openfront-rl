@@ -569,13 +569,22 @@ async function extractGameState(page, botName) {
         });
       }
 
+      // Filter out dead players — leaderboard only shows alive players,
+      // so use that as the alive set. Also keep anyone visible with troops > 0
+      // (leaderboard may lag by a tick).
+      const aliveNames = new Set(Object.keys(lbData));
+      const filteredNeighbors = neighbors.filter(
+        (n) => aliveNames.has(n.name) || n.troops > 0,
+      );
+
       // Sort to match training: land neighbors first, then by territory size
-      neighbors.sort((a, b) => {
-        if (a.isLandNeighbor !== b.isLandNeighbor)
-          return a.isLandNeighbor ? -1 : 1;
-        return b.tiles - a.tiles;
-      });
-      state.neighbors = neighbors.slice(0, 16);
+      state.neighbors = filteredNeighbors
+        .sort((a, b) => {
+          if (a.isLandNeighbor !== b.isLandNeighbor)
+            return a.isLandNeighbor ? -1 : 1;
+          return b.tiles - a.tiles;
+        })
+        .slice(0, 16);
 
       // Find our territory % from the <leader-board> Lit element.
       // Access the component's `players` array directly (light DOM Lit component).
