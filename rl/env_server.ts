@@ -203,20 +203,31 @@ function getObservation() {
   const myGold = Number(rlPlayer.gold());
   const alive = rlPlayer.isAlive();
 
-  // Neighbors (other players bordering us)
-  const neighbors = rlPlayer
-    .neighbors()
-    .filter((n) => n.isPlayer())
-    .map((n) => {
-      const p = n as Player;
-      return {
-        id: p.id(),
-        name: p.name(),
-        tiles: p.numTilesOwned(),
-        troops: p.troops(),
-        alive: p.isAlive(),
-        relation: rlPlayer!.relation(p),
-      };
+  // All alive players (not just land neighbors) — sorted by relevance
+  // Land neighbors first (immediate threats), then others sorted by size
+  const landNeighborIds = new Set(
+    rlPlayer
+      .neighbors()
+      .filter((n) => n.isPlayer())
+      .map((n) => (n as Player).id()),
+  );
+  const neighbors = game
+    .players()
+    .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
+    .map((p) => ({
+      id: p.id(),
+      name: p.name(),
+      tiles: p.numTilesOwned(),
+      troops: p.troops(),
+      alive: p.isAlive(),
+      relation: rlPlayer!.relation(p),
+      isLandNeighbor: landNeighborIds.has(p.id()),
+    }))
+    .sort((a, b) => {
+      // Land neighbors first, then by territory size (biggest threat)
+      if (a.isLandNeighbor !== b.isLandNeighbor)
+        return a.isLandNeighbor ? -1 : 1;
+      return b.tiles - a.tiles;
     });
 
   // Our units
@@ -375,7 +386,15 @@ function calculateReward(): number {
   const troopDelta = curTroops - prevTroops;
   reward += troopDelta * 0.0001;
 
-  // Death penalty (kept small relative to per-step tile rewards ~0.01)
+  // Survival bonus — being alive is good, indirectly rewards defense
+  reward += 0.001;
+
+  // Build bonus — encourages the model to try building structures
+  if (lastBuildResult === "success") {
+    reward += 0.3;
+  }
+
+  // Death penalty
   if (!rlPlayer.isAlive()) {
     reward -= 3;
   }
