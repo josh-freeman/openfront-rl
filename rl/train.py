@@ -476,7 +476,7 @@ def train(args):
     if (save_dir / "best_model.pt").exists():
         try:
             from push_to_hf import push as hf_push
-            hf_args = argparse.Namespace(repo=args.hf_repo, checkpoint_dir=str(save_dir))
+            hf_args = argparse.Namespace(repo=args.hf_repo, checkpoint_dir=str(save_dir), force=False)
             hf_push(hf_args)
         except Exception as e:
             print(f"HuggingFace push failed (non-fatal): {e}")

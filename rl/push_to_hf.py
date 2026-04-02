@@ -91,6 +91,21 @@ Trained from [josh-freeman/openfront-rl](https://github.com/josh-freeman/openfro
 """
 
 
+def get_remote_best_reward(api: HfApi, repo: str) -> float:
+    """Fetch the best_reward from the remote HF repo's training_log.json."""
+    try:
+        import tempfile
+        path = api.hf_hub_download(repo_id=repo, filename="training_log.json",
+                                    cache_dir=tempfile.mkdtemp())
+        with open(path) as f:
+            logs = json.load(f)
+        if logs:
+            return float(logs[-1].get("mean_reward", -float("inf")))
+    except Exception:
+        pass
+    return -float("inf")
+
+
 def push(args):
     checkpoint_dir = Path(args.checkpoint_dir)
     api = HfApi()
@@ -102,6 +117,20 @@ def push(args):
     best_model = checkpoint_dir / "best_model.pt"
     if not best_model.exists():
         print(f"ERROR: {best_model} not found. Train first.")
+        return
+
+    # Compare against current HF model before overwriting
+    local_state_path = checkpoint_dir / "state.json"
+    local_reward = -float("inf")
+    if local_state_path.exists():
+        with open(local_state_path) as f:
+            local_reward = float(json.load(f).get("best_reward", -float("inf")))
+
+    remote_reward = get_remote_best_reward(api, args.repo)
+    print(f"Local best reward: {local_reward:.2f}, Remote best reward: {remote_reward:.2f}")
+
+    if remote_reward > local_reward and not args.force:
+        print(f"SKIPPING push: remote model is better ({remote_reward:.2f} > {local_reward:.2f}). Use --force to override.")
         return
 
     print(f"Uploading {best_model} to {args.repo}...")
@@ -136,5 +165,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Push trained model to HuggingFace")
     parser.add_argument("--repo", default="mischievers/openfront-rl-agent")
     parser.add_argument("--checkpoint-dir", default="./checkpoints")
+    parser.add_argument("--force", action="store_true", help="Push even if remote model has higher reward")
     args = parser.parse_args()
     push(args)
