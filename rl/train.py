@@ -202,6 +202,14 @@ def train(args):
     start_update = 0
     num_episodes = 0
 
+    # Load weights only (fresh optimizer) from a specific checkpoint
+    if args.load_weights:
+        wpath = Path(args.load_weights)
+        print(f"Loading weights from: {wpath}")
+        checkpoint = torch.load(wpath, map_location=device, weights_only=True)
+        model.load_state_dict(checkpoint["model"])
+        print(f"Weights loaded (fresh optimizer, starting from update 0)")
+
     # Resume from checkpoint if requested
     if args.resume:
         state_path = save_dir / "state.json"
@@ -511,6 +519,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", default="./checkpoints")
     parser.add_argument("--hidden-sizes", default="256,256,128", help="Comma-separated backbone layer sizes")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--load-weights", default="", help="Load model weights only (fresh optimizer) from a .pt file")
     parser.add_argument("--hf-repo", default="mischievers/openfront-rl-agent", help="HuggingFace repo for auto-push")
     args = parser.parse_args()
     train(args)
