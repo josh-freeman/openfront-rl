@@ -470,7 +470,8 @@ async function extractGameState(page, botName) {
       const neighbors = [];
       for (const [name, info] of playerMap) {
         if (name === botName || name.includes(botName.slice(0, 6))) continue;
-        if (name.toLowerCase() === "wilderness" || name === "") continue;
+        if (name === "") continue;
+        // Keep Wilderness in the list — model learned to attack it for expansion
 
         const lb = lbData[name] || {};
         let tiles = lb.pct ? Math.round(lb.pct * state.totalMapTiles) : 0;
@@ -805,12 +806,7 @@ async function executeRLAction(page, action, zone, goldAmount, neighbors) {
   }
 
   if (actionType === ACTION_NOOP) {
-    // Expand into borders — click on border ring (keep conservative to save troops)
-    for (let i = 0; i < 2; i++) {
-      const { x, y } = randomBorder(zone);
-      await page.mouse.click(x, y);
-      await sleep(50);
-    }
+    // Do nothing — trust the model
   } else if (
     actionType === ACTION_ATTACK ||
     actionType === ACTION_BOAT_ATTACK
@@ -1334,21 +1330,7 @@ async function main() {
         }
       }
 
-      // ── EXPAND: click borders to grow ──
-      await clearBuildMode(page);
-      // Use explicit mousedown+mouseup at same position with gap between clicks
-      // to avoid rapid clicks being interpreted as drags (which pan the camera)
-      for (let i = 0; i < 1; i++) {
-        const { x, y } = randomBorder(zone);
-        await page.mouse.move(x, y);
-        await sleep(20);
-        await page.mouse.down();
-        await sleep(20);
-        await page.mouse.up();
-        await sleep(60);
-      }
-
-      // ── EXECUTE RL POLICY ACTION ──
+      // ── EXECUTE RL POLICY ACTION (model controls all actions including expansion) ──
       const actionResult = await executeRLAction(
         page,
         currentAction,
