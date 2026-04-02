@@ -58,25 +58,27 @@ from env import NUM_ACTIONS
 class ActorCritic(nn.Module):
     """Shared-backbone actor-critic network for MultiDiscrete action space."""
 
-    def __init__(self, obs_dim: int, max_neighbors: int):
+    def __init__(self, obs_dim: int, max_neighbors: int, hidden_sizes: list[int] = None):
         super().__init__()
 
-        self.backbone = nn.Sequential(
-            nn.Linear(obs_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-        )
+        if hidden_sizes is None:
+            hidden_sizes = [256, 256, 128]
+
+        layers = []
+        in_dim = obs_dim
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        self.backbone = nn.Sequential(*layers)
 
         # Action heads (one per MultiDiscrete dimension)
-        self.action_type_head = nn.Linear(128, NUM_ACTIONS)
-        self.target_head = nn.Linear(128, max_neighbors)
-        self.troop_head = nn.Linear(128, 5)
+        self.action_type_head = nn.Linear(in_dim, NUM_ACTIONS)
+        self.target_head = nn.Linear(in_dim, max_neighbors)
+        self.troop_head = nn.Linear(in_dim, 5)
 
         # Value head
-        self.value_head = nn.Linear(128, 1)
+        self.value_head = nn.Linear(in_dim, 1)
 
     def forward(self, x):
         features = self.backbone(x)
@@ -185,7 +187,8 @@ def train(args):
         max_neighbors=max_neighbors,
     )
 
-    model = ActorCritic(obs_dim, max_neighbors).to(device)
+    hidden_sizes = [int(x) for x in args.hidden_sizes.split(",")]
+    model = ActorCritic(obs_dim, max_neighbors, hidden_sizes=hidden_sizes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     # Logging
@@ -452,6 +455,7 @@ def train(args):
                         "num_envs": args.num_envs,
                         "lr": args.lr,
                         "rollout_steps": args.rollout_steps,
+                        "hidden_sizes": hidden_sizes,
                     },
                 }, f, indent=2)
 
@@ -502,6 +506,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")
+    parser.add_argument("--hidden-sizes", default="256,256,128", help="Comma-separated backbone layer sizes")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--hf-repo", default="mischievers/openfront-rl-agent", help="HuggingFace repo for auto-push")
     args = parser.parse_args()
