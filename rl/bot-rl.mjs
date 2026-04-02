@@ -342,24 +342,131 @@ async function extractGameState(page, botName) {
         const troopsEl = container.querySelector(".player-troops");
         const troops = troopsEl ? parseTroops(troopsEl.textContent) : 0;
         const visible = container.style.display !== "none";
-        playerMap.set(name, { troops, visible });
+        // Get label position (NameLayer positions labels at territory center)
+        const rect = container.getBoundingClientRect();
+        const labelX = rect.left + rect.width / 2;
+        const labelY = rect.top + rect.height / 2;
+        playerMap.set(name, { troops, visible, labelX, labelY });
+      }
+
+      // Detect land neighbors via canvas color matching:
+      // 1. Sample each player's territory color at their label position
+      // 2. Find our territory border pixels and sample adjacent non-ours colors
+      // 3. Match adjacent colors to player colors → those are land neighbors
+      const landNeighborNames = new Set();
+      const canvas = document.querySelector("canvas");
+      if (canvas) {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          const W = canvas.width,
+            H = canvas.height;
+          const canvasRect = canvas.getBoundingClientRect();
+          const centerData = ctx.getImageData(
+            Math.floor(W / 2),
+            Math.floor(H / 2),
+            1,
+            1,
+          ).data;
+          const myR = centerData[0],
+            myG = centerData[1],
+            myB = centerData[2];
+
+          if (myR + myG + myB > 60 && !(myB > myR + myG + 50)) {
+            // Step 1: Sample territory color at each player's label position
+            const playerColors = []; // [{name, r, g, b}]
+            for (const [name, info] of playerMap) {
+              if (name === botName || name.includes(botName.slice(0, 6)))
+                continue;
+              if (!info.labelX || !info.labelY) continue;
+              // Convert page coords → canvas pixel coords
+              const cx = Math.floor(
+                ((info.labelX - canvasRect.left) / canvasRect.width) * W,
+              );
+              const cy = Math.floor(
+                ((info.labelY - canvasRect.top) / canvasRect.height) * H,
+              );
+              if (cx < 0 || cx >= W || cy < 0 || cy >= H) continue;
+              const px = ctx.getImageData(cx, cy, 1, 1).data;
+              // Skip water/UI pixels
+              if (px[0] + px[1] + px[2] < 60) continue;
+              if (px[2] > px[0] + px[1] + 50) continue;
+              playerColors.push({ name, r: px[0], g: px[1], b: px[2] });
+            }
+
+            // Step 2: Scan grid, find our border, collect adjacent non-ours colors
+            const STEP = 16;
+            const imgData = ctx.getImageData(0, 0, W, H).data;
+            const cols = Math.floor(W / STEP),
+              rows = Math.floor(H / STEP);
+            const mineGrid = [];
+            for (let gx = 0; gx < cols; gx++) {
+              mineGrid[gx] = [];
+              for (let gy = 0; gy < rows; gy++) {
+                const px = gx * STEP + 8,
+                  py = gy * STEP + 8;
+                const idx = (py * W + px) * 4;
+                const dr = imgData[idx] - myR,
+                  dg = imgData[idx + 1] - myG,
+                  db = imgData[idx + 2] - myB;
+                mineGrid[gx][gy] = Math.sqrt(dr * dr + dg * dg + db * db) < 45;
+              }
+            }
+
+            // Collect colors of non-ours cells adjacent to our border
+            const adjacentColors = [];
+            for (let gx = 1; gx < cols - 1; gx++) {
+              for (let gy = 1; gy < rows - 1; gy++) {
+                if (!mineGrid[gx][gy]) continue;
+                const dirs = [
+                  [gx - 1, gy],
+                  [gx + 1, gy],
+                  [gx, gy - 1],
+                  [gx, gy + 1],
+                ];
+                for (const [nx, ny] of dirs) {
+                  if (mineGrid[nx][ny]) continue;
+                  const px = nx * STEP + 8,
+                    py = ny * STEP + 8;
+                  const idx = (py * W + px) * 4;
+                  const r = imgData[idx],
+                    g = imgData[idx + 1],
+                    b = imgData[idx + 2];
+                  // Skip water (dark or very blue)
+                  if (r + g + b < 60) continue;
+                  if (b > r + g + 50) continue;
+                  adjacentColors.push({ r, g, b });
+                }
+              }
+            }
+
+            // Step 3: Match adjacent colors → player colors
+            const COLOR_THRESHOLD = 50;
+            for (const ac of adjacentColors) {
+              for (const pc of playerColors) {
+                const dr = ac.r - pc.r,
+                  dg = ac.g - pc.g,
+                  db = ac.b - pc.b;
+                if (Math.sqrt(dr * dr + dg * dg + db * db) < COLOR_THRESHOLD) {
+                  landNeighborNames.add(pc.name);
+                }
+              }
+            }
+          }
+        }
       }
 
       // Build neighbors list from DOM labels, enriched with leaderboard data
       const neighbors = [];
       for (const [name, info] of playerMap) {
-        // Skip our own entry
         if (name === botName || name.includes(botName.slice(0, 6))) continue;
-        // Skip wilderness/unclaimed
         if (name.toLowerCase() === "wilderness" || name === "") continue;
 
         const lb = lbData[name] || {};
-        // Estimate tiles: use leaderboard % if available, otherwise estimate from
-        // troop count (rough heuristic: troops ≈ tiles * 0.5 in early/mid game)
         let tiles = lb.pct ? Math.round(lb.pct * state.totalMapTiles) : 0;
         if (tiles === 0 && info.troops > 0) {
-          tiles = Math.round(info.troops * 2); // rough estimate
+          tiles = Math.round(info.troops * 2);
         }
+
         neighbors.push({
           id: name,
           name: name,
@@ -367,12 +474,17 @@ async function extractGameState(page, botName) {
           troops: info.troops || lb.troops || 0,
           relation: 0, // 0 = neutral
           alive: true,
-          visible: info.visible, // whether label was on screen (troop data fresh)
+          isLandNeighbor: landNeighborNames.has(name),
+          visible: info.visible,
         });
       }
 
-      // Sort by troops descending (strongest neighbors first)
-      neighbors.sort((a, b) => b.troops - a.troops);
+      // Sort to match training: land neighbors first, then by territory size
+      neighbors.sort((a, b) => {
+        if (a.isLandNeighbor !== b.isLandNeighbor)
+          return a.isLandNeighbor ? -1 : 1;
+        return b.tiles - a.tiles;
+      });
       state.neighbors = neighbors.slice(0, 16);
 
       // Find our territory % from the <leader-board> element.
