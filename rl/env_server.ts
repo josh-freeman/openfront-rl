@@ -869,7 +869,9 @@ function stepGame(action: RLAction, ticksPerStep: number = 10) {
   const info = {
     tickCount,
     winner: game.getWinner()?.name() ?? null,
-    weWon: game.getWinner()?.id() === "rl_agent" || allOpponentsDead,
+    weWon:
+      rlPlayer.isAlive() &&
+      (game.getWinner()?.id() === "rl_agent" || allOpponentsDead),
   };
 
   return { obs, reward, done, info };

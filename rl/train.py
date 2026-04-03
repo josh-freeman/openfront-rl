@@ -345,7 +345,7 @@ def train(args):
         ("Hard",    8,  MAP_TIER_3, 50000,  0.45),
         ("Hard",   15,  MAP_TIER_3, 80000,  None),  # final stage
     ]
-    CURRICULUM_MIN_EPISODES = 50
+    CURRICULUM_MIN_EPISODES = max(200, args.num_envs * 20)
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES
