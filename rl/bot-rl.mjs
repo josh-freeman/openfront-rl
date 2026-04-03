@@ -547,6 +547,17 @@ async function extractGameState(page, botName) {
         }
       }
 
+      // Capture our own label position for attack targeting
+      for (const [name, info] of playerMap) {
+        if (name === botName || name.includes(botName.slice(0, 6))) {
+          if (info.labelX && info.labelY) {
+            state.myLabelX = info.labelX;
+            state.myLabelY = info.labelY;
+          }
+          break;
+        }
+      }
+
       // Build neighbors list from DOM labels, enriched with leaderboard data
       const neighbors = [];
       for (const [name, info] of playerMap) {
@@ -926,6 +937,7 @@ async function executeRLAction(
   goldAmount,
   neighbors,
   unitPositions,
+  gameState,
 ) {
   if (!action || !zone) return;
 
@@ -960,17 +972,19 @@ async function executeRLAction(
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
     let x, y;
+    // Use our actual label position if available, otherwise fall back to zone center
+    const originX = gameState?.myLabelX || zone.cx;
+    const originY = gameState?.myLabelY || zone.cy;
     if (target && target.labelX && target.labelY) {
-      // Click on the line between our center and the target's label,
-      // at our border distance (80-200px from center) in that direction
-      const dx = target.labelX - zone.cx;
-      const dy = target.labelY - zone.cy;
+      const dx = target.labelX - originX;
+      const dy = target.labelY - originY;
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist > 10) {
-        // Aim toward target, 80-200px from our center (our border region)
-        const clickDist = 80 + Math.random() * 120;
-        x = zone.cx + (dx / dist) * clickDist;
-        y = zone.cy + (dy / dist) * clickDist;
+        // Click 55-70% of the way from our center to the target's center.
+        // This naturally scales with zoom level and lands near/past our border.
+        const frac = 0.55 + Math.random() * 0.15;
+        x = originX + dx * frac;
+        y = originY + dy * frac;
       } else {
         // Target is very close to center — fall back to random border
         ({ x, y } = randomBorder(zone));
@@ -978,16 +992,37 @@ async function executeRLAction(
     } else {
       // No position data for target — fall back to random border
       ({ x, y } = randomBorder(zone));
+      log(
+        `RL: Warning — no label position for target ${target?.name || targetIdx}`,
+      );
     }
 
+    // Clamp to safe zone to avoid clicking UI elements
+    x = Math.max(zone.left, Math.min(zone.right, x));
+    y = Math.max(zone.top, Math.min(zone.bottom, y));
     await page.mouse.click(x, y);
     await sleep(50);
     const targetName = target ? target.name : "unknown";
+    const hasLabel = !!(target && target.labelX && target.labelY);
     log(
-      `RL: Attack ${targetName} at (${Math.round(x)},${Math.round(y)}) ratio=${troopFraction}`,
+      `RL: Attack ${targetName} at (${Math.round(x)},${Math.round(y)}) from (${Math.round(originX)},${Math.round(originY)}) ratio=${troopFraction} label=${hasLabel}`,
     );
   } else if (actionType === ACTION_RETREAT) {
-    log("RL: Retreat (noop in live)");
+    // Click the ❌ button on the most recent outgoing attack in attacks-display
+    const retreated = await safeEval(page, () => {
+      const display = document.querySelector("attacks-display");
+      if (!display) return null;
+      // Find all cancel buttons (❌) on outgoing attacks
+      const buttons = display.querySelectorAll("button");
+      for (const btn of buttons) {
+        if (btn.textContent?.trim() === "❌" && !btn.disabled) {
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    log(`RL: Retreat ${retreated ? "✓" : "no outgoing attacks"}`);
   } else if (BUILD_KEYS[actionType]) {
     const { key, name, minGold } = BUILD_KEYS[actionType];
 
@@ -1004,15 +1039,15 @@ async function executeRLAction(
       return;
     }
 
-    // Center + zoom in close for precise build placement
+    // Center + zoom in very close so our territory fills the screen
     await centerCamera(page);
     const savedScale = currentScale;
-    // Zoom in to scale ~12 so our territory fills the screen
+    const targetBuildScale = 1.5; // very zoomed in — territory must fill viewport
     const zoomInSteps = Math.max(
       0,
-      Math.round(Math.log(12 / currentScale) / Math.log(1.2)),
+      Math.round(Math.log(currentScale / targetBuildScale) / Math.log(1.2)),
     );
-    for (let i = 0; i < Math.min(zoomInSteps, 10); i++)
+    for (let i = 0; i < Math.min(zoomInSteps, 15); i++)
       await zoomStep(page, -100);
     await sleep(200);
 
@@ -1067,7 +1102,7 @@ async function executeRLAction(
       0,
       Math.round(Math.log(currentScale / savedScale) / Math.log(1.2)),
     );
-    for (let i = 0; i < Math.min(zoomOutSteps, 10); i++)
+    for (let i = 0; i < Math.min(zoomOutSteps, 15); i++)
       await zoomStep(page, 100);
   } else if (NUKE_KEYS[actionType]) {
     const { key, name, minGold } = NUKE_KEYS[actionType];
@@ -1274,6 +1309,7 @@ async function main() {
   let currentAction = null;
   let lastNeighbors = [];
   let lastUnitPositions = [];
+  let lastGameState = null;
   let lastRecenter = 0;
   lastGold = 0;
   currentScale = 1.8; // reset to game default at game start
@@ -1517,6 +1553,7 @@ async function main() {
             currentAction = action;
             lastNeighbors = gameState.neighbors || [];
             lastUnitPositions = gameState.unitPositions || [];
+            lastGameState = gameState;
             if (tick % 10 === 0) {
               log(
                 `RL action: type=${action.actionType} target=${action.targetIdx} troops=${action.troopFraction} gold=${(lastGold / 1000).toFixed(0)}K`,
@@ -1534,17 +1571,17 @@ async function main() {
         lastGold,
         lastNeighbors,
         lastUnitPositions,
+        lastGameState,
       );
       if (actionResult?.nukeLaunched) nukeCount++;
       // One-shot actions should only execute once, not every tick until next policy query.
       // Attack/boat_attack are fine to repeat (clicks on different border tiles).
-      // NOOP and RETREAT are also fine to repeat.
+      // NOOP is fine to repeat (does nothing).
       if (
         currentAction &&
         currentAction.actionType !== ACTION_NOOP &&
         currentAction.actionType !== ACTION_ATTACK &&
-        currentAction.actionType !== ACTION_BOAT_ATTACK &&
-        currentAction.actionType !== ACTION_RETREAT
+        currentAction.actionType !== ACTION_BOAT_ATTACK
       ) {
         currentAction = null;
       }
