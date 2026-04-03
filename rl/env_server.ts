@@ -147,6 +147,7 @@ let game: Game | null = null;
 let rlPlayer: Player | null = null;
 let tickCount = 0;
 let landTiles = 0; // cached at reset for reward normalization
+let prevAliveCount = 0;
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -381,16 +382,26 @@ function getObservation() {
 
 // ---------- Reward calculation ----------
 
-function calculateReward(allOpponentsDead: boolean = false): number {
+function calculateReward(): number {
   if (!rlPlayer || !game) return 0;
 
+  const allOpponents = game.players().filter((p) => p.id() !== rlPlayer!.id());
+  const aliveCount = allOpponents.filter((p) => p.isAlive()).length;
+  const allOpponentsDead = aliveCount === 0;
   const won = game.getWinner()?.id() === rlPlayer.id() || allOpponentsDead;
 
-  // One-shot reward: only on terminal states
-  if (won) return 10 + rlPlayer.numTilesOwned() / landTiles;
-  if (!rlPlayer.isAlive()) return -3 + rlPlayer.numTilesOwned() / landTiles;
+  let reward = 0;
 
-  return 0;
+  // Opponent elimination (sparse but not too sparse)
+  const newlyDead = prevAliveCount - aliveCount;
+  if (newlyDead > 0) reward += newlyDead * 1.0;
+  prevAliveCount = aliveCount;
+
+  // Terminal
+  if (won) reward += 10;
+  if (!rlPlayer.isAlive()) reward -= 3;
+
+  return reward;
 }
 
 // ---------- Action execution ----------
@@ -811,6 +822,10 @@ async function resetGame(config: ResetConfig = {}) {
   }
   if (landTiles === 0) landTiles = total; // fallback
 
+  prevAliveCount = game
+    .players()
+    .filter((p) => p.id() !== rlPlayer!.id()).length;
+
   return getObservation();
 }
 
@@ -841,13 +856,13 @@ function stepGame(action: RLAction, ticksPerStep: number = 10) {
       break;
   }
 
+  const reward = calculateReward();
+
   // Check if all opponents are dead (game.getWinner() doesn't fire in FFA)
   const allOpponentsDead = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id())
     .every((p) => !p.isAlive());
-
-  const reward = calculateReward(allOpponentsDead);
   const done =
     !rlPlayer.isAlive() || game.getWinner() !== null || allOpponentsDead;
 
