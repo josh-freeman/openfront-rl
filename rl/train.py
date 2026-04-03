@@ -273,6 +273,7 @@ def train(args):
             start_update = checkpoint.get("update", 0)
             global_step = checkpoint.get("global_step", 0)
             num_episodes = checkpoint.get("num_episodes", 0)
+            curriculum_stage = checkpoint.get("curriculum_stage", 0)
 
             if state_path.exists():
                 with open(state_path) as f:
@@ -324,20 +325,23 @@ def train(args):
     obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all()
 
     # Curriculum: gradual ramp of (difficulty, opponents, maps)
-    # Each step is a small increment to avoid distributional shock
+    # Win-rate-gated curriculum: advance only when model wins consistently
     CURRICULUM_STAGES = [
-        # (progress_threshold, difficulty, opponents, maps, max_steps)
-        (0.05, "Easy",   2,  MAP_TIER_1, 10000),
-        (0.10, "Easy",   3,  MAP_TIER_1, 15000),
-        (0.15, "Medium", 3,  MAP_TIER_2, 20000),
-        (0.20, "Medium", 4,  MAP_TIER_2, 25000),
-        (0.30, "Medium", 5,  MAP_TIER_2, 30000),
-        (0.38, "Hard",   5,  MAP_TIER_3, 40000),
-        (0.45, "Hard",   6,  MAP_TIER_3, 50000),
-        (0.50, "Hard",   8,  MAP_TIER_3, 60000),
-        (0.65, "Hard",  10,  MAP_TIER_3, 80000),
-        (1.00, "Hard",  12,  MAP_TIER_3, 100000),
+        # (difficulty, opponents, maps, max_steps)
+        ("Easy",   2,  MAP_TIER_1, 10000),
+        ("Easy",   3,  MAP_TIER_1, 15000),
+        ("Medium", 3,  MAP_TIER_2, 20000),
+        ("Medium", 4,  MAP_TIER_2, 25000),
+        ("Medium", 5,  MAP_TIER_2, 30000),
+        ("Hard",   5,  MAP_TIER_3, 40000),
+        ("Hard",   6,  MAP_TIER_3, 50000),
+        ("Hard",   8,  MAP_TIER_3, 60000),
+        ("Hard",  10,  MAP_TIER_3, 80000),
+        ("Hard",  12,  MAP_TIER_3, 100000),
     ]
+    CURRICULUM_WIN_THRESHOLD = 0.7  # 70% win rate to advance
+    CURRICULUM_MIN_EPISODES = 50    # need at least this many episodes before advancing
+    curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES
     WARMDOWN_UPDATES = 50
@@ -347,26 +351,28 @@ def train(args):
     for update in range(start_update, args.num_updates):
         t_start = time.time()
 
-        # Curriculum learning: gradual ramp
-        if args.curriculum:
-            progress = update / args.num_updates
-            # Find current stage
-            for thresh, diff, opp, maps, msteps in CURRICULUM_STAGES:
-                if progress < thresh:
-                    new_diff, new_opp, new_maps, new_max_steps = diff, opp, maps, msteps
-                    break
-            else:
-                s = CURRICULUM_STAGES[-1]
-                new_diff, new_opp, new_maps, new_max_steps = s[1], s[2], s[3], s[4]
-
-            if envs.difficulty != new_diff or envs.num_opponents != new_opp:
-                print(f"  Curriculum: switching to {new_diff} with {new_opp} opponents, {len(new_maps)} maps, max_steps={new_max_steps} (progress={progress:.0%})")
-                envs.difficulty = new_diff
-                envs.num_opponents = new_opp
-                warmdown_counter = WARMDOWN_UPDATES  # trigger LR warmdown
-            if len(envs.maps) != len(new_maps):
-                envs.maps = new_maps
-            envs.max_steps = new_max_steps
+        # Win-rate-gated curriculum: advance when win rate exceeds threshold
+        if args.curriculum and curriculum_stage < len(CURRICULUM_STAGES) - 1:
+            if (len(episode_wins) >= CURRICULUM_MIN_EPISODES
+                    and np.mean(episode_wins) >= CURRICULUM_WIN_THRESHOLD):
+                curriculum_stage += 1
+                episode_wins.clear()  # reset window for new stage
+                diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage]
+                print(f"  Curriculum: advancing to stage {curriculum_stage} — "
+                      f"{diff} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
+                envs.difficulty = diff
+                envs.num_opponents = opp
+                envs.maps = maps
+                envs.max_steps = msteps
+                warmdown_counter = WARMDOWN_UPDATES
+        elif args.curriculum:
+            # Apply current stage settings (for resume)
+            diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage]
+            if envs.difficulty != diff or envs.num_opponents != opp:
+                envs.difficulty = diff
+                envs.num_opponents = opp
+                envs.maps = maps
+                envs.max_steps = msteps
 
         # LR schedule: apply warmdown after curriculum transitions
         lr_now = args.lr
@@ -537,6 +543,8 @@ def train(args):
                     "loss/entropy": float(entropy_loss.item()),
                     "perf/sps": float(sps),
                     "lr": current_lr,
+                    "curriculum/stage": curriculum_stage,
+                    "curriculum/opponents": envs.num_opponents,
                 }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
@@ -554,6 +562,7 @@ def train(args):
                     "update": update + 1,
                     "global_step": global_step,
                     "num_episodes": num_episodes,
+                    "curriculum_stage": curriculum_stage,
                 },
                 ckpt_path,
             )

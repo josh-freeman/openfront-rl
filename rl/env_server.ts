@@ -384,20 +384,13 @@ function getObservation() {
 function calculateReward(allOpponentsDead: boolean = false): number {
   if (!rlPlayer || !game) return 0;
 
-  let reward = 0;
+  const won = game.getWinner()?.id() === rlPlayer.id() || allOpponentsDead;
 
-  // Dense holding bonus, normalized by land tiles (bounded: max 0.01/step)
-  reward += (rlPlayer.numTilesOwned() / landTiles) * 0.01;
+  // One-shot reward: only on terminal states
+  if (won) return 10 + rlPlayer.numTilesOwned() / landTiles;
+  if (!rlPlayer.isAlive()) return -3 + rlPlayer.numTilesOwned() / landTiles;
 
-  // Death penalty
-  if (!rlPlayer.isAlive()) reward -= 3;
-
-  // Win bonus
-  if (game.getWinner()?.id() === rlPlayer.id() || allOpponentsDead) {
-    reward += 10;
-  }
-
-  return reward;
+  return 0;
 }
 
 // ---------- Action execution ----------
