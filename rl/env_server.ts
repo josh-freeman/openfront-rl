@@ -148,6 +148,7 @@ let rlPlayer: Player | null = null;
 let tickCount = 0;
 let landTiles = 0; // cached at reset for reward normalization
 let prevAliveCount = 0;
+let numOpponentsAtStart = 0;
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -385,21 +386,18 @@ function getObservation() {
 function calculateReward(): number {
   if (!rlPlayer || !game) return 0;
 
-  const allOpponents = game.players().filter((p) => p.id() !== rlPlayer!.id());
-  const aliveCount = allOpponents.filter((p) => p.isAlive()).length;
-  const allOpponentsDead = aliveCount === 0;
-  const won = game.getWinner()?.id() === rlPlayer.id() || allOpponentsDead;
-
   let reward = 0;
 
-  // Opponent elimination (sparse but not too sparse)
+  // Opponent eliminations (normalized: full sweep = +1.0 regardless of N)
+  const aliveCount = game
+    .players()
+    .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive()).length;
   const newlyDead = prevAliveCount - aliveCount;
-  if (newlyDead > 0) reward += newlyDead * 1.0;
+  if (newlyDead > 0) reward += newlyDead / numOpponentsAtStart;
   prevAliveCount = aliveCount;
 
-  // Terminal
-  if (won) reward += 10;
-  if (!rlPlayer.isAlive()) reward -= 3;
+  // Death penalty
+  if (!rlPlayer.isAlive()) reward -= 1.0;
 
   return reward;
 }
@@ -822,9 +820,10 @@ async function resetGame(config: ResetConfig = {}) {
   }
   if (landTiles === 0) landTiles = total; // fallback
 
-  prevAliveCount = game
+  numOpponentsAtStart = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id()).length;
+  prevAliveCount = numOpponentsAtStart;
 
   return getObservation();
 }

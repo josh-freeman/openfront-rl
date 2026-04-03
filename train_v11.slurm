@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ofrl-v11a
+#SBATCH --job-name=ofrl-v11b
 #SBATCH --output=logs/train_%j.log
 #SBATCH --error=logs/train_%j.log
 #SBATCH --gres=gpu:1
@@ -21,7 +21,7 @@ source "$REPO_DIR/.venv/bin/activate"
 echo "=== Job $SLURM_JOB_ID starting at $(date) ==="
 echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
-echo "CONTINUING v11a (16 envs, LR=1.5e-4, vf=1.0)"
+echo "v11b: normalized elimination reward, vf=0.5, 16 envs, LR=1.5e-4"
 
 cd rl
 python -u train.py \
@@ -31,12 +31,11 @@ python -u train.py \
     --rollout-steps 512 \
     --num-updates 4000 \
     --lr 1.5e-4 \
-    --vf-coef 1.0 \
+    --vf-coef 0.5 \
     --curriculum \
     --hidden-sizes 512,512,256 \
     --save-interval 10 \
     --log-interval 5 \
-    --save-dir ./checkpoints_v11a \
-    --resume
+    --save-dir ./checkpoints_v11b
 
 echo "=== Job $SLURM_JOB_ID finished at $(date) ==="
