@@ -145,10 +145,8 @@ class RLServerConfig {
 
 let game: Game | null = null;
 let rlPlayer: Player | null = null;
-let prevTiles = 0;
-let prevTroops = 0;
-let prevGold = 0n;
 let tickCount = 0;
+let landTiles = 0; // cached at reset for reward normalization
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -388,38 +386,16 @@ function calculateReward(allOpponentsDead: boolean = false): number {
 
   let reward = 0;
 
-  const curTiles = rlPlayer.numTilesOwned();
-  const curTroops = rlPlayer.troops();
-  const curGold = Number(rlPlayer.gold());
-
-  // Territory expansion (most important)
-  const tileDelta = curTiles - prevTiles;
-  reward += tileDelta * 0.01;
-
-  // Troop growth
-  const troopDelta = curTroops - prevTroops;
-  reward += troopDelta * 0.0001;
-
-  // Gold income growth (indirectly rewards factories/cities)
-  const goldDelta = curGold - Number(prevGold);
-  if (goldDelta > 0) {
-    reward += goldDelta * 0.00001;
-  }
+  // Dense holding bonus, normalized by land tiles (bounded: max 0.01/step)
+  reward += (rlPlayer.numTilesOwned() / landTiles) * 0.01;
 
   // Death penalty
-  if (!rlPlayer.isAlive()) {
-    reward -= 3;
-  }
+  if (!rlPlayer.isAlive()) reward -= 3;
 
   // Win bonus
   if (game.getWinner()?.id() === rlPlayer.id() || allOpponentsDead) {
     reward += 10;
   }
-
-  // Update prev state
-  prevTiles = curTiles;
-  prevTroops = curTroops;
-  prevGold = BigInt(curGold);
 
   return reward;
 }
@@ -832,10 +808,15 @@ async function resetGame(config: ResetConfig = {}) {
   }
 
   rlPlayer = game.player("rl_agent");
-  prevTiles = rlPlayer.numTilesOwned();
-  prevTroops = rlPlayer.troops();
-  prevGold = rlPlayer.gold();
   tickCount = 0;
+
+  // Cache land tile count for reward normalization
+  landTiles = 0;
+  const total = game.width() * game.height();
+  for (let t = 0; t < total; t++) {
+    if (!game.isWater(t as TileRef)) landTiles++;
+  }
+  if (landTiles === 0) landTiles = total; // fallback
 
   return getObservation();
 }

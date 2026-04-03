@@ -36,7 +36,7 @@ python -u train.py \
     --hidden-sizes 512,512,256 \
     --save-interval 10 \
     --log-interval 5 \
-    --save-dir ./checkpoints_v7 \
+    --save-dir ./checkpoints_v8 \
     --resume
 
 echo "=== Job $SLURM_JOB_ID finished at $(date) ==="
