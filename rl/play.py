@@ -71,12 +71,20 @@ def play_headless(args):
             obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
             # Use action mask from info if available
             mask_t = None
+            land_t = None
+            sea_t = None
             if "action_mask" in info:
                 mask_arr = np.array(info["action_mask"][:17], dtype=np.float32)
                 mask_arr[0] = 1.0
                 mask_t = torch.FloatTensor(mask_arr).unsqueeze(0).to(device)
+            if "land_target_mask" in info:
+                land_t = torch.FloatTensor(info["land_target_mask"]).unsqueeze(0).to(device)
+            if "sea_target_mask" in info:
+                sea_t = torch.FloatTensor(info["sea_target_mask"]).unsqueeze(0).to(device)
             with torch.no_grad():
-                action, _, _, value = model.get_action_and_value(obs_t, action_mask=mask_t)
+                action, _, _, value = model.get_action_and_value(
+                    obs_t, action_mask=mask_t,
+                    land_target_mask=land_t, sea_target_mask=sea_t)
             action_np = action.squeeze(0).cpu().numpy()
 
             if steps % 20 == 0 and game == 0:
