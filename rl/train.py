@@ -246,7 +246,7 @@ def train(args):
     save_dir.mkdir(parents=True, exist_ok=True)
     episode_rewards = deque(maxlen=100)
     episode_lengths = deque(maxlen=100)
-    episode_wins = deque(maxlen=100)
+    episode_wins = deque(maxlen=200)
     best_reward = -float("inf")
     stage_best_rewards = {}
     log_entries = []
@@ -345,7 +345,7 @@ def train(args):
         ("Hard",    8,  MAP_TIER_3, 50000,  0.45),
         ("Hard",   15,  MAP_TIER_3, 80000,  None),  # final stage
     ]
-    CURRICULUM_MIN_EPISODES = max(200, args.num_envs * 20)
+    CURRICULUM_MIN_EPISODES = 200
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES

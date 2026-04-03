@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ofrl-v13
+#SBATCH --job-name=ofrl-v13a
 #SBATCH --output=logs/train_%j.log
 #SBATCH --error=logs/train_%j.log
 #SBATCH --gres=gpu:1
@@ -21,7 +21,7 @@ source "$REPO_DIR/.venv/bin/activate"
 echo "=== Job $SLURM_JOB_ID starting at $(date) ==="
 echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
-echo "CONTINUING v13 (16 envs, LR=1.5e-4, vf=1.0)"
+echo "CONTINUING v13a (16 envs, LR=1.5e-4, vf=1.0)"
 
 cd rl
 python -u train.py \
@@ -36,7 +36,7 @@ python -u train.py \
     --hidden-sizes 512,512,256 \
     --save-interval 10 \
     --log-interval 5 \
-    --save-dir ./checkpoints_v13 \
+    --save-dir ./checkpoints_v13a \
     --resume
 
 echo "=== Job $SLURM_JOB_ID finished at $(date) ==="
