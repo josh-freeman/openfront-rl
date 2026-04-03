@@ -329,15 +329,15 @@ def train(args):
     # Win-rate-gated curriculum: advance only when model wins consistently
     CURRICULUM_STAGES = [
         # (difficulty, opponents, maps, max_steps, win_threshold)
-        ("Easy",   2,  MAP_TIER_1, 10000,  0.90),
-        ("Easy",   3,  MAP_TIER_1, 15000,  0.85),
-        ("Medium", 3,  MAP_TIER_2, 20000,  0.80),
-        ("Medium", 4,  MAP_TIER_2, 25000,  0.75),
-        ("Medium", 5,  MAP_TIER_2, 30000,  0.70),
-        ("Hard",   5,  MAP_TIER_3, 40000,  0.60),
-        ("Hard",   6,  MAP_TIER_3, 50000,  0.50),
-        ("Hard",   8,  MAP_TIER_3, 60000,  0.40),
-        ("Hard",  10,  MAP_TIER_3, 80000,  0.30),
+        ("Easy",   2,  MAP_TIER_1, 10000,  0.60),
+        ("Easy",   3,  MAP_TIER_1, 15000,  0.55),
+        ("Medium", 3,  MAP_TIER_2, 20000,  0.50),
+        ("Medium", 4,  MAP_TIER_2, 25000,  0.45),
+        ("Medium", 5,  MAP_TIER_2, 30000,  0.40),
+        ("Hard",   5,  MAP_TIER_3, 40000,  0.35),
+        ("Hard",   6,  MAP_TIER_3, 50000,  0.30),
+        ("Hard",   8,  MAP_TIER_3, 60000,  0.25),
+        ("Hard",  10,  MAP_TIER_3, 80000,  0.20),
         ("Hard",  12,  MAP_TIER_3, 100000, None),  # final stage
     ]
     CURRICULUM_MIN_EPISODES = 50    # need at least this many episodes before advancing
