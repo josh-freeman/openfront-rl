@@ -383,7 +383,7 @@ function getObservation() {
 
 // ---------- Reward calculation ----------
 
-function calculateReward(): number {
+function calculateReward(allOpponentsDead: boolean = false): number {
   if (!rlPlayer || !game) return 0;
 
   let reward = 0;
@@ -412,7 +412,7 @@ function calculateReward(): number {
   }
 
   // Win bonus
-  if (game.getWinner()?.id() === rlPlayer.id()) {
+  if (game.getWinner()?.id() === rlPlayer.id() || allOpponentsDead) {
     reward += 10;
   }
 
@@ -853,16 +853,31 @@ function stepGame(action: RLAction, ticksPerStep: number = 10) {
 
     if (!rlPlayer.isAlive()) break;
     if (game.getWinner()) break;
+    // Early exit if all opponents eliminated
+    if (
+      game
+        .players()
+        .filter((p) => p.id() !== rlPlayer!.id())
+        .every((p) => !p.isAlive())
+    )
+      break;
   }
 
-  const reward = calculateReward();
-  const done = !rlPlayer.isAlive() || game.getWinner() !== null;
+  // Check if all opponents are dead (game.getWinner() doesn't fire in FFA)
+  const allOpponentsDead = game
+    .players()
+    .filter((p) => p.id() !== rlPlayer!.id())
+    .every((p) => !p.isAlive());
+
+  const reward = calculateReward(allOpponentsDead);
+  const done =
+    !rlPlayer.isAlive() || game.getWinner() !== null || allOpponentsDead;
 
   const obs = getObservation();
   const info = {
     tickCount,
     winner: game.getWinner()?.name() ?? null,
-    weWon: game.getWinner()?.id() === "rl_agent",
+    weWon: game.getWinner()?.id() === "rl_agent" || allOpponentsDead,
   };
 
   return { obs, reward, done, info };
