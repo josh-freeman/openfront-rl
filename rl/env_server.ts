@@ -388,7 +388,6 @@ function calculateReward(): number {
 
   let reward = 0;
 
-  // Opponent eliminations (normalized: full sweep = +1.0 regardless of N)
   const aliveCount = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive()).length;
@@ -396,7 +395,12 @@ function calculateReward(): number {
   if (newlyDead > 0) reward += newlyDead / numOpponentsAtStart;
   prevAliveCount = aliveCount;
 
-  // Death penalty
+  // Winner bonus: credit for all remaining alive opponents
+  const winner = game.getWinner();
+  if (winner && winner.id() === "rl_agent" && aliveCount > 0) {
+    reward += aliveCount / numOpponentsAtStart;
+  }
+
   if (!rlPlayer.isAlive()) reward -= 1.0;
 
   return reward;
