@@ -292,8 +292,11 @@ def train(args):
 
     # Initialize wandb
     if wandb is not None:
+        # Derive run name from save_dir (e.g. checkpoints_v10 → v10)
+        run_name = Path(args.save_dir).name.replace("checkpoints_", "")
         wandb.init(
             project="openfront-rl",
+            name=run_name,
             config=vars(args),
             resume="allow",
         )
