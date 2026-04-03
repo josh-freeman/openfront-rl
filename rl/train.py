@@ -329,7 +329,7 @@ def train(args):
     # Win-rate-gated curriculum: advance only when model wins consistently
     CURRICULUM_STAGES = [
         # (difficulty, opponents, maps, max_steps, win_threshold)
-        ("Easy",   2,  MAP_TIER_1, 10000,  0.60),
+        ("Easy",   2,  MAP_TIER_1, 10000,  0.75),
         ("Easy",   3,  MAP_TIER_1, 15000,  0.55),
         ("Medium", 3,  MAP_TIER_2, 20000,  0.50),
         ("Medium", 4,  MAP_TIER_2, 25000,  0.45),
@@ -340,7 +340,7 @@ def train(args):
         ("Hard",  10,  MAP_TIER_3, 80000,  0.20),
         ("Hard",  12,  MAP_TIER_3, 100000, None),  # final stage
     ]
-    CURRICULUM_MIN_EPISODES = 50    # need at least this many episodes before advancing
+    CURRICULUM_MIN_EPISODES = max(100, args.num_envs * 10)  # ~10 updates worth of episodes
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES
