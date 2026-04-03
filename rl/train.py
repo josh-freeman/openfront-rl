@@ -433,9 +433,13 @@ def train(args):
             env_ep_lengths += 1
             for i in range(args.num_envs):
                 if dones[i] or truncateds[i]:
-                    episode_rewards.append(float(env_ep_rewards[i]))
+                    ep_r = float(env_ep_rewards[i])
+                    ep_won = infos[i].get("weWon", False)
+                    if ep_r < -1.0:
+                        print(f"  WARNING ep: reward={ep_r:.2f} won={ep_won} len={int(env_ep_lengths[i])}")
+                    episode_rewards.append(ep_r)
                     episode_lengths.append(int(env_ep_lengths[i]))
-                    episode_wins.append(1 if infos[i].get("weWon", False) else 0)
+                    episode_wins.append(1 if ep_won else 0)
                     num_episodes += 1
                     env_ep_rewards[i] = 0
                     env_ep_lengths[i] = 0
