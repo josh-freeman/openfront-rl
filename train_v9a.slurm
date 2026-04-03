@@ -3,8 +3,8 @@
 #SBATCH --output=logs/train_%j.log
 #SBATCH --error=logs/train_%j.log
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
 #SBATCH --partition=mit_normal_gpu
 #SBATCH --time=06:00:00
 #SBATCH --requeue
@@ -27,7 +27,7 @@ cd rl
 python -u train.py \
     --opponents 2 \
     --difficulty Easy \
-    --num-envs 8 \
+    --num-envs 32 \
     --rollout-steps 512 \
     --num-updates 4000 \
     --lr 1.5e-4 \

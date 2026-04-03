@@ -9,6 +9,7 @@ import json
 import subprocess
 import numpy as np
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +53,7 @@ class VecOpenFrontEnv:
         self._repo_dir = str(rl_dir.parent)
         self._server_script = str(rl_dir / "env_server.ts")
 
+        self._pool = ThreadPoolExecutor(max_workers=num_envs)
         self._start_all()
 
     def _start_server(self, idx: int):
@@ -229,6 +231,20 @@ class VecOpenFrontEnv:
             obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
         return obs, masks, land_masks, sea_masks
 
+    def _step_single(self, i: int, action: np.ndarray):
+        """Step a single env. Returns (i, resp) or (i, None) on error."""
+        self._step_counts[i] += 1
+        game_action = self._decode_action(action, i)
+        try:
+            resp = self._send(i, {
+                "cmd": "step",
+                "action": game_action,
+                "ticksPerStep": self.ticks_per_step,
+            })
+            return (i, resp)
+        except (RuntimeError, BrokenPipeError):
+            return (i, None)
+
     def step(self, actions: np.ndarray):
         obs = np.zeros((self.num_envs, self.obs_dim), dtype=np.float32)
         masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
@@ -239,22 +255,16 @@ class VecOpenFrontEnv:
         truncateds = np.zeros(self.num_envs, dtype=bool)
         infos = [{}] * self.num_envs
 
-        for i in range(self.num_envs):
-            self._step_counts[i] += 1
-            game_action = self._decode_action(actions[i], i)
-            try:
-                resp = self._send(i, {
-                    "cmd": "step",
-                    "action": game_action,
-                    "ticksPerStep": self.ticks_per_step,
-                })
-            except (RuntimeError, BrokenPipeError):
-                dones[i] = True
-                obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
-                continue
+        # Step all envs in parallel (I/O-bound: waiting on subprocess responses)
+        futures = [self._pool.submit(self._step_single, i, actions[i])
+                   for i in range(self.num_envs)]
 
-            if "obs" not in resp:
-                print(f"[env {i}] bad response (no 'obs' key), resetting: {resp}")
+        for future in futures:
+            i, resp = future.result()
+
+            if resp is None or "obs" not in resp:
+                if resp is not None:
+                    print(f"[env {i}] bad response (no 'obs' key), resetting: {resp}")
                 dones[i] = True
                 obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
                 continue
@@ -270,6 +280,7 @@ class VecOpenFrontEnv:
         return obs, masks, land_masks, sea_masks, rewards, dones, truncateds, infos
 
     def close(self):
+        self._pool.shutdown(wait=False)
         for i, proc in enumerate(self._procs):
             if proc is not None:
                 try:
