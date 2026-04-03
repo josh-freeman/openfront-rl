@@ -327,19 +327,18 @@ def train(args):
     # Curriculum: gradual ramp of (difficulty, opponents, maps)
     # Win-rate-gated curriculum: advance only when model wins consistently
     CURRICULUM_STAGES = [
-        # (difficulty, opponents, maps, max_steps)
-        ("Easy",   2,  MAP_TIER_1, 10000),
-        ("Easy",   3,  MAP_TIER_1, 15000),
-        ("Medium", 3,  MAP_TIER_2, 20000),
-        ("Medium", 4,  MAP_TIER_2, 25000),
-        ("Medium", 5,  MAP_TIER_2, 30000),
-        ("Hard",   5,  MAP_TIER_3, 40000),
-        ("Hard",   6,  MAP_TIER_3, 50000),
-        ("Hard",   8,  MAP_TIER_3, 60000),
-        ("Hard",  10,  MAP_TIER_3, 80000),
-        ("Hard",  12,  MAP_TIER_3, 100000),
+        # (difficulty, opponents, maps, max_steps, win_threshold)
+        ("Easy",   2,  MAP_TIER_1, 10000,  0.90),
+        ("Easy",   3,  MAP_TIER_1, 15000,  0.85),
+        ("Medium", 3,  MAP_TIER_2, 20000,  0.80),
+        ("Medium", 4,  MAP_TIER_2, 25000,  0.75),
+        ("Medium", 5,  MAP_TIER_2, 30000,  0.70),
+        ("Hard",   5,  MAP_TIER_3, 40000,  0.60),
+        ("Hard",   6,  MAP_TIER_3, 50000,  0.50),
+        ("Hard",   8,  MAP_TIER_3, 60000,  0.40),
+        ("Hard",  10,  MAP_TIER_3, 80000,  0.30),
+        ("Hard",  12,  MAP_TIER_3, 100000, None),  # final stage
     ]
-    CURRICULUM_WIN_THRESHOLD = 0.7  # 70% win rate to advance
     CURRICULUM_MIN_EPISODES = 50    # need at least this many episodes before advancing
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
@@ -353,11 +352,13 @@ def train(args):
 
         # Win-rate-gated curriculum: advance when win rate exceeds threshold
         if args.curriculum and curriculum_stage < len(CURRICULUM_STAGES) - 1:
-            if (len(episode_wins) >= CURRICULUM_MIN_EPISODES
-                    and np.mean(episode_wins) >= CURRICULUM_WIN_THRESHOLD):
+            win_thresh = CURRICULUM_STAGES[curriculum_stage][4]
+            if (win_thresh is not None
+                    and len(episode_wins) >= CURRICULUM_MIN_EPISODES
+                    and np.mean(episode_wins) >= win_thresh):
                 curriculum_stage += 1
                 episode_wins.clear()  # reset window for new stage
-                diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage]
+                diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:4]
                 print(f"  Curriculum: advancing to stage {curriculum_stage} — "
                       f"{diff} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
                 envs.difficulty = diff
@@ -367,7 +368,7 @@ def train(args):
                 warmdown_counter = WARMDOWN_UPDATES
         elif args.curriculum:
             # Apply current stage settings (for resume)
-            diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage]
+            diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:4]
             if envs.difficulty != diff or envs.num_opponents != opp:
                 envs.difficulty = diff
                 envs.num_opponents = opp
