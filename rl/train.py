@@ -246,6 +246,7 @@ def train(args):
     save_dir.mkdir(parents=True, exist_ok=True)
     episode_rewards = deque(maxlen=100)
     episode_lengths = deque(maxlen=100)
+    episode_wins = deque(maxlen=100)
     best_reward = -float("inf")
     log_entries = []
     global_step = 0
@@ -421,6 +422,7 @@ def train(args):
                 if dones[i] or truncateds[i]:
                     episode_rewards.append(float(env_ep_rewards[i]))
                     episode_lengths.append(int(env_ep_lengths[i]))
+                    episode_wins.append(1 if infos[i].get("weWon", False) else 0)
                     num_episodes += 1
                     env_ep_rewards[i] = 0
                     env_ep_lengths[i] = 0
@@ -503,6 +505,7 @@ def train(args):
         if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
             mean_r = np.mean(episode_rewards)
             mean_l = np.mean(episode_lengths)
+            win_rate = np.mean(episode_wins) if episode_wins else 0.0
             survival_pct = mean_l / envs.max_steps  # fraction of max episode length
             entry = {
                 "update": update + 1,
@@ -510,6 +513,7 @@ def train(args):
                 "num_episodes": num_episodes,
                 "mean_reward": float(mean_r),
                 "mean_length": float(mean_l),
+                "win_rate": float(win_rate),
                 "survival_pct": float(survival_pct),
                 "max_steps": envs.max_steps,
                 "loss": float(loss.item()),
@@ -523,6 +527,7 @@ def train(args):
                     "global_step": global_step,
                     "num_episodes": num_episodes,
                     "reward/mean": float(mean_r),
+                    "reward/win_rate": float(win_rate),
                     "episode_length": float(mean_l),
                     "episode_length/survival_pct": float(survival_pct),
                     "episode_length/max_steps": envs.max_steps,
@@ -535,7 +540,7 @@ def train(args):
                 }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
-                f"episodes={num_episodes} reward={mean_r:.2f} len={mean_l:.0f} ({survival_pct:.0%}) "
+                f"episodes={num_episodes} reward={mean_r:.2f} win={win_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
             )
 
