@@ -248,6 +248,7 @@ def train(args):
     episode_lengths = deque(maxlen=100)
     episode_wins = deque(maxlen=100)
     best_reward = -float("inf")
+    stage_best_rewards = {}
     log_entries = []
     global_step = 0
     start_update = 0
@@ -573,6 +574,14 @@ def train(args):
                 best_reward = mean_r
                 torch.save(model.state_dict(), save_dir / "best_model.pt")
                 print(f"  New best model saved (reward={best_reward:.2f})")
+
+            # Save best model per curriculum stage
+            stage_best_path = save_dir / f"best_model_stage_{curriculum_stage}.pt"
+            stage_best = stage_best_rewards.get(curriculum_stage, -float("inf"))
+            if mean_r > stage_best:
+                stage_best_rewards[curriculum_stage] = mean_r
+                torch.save(model.state_dict(), stage_best_path)
+                print(f"  New best stage {curriculum_stage} model saved (reward={mean_r:.2f})")
 
             with open(save_dir / "state.json", "w") as f:
                 json.dump({
