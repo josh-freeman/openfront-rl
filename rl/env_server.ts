@@ -603,12 +603,16 @@ function executeAction(action: RLAction) {
       const troops = Math.floor(rlPlayer.troops() * fraction);
       if (troops < 10) break;
 
-      // Find a port tile to launch from
       const ports = rlPlayer.units().filter((u) => u.type() === UnitType.Port);
       if (ports.length === 0) break;
-      const portTile = ports[0].tile();
 
-      game.addExecution(new TransportShipExecution(rlPlayer, portTile, troops));
+      // ref must be a tile owned by the target enemy — TransportShipExecution
+      // derives the target player and landing destination from this tile
+      const targetBorder = Array.from(target.borderTiles());
+      if (targetBorder.length === 0) break;
+      const dst = targetBorder[Math.floor(targetBorder.length / 2)];
+
+      game.addExecution(new TransportShipExecution(rlPlayer, dst, troops));
       lastActionSucceeded = true;
       break;
     }
