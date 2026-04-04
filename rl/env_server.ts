@@ -448,7 +448,7 @@ function getObservation() {
   const actionMask = [
     true, // 0: NOOP — always valid
     hasAttackableNeighbor && hasTroops, // 1: ATTACK
-    hasAttackableBySeaNeighbor && hasTroops && hasPort, // 2: BOAT_ATTACK
+    hasAttackableBySeaNeighbor && hasTroops, // 2: BOAT_ATTACK (no port required)
     hasOutgoingAttacks, // 3: RETREAT
     canAffordCity, // 4: BUILD_CITY
     canAffordFactory, // 5: BUILD_FACTORY

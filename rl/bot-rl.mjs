@@ -2843,7 +2843,7 @@ async function main() {
           gameState.actionMask = [
             true, // 0: NOOP
             hasN && hasT, // 1: ATTACK
-            hasN && hasT && hasPort, // 2: BOAT_ATTACK
+            hasN && hasT, // 2: BOAT_ATTACK (no port required)
             hasOut, // 3: RETREAT
             canAfford("City"), // 4: BUILD_CITY
             canAfford("Factory"), // 5: BUILD_FACTORY
