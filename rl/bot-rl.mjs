@@ -944,7 +944,7 @@ function getSafeZone(box) {
   return {
     left: box.x + box.width * 0.15, // clear of leaderboard + ad
     right: box.x + box.width * 0.9, // clear of settings gear
-    top: box.y + box.height * 0.05,
+    top: box.y + box.height * 0.2, // clear of top banner/player info bar
     bottom: box.y + box.height * 0.82, // clear of bottom HUD
     cx: box.x + box.width * 0.52, // slightly right of center (away from leaderboard)
     cy: box.y + box.height * 0.42, // slightly above center (away from HUD)
@@ -1881,23 +1881,43 @@ async function executeRLAction(
               typeof me.smallID === "function" ? me.smallID() : -1;
             const step = Math.max(1, Math.floor(ourBorder.length / 200));
             for (let i = 0; i < ourBorder.length; i += step) {
-              for (const adj of g.neighbors(ourBorder[i])) {
+              const borderTile = ourBorder[i];
+              for (const adj of g.neighbors(borderTile)) {
                 if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
-                  // Found unclaimed tile adjacent to our border — click it
-                  const screen = th.worldToScreenCoordinates({
-                    x: g.x(adj),
-                    y: g.y(adj),
+                  // Found unclaimed tile — walk 2 more tiles into wilderness
+                  let deepTile = adj;
+                  for (let s = 0; s < 2; s++) {
+                    let went = false;
+                    for (const a2 of g.neighbors(deepTile)) {
+                      if (g.ownerID(a2) === 0 && (!g.isLand || g.isLand(a2))) {
+                        deepTile = a2;
+                        went = true;
+                        break;
+                      }
+                    }
+                    if (!went) break;
+                  }
+                  // Also offset screen coords away from our border tile
+                  const wildScreen = th.worldToScreenCoordinates({
+                    x: g.x(deepTile),
+                    y: g.y(deepTile),
                   });
+                  const ourScreen = th.worldToScreenCoordinates({
+                    x: g.x(borderTile),
+                    y: g.y(borderTile),
+                  });
+                  const dx = wildScreen.x - ourScreen.x;
+                  const dy = wildScreen.y - ourScreen.y;
+                  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+                  const fx = wildScreen.x + (dx / len) * 10;
+                  const fy = wildScreen.y + (dy / len) * 10;
                   const vw = window.innerWidth,
                     vh = window.innerHeight;
                   return {
-                    x: screen.x,
-                    y: screen.y,
+                    x: fx,
+                    y: fy,
                     onScreen:
-                      screen.x > 50 &&
-                      screen.x < vw - 50 &&
-                      screen.y > 30 &&
-                      screen.y < vh - 100,
+                      fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
                     method: "wilderness-border",
                   };
                 }
@@ -1991,39 +2011,107 @@ async function executeRLAction(
     x = Math.max(zone.left, Math.min(zone.right, x));
     y = Math.max(zone.top, Math.min(zone.bottom, y));
 
-    // NEVER click on leaderboard — if target is behind it, pan camera instead
-    const lbBounds = await safeEval(page, () => {
-      const lb = document.querySelector("leader-board");
-      if (!lb) return null;
-      const rect = lb.getBoundingClientRect();
-      if (rect.width === 0) return null;
-      return { right: rect.right + 15, bottom: rect.bottom + 15 };
-    });
-    if (lbBounds && x < lbBounds.right && y < lbBounds.bottom) {
-      // Target is behind leaderboard — pan away from it
-      log(`RL: Attack target behind leaderboard, panning right`);
-      await panInDirection(page, 0, 400); // pan right
+    // Check if click would hit ANY UI element — if so, pan away or skip
+    const uiCheck = await safeEval(
+      page,
+      (cx, cy) => {
+        const pad = 15;
+        const vw = window.innerWidth,
+          vh = window.innerHeight;
+        // Collect all UI element bounding rects
+        const selectors = [
+          "leader-board",
+          "player-info-bar",
+          "attacks-display",
+          "game-right-sidebar",
+          "build-menu",
+          "[class*='player-info']",
+          "[class*='bottom-bar']",
+          "[class*='hud']",
+        ];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          if (
+            cx >= r.left - pad &&
+            cx <= r.right + pad &&
+            cy >= r.top - pad &&
+            cy <= r.bottom + pad
+          ) {
+            // Determine best pan direction away from this element
+            const elCx = (r.left + r.right) / 2;
+            const elCy = (r.top + r.bottom) / 2;
+            const angle = Math.atan2(elCy - vh / 2, elCx - vw / 2);
+            // Pan in opposite direction
+            return { blocked: true, element: sel, panAngle: angle + Math.PI };
+          }
+        }
+        // Also check: top 170px is always dangerous (banners, info bars)
+        if (cy < 170)
+          return { blocked: true, element: "top-zone", panAngle: Math.PI / 2 };
+        // Bottom 120px (HUD)
+        if (cy > vh - 120)
+          return {
+            blocked: true,
+            element: "bottom-zone",
+            panAngle: -Math.PI / 2,
+          };
+        return { blocked: false };
+      },
+      x,
+      y,
+    );
+
+    if (uiCheck && uiCheck.blocked) {
+      log(`RL: Attack target behind ${uiCheck.element}, panning away`);
+      await panInDirection(page, uiCheck.panAngle, 400);
+      didPan = true;
       // Re-query position after pan
-      const apiPos3 = target
+      const apiRetry = target
         ? await getAttackClickPos(page, target.name)
         : null;
-      if (apiPos3 && apiPos3.onScreen) {
-        x = apiPos3.x;
-        y = apiPos3.y;
-        // Re-check leaderboard
-        const lb2 = await safeEval(page, () => {
-          const lb = document.querySelector("leader-board");
-          if (!lb) return null;
-          const rect = lb.getBoundingClientRect();
-          return rect.width > 0
-            ? { right: rect.right + 15, bottom: rect.bottom + 15 }
-            : null;
-        });
-        if (lb2 && x < lb2.right && y < lb2.bottom) {
-          log(`RL: Attack still behind leaderboard, skipping`);
+      if (apiRetry && apiRetry.onScreen) {
+        // Re-check UI occlusion at new position
+        const recheck = await safeEval(
+          page,
+          (cx, cy) => {
+            const pad = 15;
+            const vh = window.innerHeight;
+            const selectors = [
+              "leader-board",
+              "player-info-bar",
+              "attacks-display",
+              "game-right-sidebar",
+              "build-menu",
+              "[class*='player-info']",
+            ];
+            for (const sel of selectors) {
+              const el = document.querySelector(sel);
+              if (!el) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              if (
+                cx >= r.left - pad &&
+                cx <= r.right + pad &&
+                cy >= r.top - pad &&
+                cy <= r.bottom + pad
+              )
+                return true;
+            }
+            if (cy < 170 || cy > vh - 120) return true;
+            return false;
+          },
+          apiRetry.x,
+          apiRetry.y,
+        );
+        if (recheck) {
+          log(`RL: Target still behind UI after pan, skipping`);
           return;
         }
-        didPan = true;
+        x = apiRetry.x;
+        y = apiRetry.y;
       } else {
         log(`RL: Target off-screen after pan, skipping`);
         return;
@@ -2084,17 +2172,41 @@ async function executeRLAction(
       }
       const retryPos = await getAttackClickPos(page, target.name);
       if (retryPos && retryPos.onScreen) {
-        // Check leaderboard before retry click
-        const lb3 = await safeEval(page, () => {
-          const lb = document.querySelector("leader-board");
-          if (!lb) return null;
-          const rect = lb.getBoundingClientRect();
-          return rect.width > 0
-            ? { right: rect.right + 15, bottom: rect.bottom + 15 }
-            : null;
-        });
-        if (lb3 && retryPos.x < lb3.right && retryPos.y < lb3.bottom) {
-          log(`RL: Retry target behind leaderboard, skipping`);
+        // Check all UI elements before retry click
+        const retryBlocked = await safeEval(
+          page,
+          (cx, cy) => {
+            const pad = 15;
+            const vh = window.innerHeight;
+            const selectors = [
+              "leader-board",
+              "player-info-bar",
+              "attacks-display",
+              "game-right-sidebar",
+              "build-menu",
+              "[class*='player-info']",
+            ];
+            for (const sel of selectors) {
+              const el = document.querySelector(sel);
+              if (!el) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width === 0 || r.height === 0) continue;
+              if (
+                cx >= r.left - pad &&
+                cx <= r.right + pad &&
+                cy >= r.top - pad &&
+                cy <= r.bottom + pad
+              )
+                return true;
+            }
+            if (cy < 170 || cy > vh - 120) return true;
+            return false;
+          },
+          retryPos.x,
+          retryPos.y,
+        );
+        if (retryBlocked) {
+          log(`RL: Retry target behind UI, skipping`);
         } else {
           await page.mouse.click(retryPos.x, retryPos.y);
           await sleep(150);
