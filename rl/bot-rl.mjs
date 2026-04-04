@@ -537,7 +537,7 @@ async function extractGameState(page, botName) {
             const mySmallID =
               typeof me2.smallID === "function" ? me2.smallID() : -1;
             // Wilderness CC detection: fringe-only scan (1-layer from our border)
-            const wildernessCCs = []; // {id, tileCount, ourBorderTiles, centroidX, centroidY}
+            const wildernessCCs = []; // {id, tileCount, ourBorderCoords, centroidX, centroidY}
             let wildCCIndex = 0;
             const hasIsLand = typeof g.isLand === "function";
             let hasCoast = false;
@@ -615,10 +615,17 @@ async function extractGameState(page, botName) {
                   }
                   frontier = nextFrontier;
                 }
+                // Store border tile coords (not refs, which don't survive serialization)
+                const ourBorderCoords = Array.from(ourBorderSet).map((t) => ({
+                  x: g.x(t),
+                  y: g.y(t),
+                }));
+                // Skip tiny wilderness CCs (< 20 tiles estimated) — not worth attacking
+                if (sizeVisited.size < 20) continue;
                 wildernessCCs.push({
                   id: `wilderness_${wildCCIndex++}`,
                   tileCount: sizeVisited.size,
-                  ourBorderTiles: Array.from(ourBorderSet),
+                  ourBorderCoords,
                   centroidX: sx / ccFringe.length,
                   centroidY: sy / ccFringe.length,
                 });
@@ -983,7 +990,7 @@ async function centerCamera(page) {
   // PRIMARY: Use the game's built-in center-on-player via 'c' key
   await focusCanvas(page);
   await page.keyboard.press("c").catch(() => {});
-  await sleep(300);
+  await sleep(800); // wait for the centering animation to finish
 
   // Sync actual game scale
   const scaleInfo = await safeEval(page, () => {
@@ -1477,19 +1484,37 @@ async function getAttackClickPos(page, targetName) {
                 dist: bestDist,
               };
             }
-            // Click on the target border tile, with screen coords shifted slightly
-            // AWAY from our tile to ensure we land on their side
-            const targetScreen = th.worldToScreenCoordinates({ x: tx, y: ty });
+            // Walk 2 tiles deeper into target territory from their border tile
+            const targetSmallID =
+              typeof target.smallID === "function"
+                ? target.smallID()
+                : g.ownerID(bestTile);
+            let deepTile = bestTile;
+            for (let depth = 0; depth < 3; depth++) {
+              let found = false;
+              for (const adj of g.neighbors(deepTile)) {
+                if (g.ownerID(adj) === targetSmallID) {
+                  deepTile = adj;
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) break;
+            }
+            const deepScreen = th.worldToScreenCoordinates({
+              x: g.x(deepTile),
+              y: g.y(deepTile),
+            });
             const ourScreen = th.worldToScreenCoordinates({
               x: g.x(bestOurs),
               y: g.y(bestOurs),
             });
-            const dx = targetScreen.x - ourScreen.x;
-            const dy = targetScreen.y - ourScreen.y;
+            // Offset further away from our border for safety
+            const dx = deepScreen.x - ourScreen.x;
+            const dy = deepScreen.y - ourScreen.y;
             const len = Math.sqrt(dx * dx + dy * dy) || 1;
-            // Offset 15px further into target territory
-            const fx = targetScreen.x + (dx / len) * 15;
-            const fy = targetScreen.y + (dy / len) * 15;
+            const fx = deepScreen.x + (dx / len) * 10;
+            const fy = deepScreen.y + (dy / len) * 10;
             return {
               x: fx,
               y: fy,
@@ -1696,7 +1721,52 @@ async function getBuildClickPos(page, isBorderBuilding) {
           if (pool.length === 0) return null;
           return pool[Math.floor(Math.random() * pool.length)];
         } else {
-          // City/Factory/Silo: place far from enemy (safe interior)
+          // City/Factory/Silo: place at territory CENTER
+          // Use our name label position as the centroid (game places it at territory center)
+          const sidebar2 = document.querySelector("game-right-sidebar");
+          const myLabel = document.querySelectorAll(".player-name-span");
+          const myName =
+            typeof me.displayName === "function" ? me.displayName() : "";
+          for (const span of myLabel) {
+            if (span.textContent?.includes(myName)) {
+              const container = span.closest(".player-name")?.parentElement;
+              if (!container) continue;
+              const r = container.getBoundingClientRect();
+              const cx = r.left + r.width / 2;
+              const cy = r.top + r.height / 2;
+              if (cx > 80 && cx < vw - 80 && cy > 50 && cy < vh - 120) {
+                // Add small random offset to avoid stacking
+                const ox = (Math.random() - 0.5) * 40;
+                const oy = (Math.random() - 0.5) * 40;
+                return { x: cx + ox, y: cy + oy };
+              }
+            }
+          }
+          // Fallback: average of all border tile positions (geometric center)
+          if (border.length > 0) {
+            let sx = 0,
+              sy = 0,
+              cnt = 0;
+            const step3 = Math.max(1, Math.floor(border.length / 50));
+            for (let i = 0; i < border.length; i += step3) {
+              const screen = th.worldToScreenCoordinates({
+                x: g.x(border[i]),
+                y: g.y(border[i]),
+              });
+              sx += screen.x;
+              sy += screen.y;
+              cnt++;
+            }
+            const cx = sx / cnt,
+              cy = sy / cnt;
+            if (cx > 80 && cx < vw - 80 && cy > 50 && cy < vh - 120) {
+              return {
+                x: cx + (Math.random() - 0.5) * 30,
+                y: cy + (Math.random() - 0.5) * 30,
+              };
+            }
+          }
+          // Last fallback: safe border tiles
           const pool = safe.length > 0 ? safe : nearEnemy;
           if (pool.length === 0) return null;
           return pool[Math.floor(Math.random() * pool.length)];
@@ -1763,6 +1833,9 @@ const NUKE_KEYS = {
 // If ghostStructure is set from a previous build key, ALL attack clicks are
 // silently blocked by ClientGameRunner.inputEvent.
 async function clearBuildMode(page) {
+  // Press Escape twice — first dismisses player info popup, second clears build mode
+  await page.keyboard.press("Escape").catch(() => {});
+  await sleep(30);
   await page.keyboard.press("Escape").catch(() => {});
   await sleep(50);
 }
@@ -1795,21 +1868,24 @@ async function executeRLAction(
     actionType === ACTION_ATTACK ||
     actionType === ACTION_BOAT_ATTACK
   ) {
+    // Always focus canvas before attack clicks
+    await focusCanvas(page);
     // Adjust attack ratio using T (down 10%) / Y (up 10%) to match troopFraction
     // troopFraction: 0.2, 0.4, 0.6, 0.8, or 1.0
     const steps = Math.round((troopFraction - currentAttackRatio) / 0.1);
     if (steps !== 0) {
-      await focusCanvas(page);
       const key = steps > 0 ? "y" : "t";
       for (let i = 0; i < Math.abs(steps); i++) await page.keyboard.press(key);
       currentAttackRatio = troopFraction;
       await sleep(30);
     }
 
-    const atkZoomSteps = 0; // no pre-zoom for attacks — retry handles zoom
-
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
+
+    // Zoom in for wilderness attacks — tiles are tiny at normal zoom
+    const atkZoomSteps =
+      target && target._wildernessCC ? await ensureClickZoom(page) : 0;
 
     // Guard: land attacks require land neighbor, boat attacks require non-land
     if (target && !target._wildernessCC) {
@@ -1842,7 +1918,13 @@ async function executeRLAction(
             const me = g.myPlayer?.();
             if (!me) return null;
 
-            // Find an unclaimed tile adjacent to our border
+            // Use the CC's centroid to find wilderness tiles near this specific CC
+            const vw = window.innerWidth,
+              vh = window.innerHeight;
+            const mySmallID =
+              typeof me.smallID === "function" ? me.smallID() : -1;
+
+            // Get our border tiles
             let ourBorder = [];
             try {
               if (typeof me.borderTiles === "function") {
@@ -1852,29 +1934,58 @@ async function executeRLAction(
               return null;
             }
 
-            const mySmallID =
-              typeof me.smallID === "function" ? me.smallID() : -1;
-            const step = Math.max(1, Math.floor(ourBorder.length / 200));
-            for (let i = 0; i < ourBorder.length; i += step) {
-              const borderTile = ourBorder[i];
+            // Find border tiles closest to this CC's centroid
+            const ccX = ccData.centroidX,
+              ccY = ccData.centroidY;
+            const scored = ourBorder.map((t, idx) => ({
+              t,
+              idx,
+              d: Math.abs(g.x(t) - ccX) + Math.abs(g.y(t) - ccY),
+            }));
+            scored.sort((a, b) => a.d - b.d);
+
+            // Check the closest border tiles for adjacent wilderness
+            const checkCount = Math.min(scored.length, 50);
+            for (let i = 0; i < checkCount; i++) {
+              const borderTile = scored[i].t;
               for (const adj of g.neighbors(borderTile)) {
                 if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
-                  // Found unclaimed tile adjacent to our border — click it directly
-                  // No walking deeper or offsetting, as that risks clicking into enemy territory
-                  const wildScreen = th.worldToScreenCoordinates({
-                    x: g.x(adj),
-                    y: g.y(adj),
+                  // Found unclaimed tile — walk 2 tiles deeper into wilderness
+                  let deepTile = adj;
+                  for (let depth = 0; depth < 2; depth++) {
+                    let found = false;
+                    for (const adj2 of g.neighbors(deepTile)) {
+                      if (
+                        g.ownerID(adj2) === 0 &&
+                        (!g.isLand || g.isLand(adj2))
+                      ) {
+                        deepTile = adj2;
+                        found = true;
+                        break;
+                      }
+                    }
+                    if (!found) break;
+                  }
+                  // Get screen coords of deep tile and our border tile
+                  const deepScreen = th.worldToScreenCoordinates({
+                    x: g.x(deepTile),
+                    y: g.y(deepTile),
                   });
-                  const vw = window.innerWidth,
-                    vh = window.innerHeight;
+                  const ourScreen = th.worldToScreenCoordinates({
+                    x: g.x(borderTile),
+                    y: g.y(borderTile),
+                  });
+                  // Offset 12px further away from our border
+                  const dx = deepScreen.x - ourScreen.x;
+                  const dy = deepScreen.y - ourScreen.y;
+                  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+                  const fx = deepScreen.x + (dx / len) * 12;
+                  const fy = deepScreen.y + (dy / len) * 12;
                   return {
-                    x: wildScreen.x,
-                    y: wildScreen.y,
+                    x: fx,
+                    y: fy,
                     onScreen:
-                      wildScreen.x > 50 &&
-                      wildScreen.x < vw - 50 &&
-                      wildScreen.y > 30 &&
-                      wildScreen.y < vh - 100,
+                      fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
                     method: "wilderness-border",
                   };
                 }
@@ -1885,8 +1996,6 @@ async function executeRLAction(
               x: ccData.centroidX,
               y: ccData.centroidY,
             });
-            const vw = window.innerWidth,
-              vh = window.innerHeight;
             return {
               x: screen.x,
               y: screen.y,
@@ -1929,6 +2038,18 @@ async function executeRLAction(
       // Target exists but is off-screen — pan toward it
       const dir = await getDirectionToTarget(page, target.name);
       if (dir !== null) {
+        // Show pan debug marker: arrow from center toward pan direction
+        const panEndX = zone.cx + Math.cos(dir) * 150;
+        const panEndY = zone.cy + Math.sin(dir) * 150;
+        await showDebugMarker(
+          page,
+          panEndX,
+          panEndY,
+          zone.cx,
+          zone.cy,
+          `PAN → ${target.name} (off-screen)`,
+          "yellow",
+        );
         await panInDirection(page, dir, 600);
         didPan = true;
         const apiPos2 = await getAttackClickPos(page, target.name);
@@ -1964,6 +2085,8 @@ async function executeRLAction(
       log(`RL: Warning — no targeting data for ${target?.name || targetIdx}`);
     }
 
+    const isWilderness = !!(target && target._wildernessCC);
+
     // Clamp to safe zone to avoid clicking UI elements
     x = Math.max(zone.left, Math.min(zone.right, x));
     y = Math.max(zone.top, Math.min(zone.bottom, y));
@@ -1985,24 +2108,24 @@ async function executeRLAction(
           "[class*='player-info']",
           "[class*='bottom-bar']",
           "[class*='hud']",
+          ".player-name",
         ];
         for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (!el) continue;
-          const r = el.getBoundingClientRect();
-          if (r.width === 0 || r.height === 0) continue;
-          if (
-            cx >= r.left - pad &&
-            cx <= r.right + pad &&
-            cy >= r.top - pad &&
-            cy <= r.bottom + pad
-          ) {
-            // Determine best pan direction away from this element
-            const elCx = (r.left + r.right) / 2;
-            const elCy = (r.top + r.bottom) / 2;
-            const angle = Math.atan2(elCy - vh / 2, elCx - vw / 2);
-            // Pan in opposite direction
-            return { blocked: true, element: sel, panAngle: angle + Math.PI };
+          const els = document.querySelectorAll(sel);
+          for (const el of els) {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            if (
+              cx >= r.left - pad &&
+              cx <= r.right + pad &&
+              cy >= r.top - pad &&
+              cy <= r.bottom + pad
+            ) {
+              const elCx = (r.left + r.right) / 2;
+              const elCy = (r.top + r.bottom) / 2;
+              const angle = Math.atan2(elCy - vh / 2, elCx - vw / 2);
+              return { blocked: true, element: sel, panAngle: angle + Math.PI };
+            }
           }
         }
         // Also check: top 170px is always dangerous (banners, info bars)
@@ -2022,56 +2145,104 @@ async function executeRLAction(
     );
 
     if (uiCheck && uiCheck.blocked) {
-      log(`RL: Attack target behind ${uiCheck.element}, panning away`);
-      await panInDirection(page, uiCheck.panAngle, 400);
+      log(
+        `RL: Attack ${target?.name || "?"} at (${Math.round(x)},${Math.round(y)}) behind ${uiCheck.element}, panning`,
+      );
+      // Show debug marker: where we wanted to click (blocked) and pan direction
+      const panEndX2 = zone.cx + Math.cos(uiCheck.panAngle) * 150;
+      const panEndY2 = zone.cy + Math.sin(uiCheck.panAngle) * 150;
+      await showDebugMarker(
+        page,
+        x,
+        y,
+        zone.cx,
+        zone.cy,
+        `BLOCKED by ${uiCheck.element} → pan`,
+        "orange",
+      );
+      // Pan opposite to the UI element, then recenter + re-query
+      await panInDirection(page, uiCheck.panAngle, 500);
       didPan = true;
+      await sleep(200);
       // Re-query position after pan
-      const apiRetry = target
-        ? await getAttackClickPos(page, target.name)
-        : null;
-      if (apiRetry && apiRetry.onScreen) {
-        // Re-check UI occlusion at new position
-        const recheck = await safeEval(
+      let apiRetry = null;
+      if (isWilderness && target._wildernessCC) {
+        apiRetry = await safeEval(
           page,
-          (cx, cy) => {
-            const pad = 15;
-            const vh = window.innerHeight;
-            const selectors = [
-              "leader-board",
-              "player-info-bar",
-              "attacks-display",
-              "game-right-sidebar",
-              "build-menu",
-              "[class*='player-info']",
-            ];
-            for (const sel of selectors) {
-              const el = document.querySelector(sel);
-              if (!el) continue;
-              const r = el.getBoundingClientRect();
-              if (r.width === 0 || r.height === 0) continue;
-              if (
-                cx >= r.left - pad &&
-                cx <= r.right + pad &&
-                cy >= r.top - pad &&
-                cy <= r.bottom + pad
-              )
-                return true;
+          async (ccData) => {
+            try {
+              const sidebar = document.querySelector("game-right-sidebar");
+              if (!sidebar?.game) return null;
+              const g = sidebar.game;
+              const th = document.querySelector("build-menu")?.transformHandler;
+              if (!th) return null;
+              const me = g.myPlayer?.();
+              if (!me || typeof me.borderTiles !== "function") return null;
+              const vw = window.innerWidth,
+                vh = window.innerHeight;
+              let ourBorder = [...(await me.borderTiles()).borderTiles];
+              const scored = ourBorder.map((t) => ({
+                t,
+                d:
+                  Math.abs(g.x(t) - ccData.centroidX) +
+                  Math.abs(g.y(t) - ccData.centroidY),
+              }));
+              scored.sort((a, b) => a.d - b.d);
+              for (let i = 0; i < Math.min(scored.length, 50); i++) {
+                for (const adj of g.neighbors(scored[i].t)) {
+                  if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
+                    let deep = adj;
+                    for (let d = 0; d < 2; d++) {
+                      for (const a2 of g.neighbors(deep)) {
+                        if (
+                          g.ownerID(a2) === 0 &&
+                          (!g.isLand || g.isLand(a2))
+                        ) {
+                          deep = a2;
+                          break;
+                        }
+                      }
+                    }
+                    const ds = th.worldToScreenCoordinates({
+                      x: g.x(deep),
+                      y: g.y(deep),
+                    });
+                    const os = th.worldToScreenCoordinates({
+                      x: g.x(scored[i].t),
+                      y: g.y(scored[i].t),
+                    });
+                    const dx = ds.x - os.x,
+                      dy = ds.y - os.y,
+                      len = Math.sqrt(dx * dx + dy * dy) || 1;
+                    return {
+                      x: ds.x + (dx / len) * 12,
+                      y: ds.y + (dy / len) * 12,
+                      onScreen:
+                        ds.x > 50 &&
+                        ds.x < vw - 50 &&
+                        ds.y > 30 &&
+                        ds.y < vh - 100,
+                    };
+                  }
+                }
+              }
+              return null;
+            } catch (e) {
+              return null;
             }
-            if (cy < 170 || cy > vh - 120) return true;
-            return false;
           },
-          apiRetry.x,
-          apiRetry.y,
+          target._wildernessCC,
         );
-        if (recheck) {
-          log(`RL: Target still behind UI after pan, skipping`);
-          await restoreClickZoom(page, atkZoomSteps);
-          return;
-        }
+      } else if (target) {
+        apiRetry = await getAttackClickPos(page, target.name);
+      }
+      if (apiRetry && apiRetry.onScreen) {
         x = apiRetry.x;
         y = apiRetry.y;
+        method = "pan-retry";
       } else {
-        log(`RL: Target off-screen after pan, skipping`);
+        log(`RL: Target off-screen after pan, will retry next tick`);
+        await centerCamera(page);
         await restoreClickZoom(page, atkZoomSteps);
         return;
       }
@@ -2092,7 +2263,7 @@ async function executeRLAction(
     // Log what we're clicking and verify it's on our territory's neighbor
     const targetName = target ? target.name : "unknown";
     log(
-      `RL: Clicking attack at (${Math.round(x)},${Math.round(y)}) target=${targetName} method=${method} isLand=${target?.isLandNeighbor} isWild=${!!target?._wildernessCC}`,
+      `RL: Clicking attack at (${Math.round(x)},${Math.round(y)}) target=${targetName} method=${method} isLand=${target?.isLandNeighbor} isWild=${isWilderness}`,
     );
     await page.mouse.click(x, y);
     await sleep(150);
@@ -2133,7 +2304,84 @@ async function executeRLAction(
         currentAttackRatio = troopFraction;
         await sleep(30);
       }
-      const retryPos = await getAttackClickPos(page, target.name);
+      // For wilderness: re-run wilderness targeting (getAttackClickPos only finds players)
+      let retryPos = null;
+      if (isWilderness) {
+        retryPos = await safeEval(
+          page,
+          async (ccData) => {
+            try {
+              const sidebar = document.querySelector("game-right-sidebar");
+              if (!sidebar?.game) return null;
+              const g = sidebar.game;
+              const buildMenu = document.querySelector("build-menu");
+              const th = buildMenu?.transformHandler;
+              if (!th) return null;
+              const me = g.myPlayer?.();
+              if (!me || typeof me.borderTiles !== "function") return null;
+              const vw = window.innerWidth,
+                vh = window.innerHeight;
+              let ourBorder = [];
+              try {
+                ourBorder = [...(await me.borderTiles()).borderTiles];
+              } catch (e) {
+                return null;
+              }
+              const ccX = ccData.centroidX,
+                ccY = ccData.centroidY;
+              const scored = ourBorder.map((t) => ({
+                t,
+                d: Math.abs(g.x(t) - ccX) + Math.abs(g.y(t) - ccY),
+              }));
+              scored.sort((a, b) => a.d - b.d);
+              for (let i = 0; i < Math.min(scored.length, 50); i++) {
+                const borderTile = scored[i].t;
+                for (const adj of g.neighbors(borderTile)) {
+                  if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
+                    let deepTile = adj;
+                    for (let depth = 0; depth < 2; depth++) {
+                      for (const adj2 of g.neighbors(deepTile)) {
+                        if (
+                          g.ownerID(adj2) === 0 &&
+                          (!g.isLand || g.isLand(adj2))
+                        ) {
+                          deepTile = adj2;
+                          break;
+                        }
+                      }
+                    }
+                    const deepScreen = th.worldToScreenCoordinates({
+                      x: g.x(deepTile),
+                      y: g.y(deepTile),
+                    });
+                    const ourScreen = th.worldToScreenCoordinates({
+                      x: g.x(borderTile),
+                      y: g.y(borderTile),
+                    });
+                    const dx = deepScreen.x - ourScreen.x,
+                      dy = deepScreen.y - ourScreen.y;
+                    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+                    const fx = deepScreen.x + (dx / len) * 12,
+                      fy = deepScreen.y + (dy / len) * 12;
+                    return {
+                      x: fx,
+                      y: fy,
+                      onScreen:
+                        fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
+                    };
+                  }
+                }
+              }
+              return null;
+            } catch (e) {
+              return null;
+            }
+          },
+          target._wildernessCC,
+        );
+      } else {
+        retryPos = await getAttackClickPos(page, target.name);
+      }
       if (retryPos && retryPos.onScreen) {
         // Check all UI elements before retry click
         const retryBlocked = await safeEval(
@@ -2403,6 +2651,17 @@ async function executeRLAction(
       } else {
         const dir = await getDirectionToTarget(page, nukeTarget.name);
         if (dir !== null) {
+          const npx = zone.cx + Math.cos(dir) * 150;
+          const npy = zone.cy + Math.sin(dir) * 150;
+          await showDebugMarker(
+            page,
+            npx,
+            npy,
+            zone.cx,
+            zone.cy,
+            `PAN → ${nukeTarget.name} (nuke, off-screen)`,
+            "magenta",
+          );
           await panInDirection(page, dir, 600);
           const pos2 = await getAttackClickPos(page, nukeTarget.name);
           if (pos2) {
@@ -2741,6 +3000,12 @@ async function main() {
       // Keep clicking the map to pick a starting location.
       // Detect spawn by checking if the troop HUD appeared (troops > 0).
       if (!spawned) {
+        // Zoom out a bit on first spawn attempt so we can see land
+        if (spawnAttempts === 0) {
+          await focusCanvas(page);
+          for (let i = 0; i < 5; i++) await zoomStep(page, 100); // zoom out slightly
+          await sleep(200);
+        }
         const box = await getCanvasBounds(page);
         if (box) {
           const cx = box.x + box.width * (0.3 + Math.random() * 0.4);
@@ -2751,24 +3016,79 @@ async function main() {
         spawnAttempts++;
         await sleep(2000);
 
-        // Check if we spawned: look for the troops HUD (only visible after spawning)
+        // Check if we spawned: the "Choose a starting location" banner must be GONE
+        // AND we must have actual tiles. Both conditions required to avoid false positives.
+        const spawnBannerGone = await safeEval(page, () => {
+          // Check for the spawn location prompt — various possible selectors
+          const body = document.body?.innerText || "";
+          if (body.includes("Choose a starting location")) return false;
+          if (body.includes("choose a starting location")) return false;
+          // Also check for common spawn UI elements
+          const spawnUI = document.querySelector(
+            ".spawn-overlay, .spawn-prompt, [class*='spawn'], [class*='starting-location']",
+          );
+          if (spawnUI && spawnUI.offsetParent !== null) return false;
+          return true;
+        });
         const hudState = await extractGameState(page, BOT_NAME);
-        // Troops show ~1K even before spawn. Gold > 0 only after spawning.
-        // Also allow fallback after enough attempts.
+        // Require BOTH: spawn banner gone AND actual tiles owned
         const didSpawn =
-          (hudState && hudState.myGold > 100) || spawnAttempts >= 15;
+          spawnBannerGone &&
+          hudState &&
+          (hudState.myGold > 100 || hudState.myTiles > 10);
+        if (!didSpawn) {
+          log(
+            `Spawn check: bannerGone=${spawnBannerGone}, tiles=${hudState?.myTiles || 0}, gold=${hudState?.myGold || 0}`,
+          );
+        }
 
-        if (didSpawn || spawnAttempts > 15) {
+        if (didSpawn) {
           spawned = true;
           spawnTime = Date.now();
           log(
             `Spawned! troops=${hudState?.myTroops || "?"}, territory=${((hudState?.territoryPct || 0) * 100).toFixed(1)}%`,
           );
 
-          // Center camera and zoom in to ~7x (1.8 → ~6.4)
+          // Center camera, then zoom in until we can see our own label
           await centerCamera(page);
-          for (let i = 0; i < 7; i++) await zoomStep(page, -100);
-          await sleep(500);
+          await sleep(500); // extra wait for center animation to settle
+
+          // Zoom in until our label is visible on screen
+          for (let attempt = 0; attempt < 25; attempt++) {
+            const canSeeLabel = await safeEval(
+              page,
+              (botName) => {
+                const spans = document.querySelectorAll(".player-name-span");
+                for (const s of spans) {
+                  // Match by includes (handles clan tag prefix like "[XXDAR] xXDark...")
+                  if (s.textContent?.includes(botName)) {
+                    const container = s.closest(".player-name")?.parentElement;
+                    if (!container) continue;
+                    const r = container.getBoundingClientRect();
+                    const vw = window.innerWidth,
+                      vh = window.innerHeight;
+                    return (
+                      r.width > 0 &&
+                      r.left > 30 &&
+                      r.right < vw - 30 &&
+                      r.top > 30 &&
+                      r.bottom < vh - 80
+                    );
+                  }
+                }
+                return false;
+              },
+              BOT_NAME,
+            );
+            if (canSeeLabel) {
+              log(`Spawn zoom: found our label after ${attempt} zoom steps`);
+              break;
+            }
+            await zoomStep(page, -100); // zoom in
+            await sleep(50);
+          }
+          // One final re-center after all zooming
+          await centerCamera(page);
           lastRecenter = Date.now();
         }
         continue;
@@ -2796,10 +3116,13 @@ async function main() {
         // Zoom targets: balance seeing our territory and neighbors
         const tPct = lastTerritoryPct;
         let targetScale;
-        if (tPct < 0.005) targetScale = 4.0;
-        else if (tPct < 0.01) targetScale = 3.5;
-        else if (tPct < 0.03) targetScale = 2.5;
-        else if (tPct < 0.05) targetScale = 2.0;
+        if (tPct < 0.0005) targetScale = 10.0;
+        else if (tPct < 0.001) targetScale = 6.0;
+        else if (tPct < 0.003) targetScale = 4.0;
+        else if (tPct < 0.005) targetScale = 3.0;
+        else if (tPct < 0.01) targetScale = 2.5;
+        else if (tPct < 0.03) targetScale = 2.0;
+        else if (tPct < 0.05) targetScale = 1.8;
         else targetScale = 1.5;
 
         const scaleRatio = currentScale / targetScale;
@@ -2807,7 +3130,7 @@ async function main() {
           const stepsNeeded = Math.round(
             Math.log(targetScale / currentScale) / Math.log(1.2),
           );
-          const clamped = Math.max(-6, Math.min(6, stepsNeeded));
+          const clamped = Math.max(-10, Math.min(10, stepsNeeded));
           if (clamped !== 0) {
             const delta = clamped > 0 ? -100 : 100;
             for (let i = 0; i < Math.abs(clamped); i++)
@@ -2824,7 +3147,7 @@ async function main() {
       // Zoom out, grab label positions, zoom back to target scale.
       if (
         Date.now() - lastNeighborScan > 15000 &&
-        Date.now() - spawnTime > 5000
+        Date.now() - spawnTime > 15000
       ) {
         lastNeighborScan = Date.now();
         // Sync actual scale from game
@@ -2837,10 +3160,13 @@ async function main() {
         if (currentScale > 2.5) {
           const tPct = lastTerritoryPct;
           let targetScale;
-          if (tPct < 0.005) targetScale = 4.0;
-          else if (tPct < 0.01) targetScale = 3.5;
-          else if (tPct < 0.03) targetScale = 2.5;
-          else if (tPct < 0.05) targetScale = 2.0;
+          if (tPct < 0.0005) targetScale = 10.0;
+          else if (tPct < 0.001) targetScale = 6.0;
+          else if (tPct < 0.003) targetScale = 4.0;
+          else if (tPct < 0.005) targetScale = 3.0;
+          else if (tPct < 0.01) targetScale = 2.5;
+          else if (tPct < 0.03) targetScale = 2.0;
+          else if (tPct < 0.05) targetScale = 1.8;
           else targetScale = 1.5;
 
           // Zoom out to ~1.5 for label visibility
@@ -2883,7 +3209,7 @@ async function main() {
           const inSteps = Math.round(
             Math.log(targetScale / currentScale) / Math.log(1.2),
           );
-          const clampedIn = Math.max(-8, Math.min(8, inSteps));
+          const clampedIn = Math.max(-12, Math.min(12, inSteps));
           if (clampedIn > 0) {
             for (let i = 0; i < clampedIn; i++) await zoomStep(page, -100);
           }
@@ -3048,8 +3374,14 @@ async function main() {
         );
         if (gs?._borderDebug) {
           const bd = gs._borderDebug;
+          const wildCount = bd.wildernessCCCount || 0;
+          const mask = gs.actionMask || [];
+          const maskStr = mask
+            .map((v, i) => (v ? i : null))
+            .filter((v) => v !== null)
+            .join(",");
           log(
-            `  border: myBorder=${bd.myBorderLen} landN=[${bd.landNames.slice(0, 3)}] apiN=${bd.apiNeighborCount}`,
+            `  border: myBorder=${bd.myBorderLen} landN=[${bd.landNames.slice(0, 3)}] apiN=${bd.apiNeighborCount} wildCCs=${wildCount} mask=[${maskStr}]`,
           );
           if (gs._buildDebug) {
             log(`  build: ${JSON.stringify(gs._buildDebug.slice(0, 5))}`);
