@@ -1077,6 +1077,30 @@ async function zoomStep(page, delta) {
   await sleep(80);
 }
 
+// Zoom in to a minimum scale for precise clicking. Returns steps taken (for restoreClickZoom).
+const MIN_CLICK_SCALE = 7;
+async function ensureClickZoom(page) {
+  const realScale = await safeEval(page, () => {
+    const bm = document.querySelector("build-menu");
+    return bm?.transformHandler?.scale ?? null;
+  });
+  if (realScale) currentScale = realScale;
+  if (currentScale >= MIN_CLICK_SCALE) return 0;
+  const stepsIn = Math.min(
+    8,
+    Math.round(Math.log(MIN_CLICK_SCALE / currentScale) / Math.log(1.2)),
+  );
+  for (let i = 0; i < stepsIn; i++) await zoomStep(page, -100);
+  await sleep(100);
+  return stepsIn;
+}
+
+async function restoreClickZoom(page, stepsIn) {
+  if (stepsIn > 0) {
+    for (let i = 0; i < stepsIn; i++) await zoomStep(page, 100);
+  }
+}
+
 // Generate a random point well inside our territory (tight around center after 'c')
 function randomInterior(zone) {
   const spread = 30;
@@ -1842,6 +1866,10 @@ async function executeRLAction(
       await sleep(30);
     }
 
+    // Zoom in for click precision, recenter so coordinates are fresh
+    const atkZoomSteps = await ensureClickZoom(page);
+    if (atkZoomSteps > 0) await centerCamera(page);
+
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
     const originX = gameState?.myLabelX || zone.cx;
@@ -2108,12 +2136,14 @@ async function executeRLAction(
         );
         if (recheck) {
           log(`RL: Target still behind UI after pan, skipping`);
+          await restoreClickZoom(page, atkZoomSteps);
           return;
         }
         x = apiRetry.x;
         y = apiRetry.y;
       } else {
         log(`RL: Target off-screen after pan, skipping`);
+        await restoreClickZoom(page, atkZoomSteps);
         return;
       }
     }
@@ -2233,8 +2263,10 @@ async function executeRLAction(
       );
     }
 
-    // If we panned for this attack, recenter so subsequent actions work correctly
-    if (didPan) {
+    // Restore zoom level after attack
+    await restoreClickZoom(page, atkZoomSteps);
+    // If we panned or zoomed for this attack, recenter so subsequent actions work correctly
+    if (didPan || atkZoomSteps > 0) {
       await centerCamera(page);
     }
   } else if (actionType === ACTION_RETREAT) {
@@ -2275,6 +2307,8 @@ async function executeRLAction(
       return;
     }
 
+    // Zoom in for click precision
+    const buildZoomSteps = await ensureClickZoom(page);
     await centerCamera(page);
 
     const isBorderBuilding =
@@ -2317,16 +2351,13 @@ async function executeRLAction(
     if (apiBuildPos) {
       let built = await tryBuild(apiBuildPos.x, apiBuildPos.y, "api");
       if (!built) {
-        // Retry: zoom in for precision
-        log(`RL: Build ${name} miss, zooming in to retry`);
-        for (let i = 0; i < 4; i++) await zoomStep(page, -100);
-        await sleep(100);
+        // Retry: recenter and recompute position (already zoomed in via ensureClickZoom)
+        log(`RL: Build ${name} miss, retrying with fresh coords`);
         await centerCamera(page);
         const retryPos = await getBuildClickPos(page, isBorderBuilding);
         if (retryPos) {
           built = await tryBuild(retryPos.x, retryPos.y, "api-retry");
         }
-        for (let i = 0; i < 4; i++) await zoomStep(page, 100);
       }
       lastBuildResult = built ? "success" : "fail";
       lastActionSucceeded = built;
@@ -2399,7 +2430,7 @@ async function executeRLAction(
         `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) method=fallback ${built ? "✓" : "✗"} [gold=${(gold / 1000).toFixed(0)}K]`,
       );
 
-      // Zoom back out
+      // Zoom back out (fallback's own zoom)
       const zoomOutSteps = Math.max(
         0,
         Math.round(Math.log(currentScale / savedScale) / Math.log(1.2)),
@@ -2407,13 +2438,18 @@ async function executeRLAction(
       for (let i = 0; i < Math.min(zoomOutSteps, 15); i++)
         await zoomStep(page, 100);
     }
+    // Restore the ensureClickZoom zoom
+    await restoreClickZoom(page, buildZoomSteps);
+    if (buildZoomSteps > 0) await centerCamera(page);
   } else if (NUKE_KEYS[actionType]) {
     const { key, name, minGold } = NUKE_KEYS[actionType];
     if (gold < minGold) {
       log(`RL: Skip ${name} — need ${(minGold / 1000).toFixed(0)}K gold`);
       return;
     }
-    // Nukes: press key, then click on enemy territory
+    // Nukes: zoom in for precision, press key, then click on enemy territory
+    const nukeZoomSteps = await ensureClickZoom(page);
+    if (nukeZoomSteps > 0) await centerCamera(page);
     await page.keyboard.press(key).catch(() => {});
     await sleep(300);
 
@@ -2506,8 +2542,9 @@ async function executeRLAction(
     log(
       `RL: Launch ${name} at ${nukeTargetName} (${Math.round(nx)},${Math.round(ny)}) method=${nukeMethod}`,
     );
-    // Recenter if we panned
-    if (nukeMethod.startsWith("pan")) {
+    // Restore zoom and recenter
+    await restoreClickZoom(page, nukeZoomSteps);
+    if (nukeMethod.startsWith("pan") || nukeZoomSteps > 0) {
       await centerCamera(page);
     }
     return { nukeLaunched: true };
@@ -2519,8 +2556,34 @@ async function executeRLAction(
       log("RL: Upgrade — no unit positions");
       return;
     }
-    const unit = unitPositions[0];
-    await page.mouse.click(unit.x, unit.y, { button: "right" });
+    const upgZoomSteps = await ensureClickZoom(page);
+    if (upgZoomSteps > 0) await centerCamera(page);
+    // Re-query unit positions at new zoom level
+    const freshUpgUnits =
+      upgZoomSteps > 0
+        ? await safeEval(page, () => {
+            const sb = document.querySelector("game-right-sidebar");
+            const g = sb?.game;
+            const bm = document.querySelector("build-menu");
+            const th = bm?.transformHandler;
+            const me = g?.myPlayer?.();
+            if (!me || !th) return null;
+            const units = typeof me.units === "function" ? me.units() : [];
+            return [...units].slice(0, 10).map((u) => {
+              const tile = typeof u.tile === "function" ? u.tile() : u.tile;
+              const s = th.worldToScreenCoordinates({
+                x: g.x(tile),
+                y: g.y(tile),
+              });
+              return { x: s.x, y: s.y };
+            });
+          })
+        : null;
+    const upgUnit =
+      freshUpgUnits && freshUpgUnits.length > 0
+        ? freshUpgUnits[0]
+        : unitPositions[0];
+    await page.mouse.click(upgUnit.x, upgUnit.y, { button: "right" });
     await sleep(400);
     // Click the "build" slot in the SVG radial menu
     const opened = await safeEval(page, () => {
@@ -2536,11 +2599,13 @@ async function executeRLAction(
     if (opened) {
       await sleep(300);
       // In the build submenu, clicking near an existing unit upgrades it
-      await page.mouse.click(unit.x, unit.y);
+      await page.mouse.click(upgUnit.x, upgUnit.y);
     }
     log(
-      `RL: Upgrade at (${Math.round(unit.x)},${Math.round(unit.y)}) ${opened ? "✓" : "no menu"}`,
+      `RL: Upgrade at (${Math.round(upgUnit.x)},${Math.round(upgUnit.y)}) ${opened ? "✓" : "no menu"}`,
     );
+    await restoreClickZoom(page, upgZoomSteps);
+    if (upgZoomSteps > 0) await centerCamera(page);
   } else if (actionType === ACTION_DELETE_UNIT) {
     // Right-click near a unit to open radial menu, then click "delete" slot
     unitPositions = unitPositions || [];
@@ -2548,8 +2613,37 @@ async function executeRLAction(
       log("RL: Delete unit — no unit positions");
       return;
     }
-    const unit = unitPositions[unitPositions.length - 1];
-    await page.mouse.click(unit.x, unit.y, { button: "right" });
+    const delZoomSteps = await ensureClickZoom(page);
+    if (delZoomSteps > 0) await centerCamera(page);
+    // Re-query unit positions at new zoom level
+    const freshDelUnits =
+      delZoomSteps > 0
+        ? await safeEval(page, () => {
+            const sb = document.querySelector("game-right-sidebar");
+            const g = sb?.game;
+            const bm = document.querySelector("build-menu");
+            const th = bm?.transformHandler;
+            const me = g?.myPlayer?.();
+            if (!me || !th) return null;
+            const units = typeof me.units === "function" ? me.units() : [];
+            return [...units].slice(0, 10).map((u) => {
+              const tile = typeof u.tile === "function" ? u.tile() : u.tile;
+              const s = th.worldToScreenCoordinates({
+                x: g.x(tile),
+                y: g.y(tile),
+              });
+              const active =
+                typeof u.isActive === "function" ? u.isActive() : true;
+              return { x: s.x, y: s.y, active };
+            });
+          })
+        : null;
+    // Pick last active unit
+    const delCandidates = freshDelUnits || unitPositions;
+    const delUnit =
+      [...delCandidates].reverse().find((u) => u.active !== false) ||
+      delCandidates[delCandidates.length - 1];
+    await page.mouse.click(delUnit.x, delUnit.y, { button: "right" });
     await sleep(400);
     const deleted = await safeEval(page, () => {
       const el =
@@ -2562,8 +2656,10 @@ async function executeRLAction(
       return false;
     });
     log(
-      `RL: Delete unit at (${Math.round(unit.x)},${Math.round(unit.y)}) ${deleted ? "✓" : "no menu"}`,
+      `RL: Delete unit at (${Math.round(delUnit.x)},${Math.round(delUnit.y)}) ${deleted ? "✓" : "no menu"}`,
     );
+    await restoreClickZoom(page, delZoomSteps);
+    if (delZoomSteps > 0) await centerCamera(page);
     if (deleted) return { deleted: true };
   }
 }
