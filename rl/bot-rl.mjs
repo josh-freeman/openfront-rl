@@ -24,11 +24,11 @@ puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 const BOT_NAME = process.argv[2] || "xXDarkLord42Xx";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
 
-// Must match training: ticksPerStep (10) × turnIntervalMs (100) = 1000ms
-// This is defined in env_server.ts and env.py as ticks_per_step=10
+// Training: ticksPerStep=10, turnInterval=100ms → 1 action per 1000ms game time.
+// Live server ticks faster, so poll more frequently to stay responsive.
 const TICKS_PER_STEP = 10;
 const TURN_INTERVAL_MS = 100;
-const POLICY_INTERVAL_MS = TICKS_PER_STEP * TURN_INTERVAL_MS; // 1000ms
+const POLICY_INTERVAL_MS = 500; // Query policy every 500ms for responsiveness
 
 // Track actual game scale (game default is 1.8, range [0.2, 20])
 // The game zooms via: scale /= (1 + delta/600), clamped to [0.2, 20]
@@ -51,6 +51,60 @@ async function snap(page, name) {
     await page.screenshot({ path });
     log(`Screenshot → ${path}`);
   } catch {}
+}
+
+// ── Debug overlay: show click markers on screen ──────────────────
+async function showDebugMarker(
+  page,
+  x,
+  y,
+  originX,
+  originY,
+  label,
+  color = "red",
+) {
+  await page.evaluate(
+    (x, y, ox, oy, label, color) => {
+      let overlay = document.getElementById("rl-debug-overlay");
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "rl-debug-overlay";
+        overlay.style.cssText =
+          "position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:99999";
+        document.body.appendChild(overlay);
+      }
+      const dx = x - ox,
+        dy = y - oy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+      const line = document.createElement("div");
+      line.style.cssText = `position:absolute;left:${ox}px;top:${oy}px;width:${dist}px;height:2px;background:${color};opacity:0.6;transform-origin:0 50%;transform:rotate(${angle}deg);pointer-events:none;`;
+      const dot = document.createElement("div");
+      dot.style.cssText = `position:absolute;left:${x - 8}px;top:${y - 8}px;width:16px;height:16px;border-radius:50%;background:${color};opacity:0.8;pointer-events:none;border:2px solid white;`;
+      const lbl = document.createElement("div");
+      lbl.textContent = label;
+      lbl.style.cssText = `position:absolute;left:${x + 12}px;top:${y - 10}px;color:white;font-size:11px;font-weight:bold;text-shadow:1px 1px 2px black;pointer-events:none;white-space:nowrap;`;
+      const orig = document.createElement("div");
+      orig.style.cssText = `position:absolute;left:${ox - 4}px;top:${oy - 4}px;width:8px;height:8px;border-radius:50%;background:cyan;opacity:0.8;pointer-events:none;`;
+      overlay.appendChild(line);
+      overlay.appendChild(dot);
+      overlay.appendChild(lbl);
+      overlay.appendChild(orig);
+      setTimeout(() => {
+        [line, dot, lbl, orig].forEach((el) => {
+          el.style.transition = "opacity 0.5s";
+          el.style.opacity = "0";
+          setTimeout(() => el.remove(), 500);
+        });
+      }, 2000);
+    },
+    x,
+    y,
+    originX,
+    originY,
+    label,
+    color,
+  );
 }
 
 // ── Policy server query ──────────────────────────────────────────
@@ -186,7 +240,7 @@ function parseHudNumber(s) {
 async function extractGameState(page, botName) {
   return safeEval(
     page,
-    (botName) => {
+    async (botName) => {
       const state = {
         myTiles: 0,
         myTroops: 0,
@@ -337,6 +391,26 @@ async function extractGameState(page, botName) {
         if (me && typeof me.deleteUnitCooldown === "function") {
           state.canDeleteUnit = me.deleteUnitCooldown() === 0;
         }
+        // Query real build availability from game API (accounts for scaling costs)
+        if (me && typeof me.buildables === "function") {
+          try {
+            const bu = await me.buildables();
+            // Map UnitType string -> canBuild boolean
+            state.canBuildFromAPI = {};
+            state._buildCosts = {};
+            for (const entry of bu) {
+              state.canBuildFromAPI[entry.type] = entry.canBuild !== false;
+              state._buildCosts[entry.type] = Number(entry.cost);
+            }
+            state._buildDebug = bu.map((e) => ({
+              type: e.type,
+              canBuild: e.canBuild !== false,
+              cost: Number(e.cost),
+            }));
+          } catch (e) {
+            state._buildError = e.message;
+          }
+        }
       }
 
       // Parse incoming/outgoing attacks from <attacks-display> (light DOM)
@@ -441,109 +515,103 @@ async function extractGameState(page, botName) {
         playerMap.set(name, { troops, visible, labelX, labelY });
       }
 
-      // Detect land neighbors via canvas color matching:
-      // 1. Sample each player's territory color at their label position
-      // 2. Find our territory border pixels and sample adjacent non-ours colors
-      // 3. Match adjacent colors to player colors → those are land neighbors
+      // Use game API for accurate land neighbor detection
       const landNeighborNames = new Set();
-      const canvas = document.querySelector("canvas");
-      if (canvas) {
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          const W = canvas.width,
-            H = canvas.height;
-          const canvasRect = canvas.getBoundingClientRect();
-          const centerData = ctx.getImageData(
-            Math.floor(W / 2),
-            Math.floor(H / 2),
-            1,
-            1,
-          ).data;
-          const myR = centerData[0],
-            myG = centerData[1],
-            myB = centerData[2];
+      const apiNeighborData = new Map(); // displayName -> {tiles, troops, relation, isLand, isAllied}
+      if (sidebar && sidebar.game) {
+        const me2 = sidebar.game.myPlayer?.();
+        const g = sidebar.game;
+        if (me2) {
+          try {
+            // Client-side sharesBorderWith: scan our border tiles, collect ownerIDs
+            // of adjacent tiles. This replicates PlayerImpl.sharesBorderWith which
+            // doesn't exist on the client-side PlayerView.
+            let myBorder = [];
+            try {
+              if (typeof me2.borderTiles === "function") {
+                const bt = await me2.borderTiles();
+                myBorder = bt?.borderTiles ? [...bt.borderTiles] : [];
+              }
+            } catch (e) {}
+            const borderNeighborIDs = new Set();
+            const mySmallID =
+              typeof me2.smallID === "function" ? me2.smallID() : -1;
+            if (
+              myBorder.length > 0 &&
+              typeof g.neighbors === "function" &&
+              typeof g.ownerID === "function"
+            ) {
+              const step = Math.max(1, Math.floor(myBorder.length / 300));
+              for (let i = 0; i < myBorder.length; i += step) {
+                const adjTiles = g.neighbors(myBorder[i]);
+                for (const adj of adjTiles) {
+                  const oid = g.ownerID(adj);
+                  if (oid !== 0 && oid !== mySmallID) {
+                    borderNeighborIDs.add(oid);
+                  }
+                }
+              }
+            }
 
-          if (myR + myG + myB > 60 && !(myB > myR + myG + 50)) {
-            // Step 1: Sample territory color at each player's label position
-            const playerColors = []; // [{name, r, g, b}]
-            for (const [name, info] of playerMap) {
-              if (name === botName || name.includes(botName.slice(0, 6)))
+            // Get all players from game API (not just leaderboard top 10)
+            const allPlayers =
+              typeof g.players === "function" ? g.players() : [];
+            for (const n of allPlayers) {
+              if (!n || (typeof n.isAlive === "function" && !n.isAlive()))
                 continue;
-              if (!info.labelX || !info.labelY) continue;
-              // Convert page coords → canvas pixel coords
-              const cx = Math.floor(
-                ((info.labelX - canvasRect.left) / canvasRect.width) * W,
-              );
-              const cy = Math.floor(
-                ((info.labelY - canvasRect.top) / canvasRect.height) * H,
-              );
-              if (cx < 0 || cx >= W || cy < 0 || cy >= H) continue;
-              const px = ctx.getImageData(cx, cy, 1, 1).data;
-              // Skip water/UI pixels
-              if (px[0] + px[1] + px[2] < 60) continue;
-              if (px[2] > px[0] + px[1] + 50) continue;
-              playerColors.push({ name, r: px[0], g: px[1], b: px[2] });
+              const nSmallID =
+                typeof n.smallID === "function" ? n.smallID() : -1;
+              if (nSmallID === mySmallID || nSmallID <= 0) continue;
+              const dname =
+                typeof n.displayName === "function" ? n.displayName() : "";
+              if (!dname) continue;
+              const isLand = borderNeighborIDs.has(nSmallID);
+              const rel =
+                typeof me2.relation === "function" ? me2.relation(n) : 2;
+              const tiles =
+                typeof n.numTilesOwned === "function" ? n.numTilesOwned() : 0;
+              const troops = typeof n.troops === "function" ? n.troops() : 0;
+              const allied =
+                typeof me2.isAlliedWith === "function"
+                  ? me2.isAlliedWith(n)
+                  : false;
+              if (isLand) landNeighborNames.add(dname);
+              apiNeighborData.set(dname, {
+                tiles,
+                troops,
+                relation: rel,
+                isLand,
+                isAllied: allied,
+              });
             }
-
-            // Step 2: Scan grid, find our border, collect adjacent non-ours colors
-            const STEP = 16;
-            const imgData = ctx.getImageData(0, 0, W, H).data;
-            const cols = Math.floor(W / STEP),
-              rows = Math.floor(H / STEP);
-            const mineGrid = [];
-            for (let gx = 0; gx < cols; gx++) {
-              mineGrid[gx] = [];
-              for (let gy = 0; gy < rows; gy++) {
-                const px = gx * STEP + 8,
-                  py = gy * STEP + 8;
-                const idx = (py * W + px) * 4;
-                const dr = imgData[idx] - myR,
-                  dg = imgData[idx + 1] - myG,
-                  db = imgData[idx + 2] - myB;
-                mineGrid[gx][gy] = Math.sqrt(dr * dr + dg * dg + db * db) < 45;
-              }
-            }
-
-            // Collect colors of non-ours cells adjacent to our border
-            const adjacentColors = [];
-            for (let gx = 1; gx < cols - 1; gx++) {
-              for (let gy = 1; gy < rows - 1; gy++) {
-                if (!mineGrid[gx][gy]) continue;
-                const dirs = [
-                  [gx - 1, gy],
-                  [gx + 1, gy],
-                  [gx, gy - 1],
-                  [gx, gy + 1],
-                ];
-                for (const [nx, ny] of dirs) {
-                  if (mineGrid[nx][ny]) continue;
-                  const px = nx * STEP + 8,
-                    py = ny * STEP + 8;
-                  const idx = (py * W + px) * 4;
-                  const r = imgData[idx],
-                    g = imgData[idx + 1],
-                    b = imgData[idx + 2];
-                  // Skip water (dark or very blue)
-                  if (r + g + b < 60) continue;
-                  if (b > r + g + 50) continue;
-                  adjacentColors.push({ r, g, b });
-                }
-              }
-            }
-
-            // Step 3: Match adjacent colors → player colors
-            const COLOR_THRESHOLD = 50;
-            for (const ac of adjacentColors) {
-              for (const pc of playerColors) {
-                const dr = ac.r - pc.r,
-                  dg = ac.g - pc.g,
-                  db = ac.b - pc.b;
-                if (Math.sqrt(dr * dr + dg * dg + db * db) < COLOR_THRESHOLD) {
-                  landNeighborNames.add(pc.name);
-                }
-              }
-            }
+            state._borderDebug = {
+              myBorderLen: myBorder.length,
+              mySmallID,
+              hasNeighborsFn: typeof g.neighbors === "function",
+              hasOwnerIDFn: typeof g.ownerID === "function",
+              hasPlayersFn: typeof g.players === "function",
+              numPlayers: allPlayers.length,
+              borderNeighborIDs: [...borderNeighborIDs],
+              landNames: [...landNeighborNames],
+              apiNeighborCount: apiNeighborData.size,
+            };
+          } catch (e) {
+            state._borderDebugError = e?.message || String(e);
           }
+        }
+        // Also read our own exact stats from game API
+        if (me2) {
+          try {
+            const myTiles =
+              typeof me2.numTilesOwned === "function" ? me2.numTilesOwned() : 0;
+            const myTroops =
+              typeof me2.troops === "function" ? me2.troops() : 0;
+            const myGold =
+              typeof me2.gold === "function" ? Number(me2.gold()) : 0;
+            if (myTiles > 0) state.myTiles = myTiles;
+            if (myTroops > 0) state.myTroops = myTroops;
+            if (myGold > 0) state.myGold = myGold;
+          } catch (e) {}
         }
       }
 
@@ -575,14 +643,17 @@ async function extractGameState(page, botName) {
           tiles = Math.round(troops * 0.02);
         }
 
+        // Use game API data when available (exact values), fall back to DOM/leaderboard
+        const api = apiNeighborData.get(name);
         neighbors.push({
           id: name,
           name: name,
-          tiles,
-          troops,
-          relation: 2, // Relation.Neutral = 2 (matches training env)
+          tiles: api?.tiles || tiles,
+          troops: api?.troops || troops,
+          relation: api?.relation ?? 2, // Game API relation (0-3), default Neutral
           alive: true,
           isLandNeighbor: landNeighborNames.has(name),
+          isAllied: api?.isAllied || false,
           visible: info.visible,
           labelX: info.labelX,
           labelY: info.labelY,
@@ -606,21 +677,22 @@ async function extractGameState(page, botName) {
         })
         .slice(0, 16);
 
-      // Find our territory % from the <leader-board> Lit element.
-      // Access the component's `players` array directly (light DOM Lit component).
-      const lb = document.querySelector("leader-board");
-      if (lb && lb.players) {
-        const myEntry = lb.players.find((p) => p.isMyPlayer);
-        if (myEntry && myEntry.score) {
-          const pctMatch = myEntry.score.match(/([\d.]+)%/);
-          if (pctMatch) {
-            state.territoryPct = parseFloat(pctMatch[1]) / 100;
+      // Compute territory % from exact tile count (game API) or fall back to leaderboard
+      if (state.myTiles > 0 && state.totalMapTiles > 0) {
+        state.territoryPct = state.myTiles / state.totalMapTiles;
+      } else {
+        const lb = document.querySelector("leader-board");
+        if (lb && lb.players) {
+          const myEntry = lb.players.find((p) => p.isMyPlayer);
+          if (myEntry && myEntry.score) {
+            const pctMatch = myEntry.score.match(/([\d.]+)%/);
+            if (pctMatch) {
+              state.territoryPct = parseFloat(pctMatch[1]) / 100;
+            }
           }
         }
+        state.myTiles = Math.round(state.territoryPct * state.totalMapTiles);
       }
-
-      // Derive myTiles from territoryPct (so vec[0] = myTiles/total is non-zero)
-      state.myTiles = Math.round(state.territoryPct * state.totalMapTiles);
 
       // Read unit screen positions for upgrade/delete targeting
       // Uses game.myPlayer().units() → tile positions → transform to screen coords
@@ -643,10 +715,13 @@ async function extractGameState(page, botName) {
               if (screen && screen.x > 0 && screen.y > 0) {
                 const typeName =
                   typeof u.type === "function" ? u.type() : u.type;
+                const active =
+                  typeof u.isActive === "function" ? u.isActive() : true;
                 state.unitPositions.push({
                   x: screen.x,
                   y: screen.y,
                   type: typeName,
+                  active,
                 });
               }
             }
@@ -802,46 +877,98 @@ async function focusCanvas(page) {
   }
 }
 
-// Center camera on our territory.
-// Strategy: try clicking our row in the leaderboard (reliable), fall back to 'c' key.
+// Center camera on our territory using arrow keys + game API.
+// Computes our territory centroid in screen space, then pans to bring it to center.
+// Falls back to 'c' key if game API isn't available.
 async function centerCamera(page) {
-  // Method 1: Find our name in the leaderboard and click it
+  const panInfo = await safeEval(page, async () => {
+    const sidebar = document.querySelector("game-right-sidebar");
+    if (!sidebar?.game) return null;
+    const g = sidebar.game;
+    const buildMenu = document.querySelector("build-menu");
+    const th = buildMenu?.transformHandler;
+    if (!th) return null;
+    const me = g.myPlayer?.();
+    if (!me) return null;
+
+    // Compute centroid of our border tiles (approximates territory center)
+    let border = [];
+    try {
+      if (typeof me.borderTiles === "function") {
+        border = [...(await me.borderTiles()).borderTiles];
+      }
+    } catch (e) {}
+    if (border.length === 0) return null;
+
+    let sumX = 0,
+      sumY = 0,
+      count = 0;
+    const step = Math.max(1, Math.floor(border.length / 60));
+    for (let i = 0; i < border.length; i += step) {
+      sumX += g.x(border[i]);
+      sumY += g.y(border[i]);
+      count++;
+    }
+    const cwx = sumX / count,
+      cwy = sumY / count;
+    const screen = th.worldToScreenCoordinates({ x: cwx, y: cwy });
+    return {
+      ourX: screen.x,
+      ourY: screen.y,
+      vpW: window.innerWidth,
+      vpH: window.innerHeight,
+      gameScale: th.scale,
+    };
+  });
+
+  if (panInfo) {
+    // Sync actual game scale
+    if (panInfo.gameScale) currentScale = panInfo.gameScale;
+    const dx = panInfo.ourX - panInfo.vpW / 2;
+    const dy = panInfo.ourY - panInfo.vpH / 2;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 80) return; // already centered enough
+
+    // Pan with arrows: direction from screen center TOWARD our territory
+    const angle = Math.atan2(dy, dx);
+    const duration = Math.min(600, Math.max(100, dist * 0.4));
+    await panInDirection(page, angle, duration);
+    log(
+      `Center: panned ${duration.toFixed(0)}ms toward our territory (offset=${Math.round(dist)}px)`,
+    );
+    return;
+  }
+
+  // Fallback: try leaderboard click
   const clicked = await safeEval(
     page,
     (botName) => {
-      // The leaderboard rows contain player names. Find ours and click it.
       for (const el of document.querySelectorAll("*")) {
         const text = el.textContent?.trim() || "";
         const r = el.getBoundingClientRect();
-        // Leaderboard is in the top-left, rows are narrow
         if (r.x > window.innerWidth * 0.3 || r.y > window.innerHeight * 0.6)
           continue;
         if (r.width < 50 || r.height < 10 || r.height > 40) continue;
         if (text.includes(botName)) {
           el.click();
-          return {
-            x: r.x + r.width / 2,
-            y: r.y + r.height / 2,
-            method: "leaderboard",
-          };
+          return true;
         }
       }
       return null;
     },
     BOT_NAME,
   );
-
   if (clicked) {
-    log(`Center: clicked leaderboard row for "${BOT_NAME}"`);
     await sleep(800);
+    log("Center: leaderboard click fallback");
     return;
   }
 
-  // Method 2: Fall back to 'c' key
+  // Last resort: 'c' key
   await focusCanvas(page);
   await page.keyboard.press("c").catch(() => {});
   await sleep(800);
-  log("Center: used 'c' key fallback");
+  log("Center: 'c' key fallback");
 }
 
 // ── Zoom helpers ──────────────────────────────────────────────────
@@ -880,6 +1007,660 @@ function randomBorder(zone) {
     x: Math.max(zone.left, Math.min(zone.right, x)),
     y: Math.max(zone.top, Math.min(zone.bottom, y)),
   };
+}
+
+// ── Raycast helpers ──────────────────────────────────────────────
+// Walk from screen center outward along a direction until we leave our
+// territory color. Returns the first non-our-territory pixel as page
+// coordinates. Works at ANY zoom level because it reads actual pixels.
+
+async function raycastToBorder(page, angle) {
+  return safeEval(
+    page,
+    (angle) => {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return null;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      const W = canvas.width,
+        H = canvas.height;
+      const cx = Math.floor(W / 2),
+        cy = Math.floor(H / 2);
+
+      // Center pixel = our territory color (camera was centered on us)
+      const cd = ctx.getImageData(cx, cy, 1, 1).data;
+      const myR = cd[0],
+        myG = cd[1],
+        myB = cd[2];
+      if (myR + myG + myB < 60) return null;
+      if (myB > myR + myG + 50) return null;
+
+      const imgData = ctx.getImageData(0, 0, W, H).data;
+      const step = 5;
+      const maxDist = Math.max(W, H);
+      const cosA = Math.cos(angle),
+        sinA = Math.sin(angle);
+
+      for (let i = 3; i * step < maxDist; i++) {
+        const px = Math.floor(cx + cosA * i * step);
+        const py = Math.floor(cy + sinA * i * step);
+        if (px < 0 || px >= W || py < 0 || py >= H) break;
+
+        const idx = (py * W + px) * 4;
+        const dr = imgData[idx] - myR;
+        const dg = imgData[idx + 1] - myG;
+        const db = imgData[idx + 2] - myB;
+
+        if (Math.sqrt(dr * dr + dg * dg + db * db) > 45) {
+          // Found a non-our-territory pixel — step a bit further past the border
+          const landPx = Math.floor(cx + cosA * (i + 2) * step);
+          const landPy = Math.floor(cy + sinA * (i + 2) * step);
+          const clampedPx = Math.max(0, Math.min(W - 1, landPx));
+          const clampedPy = Math.max(0, Math.min(H - 1, landPy));
+
+          const rect = canvas.getBoundingClientRect();
+          return {
+            x: rect.left + (clampedPx / W) * rect.width,
+            y: rect.top + (clampedPy / H) * rect.height,
+            stepsToEdge: i,
+            angle: angle,
+          };
+        }
+      }
+      return null; // Our territory extends to screen edge in this direction
+    },
+    angle,
+  );
+}
+
+// Cast a fan of rays around centerAngle, return the hit with fewest steps
+// (closest border point roughly in the target's direction).
+async function raycastFan(page, centerAngle, fanDeg = 40, numRays = 9) {
+  return safeEval(
+    page,
+    (centerAngle, fanRad, numRays) => {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return null;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      const W = canvas.width,
+        H = canvas.height;
+      const cx = Math.floor(W / 2),
+        cy = Math.floor(H / 2);
+
+      const cd = ctx.getImageData(cx, cy, 1, 1).data;
+      const myR = cd[0],
+        myG = cd[1],
+        myB = cd[2];
+      if (myR + myG + myB < 60) return null;
+      if (myB > myR + myG + 50) return null;
+
+      const imgData = ctx.getImageData(0, 0, W, H).data;
+      const step = 5;
+      const maxDist = Math.max(W, H);
+      const rect = canvas.getBoundingClientRect();
+
+      let bestHit = null;
+      let bestSteps = Infinity;
+
+      for (let r = 0; r < numRays; r++) {
+        const angle = centerAngle + (r / (numRays - 1) - 0.5) * fanRad;
+        const cosA = Math.cos(angle),
+          sinA = Math.sin(angle);
+
+        for (let i = 3; i * step < maxDist; i++) {
+          const px = Math.floor(cx + cosA * i * step);
+          const py = Math.floor(cy + sinA * i * step);
+          if (px < 0 || px >= W || py < 0 || py >= H) break;
+
+          const idx = (py * W + px) * 4;
+          const dr = imgData[idx] - myR;
+          const dg = imgData[idx + 1] - myG;
+          const db = imgData[idx + 2] - myB;
+
+          if (Math.sqrt(dr * dr + dg * dg + db * db) > 45) {
+            if (i < bestSteps) {
+              const landPx = Math.floor(cx + cosA * (i + 2) * step);
+              const landPy = Math.floor(cy + sinA * (i + 2) * step);
+              const clampedPx = Math.max(0, Math.min(W - 1, landPx));
+              const clampedPy = Math.max(0, Math.min(H - 1, landPy));
+              bestSteps = i;
+              bestHit = {
+                x: rect.left + (clampedPx / W) * rect.width,
+                y: rect.top + (clampedPy / H) * rect.height,
+                stepsToEdge: i,
+                angle: angle,
+              };
+            }
+            break;
+          }
+        }
+      }
+      return bestHit;
+    },
+    centerAngle,
+    (fanDeg * Math.PI) / 180,
+    numRays,
+  );
+}
+
+// ── Pan helpers ──────────────────────────────────────────────────
+// Hold arrow keys to pan camera in a direction. The game's InputHandler
+// pans every frame while keys are held, so holding for ~400ms moves
+// roughly half a screen at typical zoom.
+
+async function panInDirection(page, angle, durationMs = 400) {
+  await focusCanvas(page);
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+
+  // Map angle to arrow keys (can press two for diagonal)
+  const keys = [];
+  if (cos > 0.4) keys.push("ArrowRight");
+  if (cos < -0.4) keys.push("ArrowLeft");
+  if (sin > 0.4) keys.push("ArrowDown");
+  if (sin < -0.4) keys.push("ArrowUp");
+  if (keys.length === 0) keys.push("ArrowRight"); // fallback
+
+  for (const k of keys) await page.keyboard.down(k);
+  await sleep(durationMs);
+  for (const k of keys) await page.keyboard.up(k);
+  await sleep(150);
+}
+
+// After panning, screen center might not be our territory anymore.
+// This scanner doesn't assume center = ours. Instead it takes our known
+// territory color (from before the pan) and scans for the first non-matching,
+// non-water pixel — that's a clickable enemy/wilderness tile.
+// If center IS still ours, it raycasts outward like before.
+// If center is NOT ours, it clicks center directly (we panned onto enemy territory).
+async function findClickAfterPan(page, myColorRGB, targetAngle) {
+  return safeEval(
+    page,
+    (myR, myG, myB, targetAngle) => {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return null;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      const W = canvas.width,
+        H = canvas.height;
+      const cx = Math.floor(W / 2),
+        cy = Math.floor(H / 2);
+      const rect = canvas.getBoundingClientRect();
+
+      // Check if center is still our territory
+      const cd = ctx.getImageData(cx, cy, 1, 1).data;
+      const dr = cd[0] - myR,
+        dg = cd[1] - myG,
+        db = cd[2] - myB;
+      const centerIsOurs = Math.sqrt(dr * dr + dg * dg + db * db) < 45;
+
+      // Skip water check
+      const isWater = (r, g, b) => r + g + b < 60 || b > r + g + 50;
+
+      if (!centerIsOurs && !isWater(cd[0], cd[1], cd[2])) {
+        // We panned past our border — center is enemy/wilderness. Click here!
+        return {
+          x: rect.left + (cx / W) * rect.width,
+          y: rect.top + (cy / H) * rect.height,
+          stepsToEdge: 0,
+          method: "pan-center-is-enemy",
+        };
+      }
+
+      if (!centerIsOurs) {
+        // Center is water after pan — scan radially for any land
+        const imgData = ctx.getImageData(0, 0, W, H).data;
+        const step = 8;
+        for (let deg = 0; deg < 360; deg += 30) {
+          const a = (deg * Math.PI) / 180;
+          const cosA = Math.cos(a),
+            sinA = Math.sin(a);
+          for (let i = 5; i * step < Math.max(W, H) / 2; i++) {
+            const px = Math.floor(cx + cosA * i * step);
+            const py = Math.floor(cy + sinA * i * step);
+            if (px < 0 || px >= W || py < 0 || py >= H) break;
+            const idx = (py * W + px) * 4;
+            const r = imgData[idx],
+              g = imgData[idx + 1],
+              b = imgData[idx + 2];
+            if (!isWater(r, g, b)) {
+              // Check it's not our territory
+              const ddr = r - myR,
+                ddg = g - myG,
+                ddb = b - myB;
+              if (Math.sqrt(ddr * ddr + ddg * ddg + ddb * ddb) > 45) {
+                return {
+                  x: rect.left + (px / W) * rect.width,
+                  y: rect.top + (py / H) * rect.height,
+                  stepsToEdge: i,
+                  method: "pan-scan-land",
+                };
+              }
+            }
+          }
+        }
+        return null;
+      }
+
+      // Center is still ours — raycast outward in a fan toward target
+      const imgData = ctx.getImageData(0, 0, W, H).data;
+      const step = 5;
+      const fanRad = (80 * Math.PI) / 180; // wider fan after pan
+      const numRays = 13;
+      let bestHit = null;
+      let bestSteps = Infinity;
+
+      for (let r = 0; r < numRays; r++) {
+        const angle = targetAngle + (r / (numRays - 1) - 0.5) * fanRad;
+        const cosA = Math.cos(angle),
+          sinA = Math.sin(angle);
+        for (let i = 3; i * step < Math.max(W, H); i++) {
+          const px = Math.floor(cx + cosA * i * step);
+          const py = Math.floor(cy + sinA * i * step);
+          if (px < 0 || px >= W || py < 0 || py >= H) break;
+          const idx = (py * W + px) * 4;
+          const ddr = imgData[idx] - myR;
+          const ddg = imgData[idx + 1] - myG;
+          const ddb = imgData[idx + 2] - myB;
+          if (Math.sqrt(ddr * ddr + ddg * ddg + ddb * ddb) > 45) {
+            if (i < bestSteps) {
+              const landPx = Math.floor(cx + cosA * (i + 2) * step);
+              const landPy = Math.floor(cy + sinA * (i + 2) * step);
+              bestSteps = i;
+              bestHit = {
+                x:
+                  rect.left +
+                  (Math.max(0, Math.min(W - 1, landPx)) / W) * rect.width,
+                y:
+                  rect.top +
+                  (Math.max(0, Math.min(H - 1, landPy)) / H) * rect.height,
+                stepsToEdge: i,
+                method: "pan-raycast",
+              };
+            }
+            break;
+          }
+        }
+      }
+      return bestHit;
+    },
+    myColorRGB?.r ?? 128,
+    myColorRGB?.g ?? 128,
+    myColorRGB?.b ?? 128,
+    targetAngle,
+  );
+}
+
+// Read our territory color from screen center (call while centered on our territory)
+async function readOurColor(page) {
+  return safeEval(page, () => {
+    const canvas = document.querySelector("canvas");
+    if (!canvas) return null;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    const W = canvas.width,
+      H = canvas.height;
+    const cd = ctx.getImageData(
+      Math.floor(W / 2),
+      Math.floor(H / 2),
+      1,
+      1,
+    ).data;
+    if (cd[0] + cd[1] + cd[2] < 60) return null;
+    if (cd[2] > cd[0] + cd[1] + 50) return null;
+    return { r: cd[0], g: cd[1], b: cd[2] };
+  });
+}
+
+// ── Game-API-based targeting ─────────────────────────────────────
+// These functions use the game engine's internal state to compute exact
+// screen coordinates for click targets. No pixel scanning needed.
+
+// Compute the screen position for attacking a target player.
+// Uses borderTiles() to find the closest enemy tile to our border,
+// then worldToScreenCoordinates to get exact screen position.
+// Returns { x, y, onScreen, method } or null if game API unavailable.
+async function getAttackClickPos(page, targetName) {
+  return safeEval(
+    page,
+    async (targetName) => {
+      try {
+        const sidebar = document.querySelector("game-right-sidebar");
+        if (!sidebar?.game) return null;
+        const g = sidebar.game;
+        const buildMenu = document.querySelector("build-menu");
+        const th = buildMenu?.transformHandler;
+        if (!th) return null;
+        const me = g.myPlayer?.();
+        if (!me) return null;
+
+        // Find target player from leaderboard or game API neighbors
+        let target = null;
+
+        // Try leaderboard first (has PlayerView objects)
+        const lb = document.querySelector("leader-board");
+        if (lb?.players) {
+          for (const entry of lb.players) {
+            if (entry.name === targetName && entry.player) {
+              target = entry.player;
+              break;
+            }
+          }
+        }
+
+        // Fallback: search all game players (works for ALL players, not just top 10)
+        if (!target && typeof g.players === "function") {
+          try {
+            for (const n of g.players()) {
+              const dn =
+                typeof n.displayName === "function" ? n.displayName() : "";
+              if (dn === targetName) {
+                target = n;
+                break;
+              }
+            }
+          } catch (e) {}
+        }
+
+        if (!target) return null;
+
+        // Get border tiles for both players (async on client)
+        let ourBorder = [];
+        try {
+          if (typeof me.borderTiles === "function") {
+            ourBorder = [...(await me.borderTiles()).borderTiles];
+          }
+        } catch (e) {
+          return null;
+        }
+
+        let targetBorder = [];
+        try {
+          if (typeof target.borderTiles === "function") {
+            targetBorder = [...(await target.borderTiles()).borderTiles];
+          }
+        } catch (e) {}
+
+        const vw = window.innerWidth,
+          vh = window.innerHeight;
+
+        if (targetBorder.length > 0 && ourBorder.length > 0) {
+          // Find closest pair of border tiles (sample for perf)
+          const s1 = Math.max(1, Math.floor(ourBorder.length / 80));
+          const s2 = Math.max(1, Math.floor(targetBorder.length / 80));
+          let bestDist = Infinity,
+            bestTile = null;
+
+          for (let i = 0; i < ourBorder.length; i += s1) {
+            const ox = g.x(ourBorder[i]),
+              oy = g.y(ourBorder[i]);
+            for (let j = 0; j < targetBorder.length; j += s2) {
+              const tx = g.x(targetBorder[j]),
+                ty = g.y(targetBorder[j]);
+              const d = Math.abs(ox - tx) + Math.abs(oy - ty);
+              if (d < bestDist) {
+                bestDist = d;
+                bestTile = targetBorder[j];
+              }
+            }
+          }
+
+          if (bestTile != null) {
+            // Also find the closest OUR border tile to this target border tile
+            let bestOurs = ourBorder[0];
+            let bestOursDist = Infinity;
+            const tx = g.x(bestTile),
+              ty = g.y(bestTile);
+            for (let i = 0; i < ourBorder.length; i += s1) {
+              const d =
+                Math.abs(g.x(ourBorder[i]) - tx) +
+                Math.abs(g.y(ourBorder[i]) - ty);
+              if (d < bestOursDist) {
+                bestOursDist = d;
+                bestOurs = ourBorder[i];
+              }
+            }
+            // Click on the target border tile, with screen coords shifted slightly
+            // AWAY from our tile to ensure we land on their side
+            const targetScreen = th.worldToScreenCoordinates({ x: tx, y: ty });
+            const ourScreen = th.worldToScreenCoordinates({
+              x: g.x(bestOurs),
+              y: g.y(bestOurs),
+            });
+            const dx = targetScreen.x - ourScreen.x;
+            const dy = targetScreen.y - ourScreen.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            // Offset 15px further into target territory
+            const fx = targetScreen.x + (dx / len) * 15;
+            const fy = targetScreen.y + (dy / len) * 15;
+            return {
+              x: fx,
+              y: fy,
+              onScreen: fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
+              method: "border-tiles",
+            };
+          }
+        }
+
+        // Fallback: use target's territory centroid
+        if (targetBorder.length > 0) {
+          let sx = 0,
+            sy = 0,
+            c = 0;
+          const step = Math.max(1, Math.floor(targetBorder.length / 30));
+          for (let i = 0; i < targetBorder.length; i += step) {
+            sx += g.x(targetBorder[i]);
+            sy += g.y(targetBorder[i]);
+            c++;
+          }
+          const screen = th.worldToScreenCoordinates({ x: sx / c, y: sy / c });
+          return {
+            x: screen.x,
+            y: screen.y,
+            onScreen:
+              screen.x > 50 &&
+              screen.x < vw - 50 &&
+              screen.y > 30 &&
+              screen.y < vh - 100,
+            method: "target-centroid",
+          };
+        }
+
+        return null;
+      } catch (e) {
+        return null;
+      }
+    },
+    targetName,
+  );
+}
+
+// Compute direction from viewport center to a target's territory.
+// Returns angle in radians, or null. Used for panning toward off-screen targets.
+async function getDirectionToTarget(page, targetName) {
+  return safeEval(
+    page,
+    async (targetName) => {
+      try {
+        const sidebar = document.querySelector("game-right-sidebar");
+        if (!sidebar?.game) return null;
+        const g = sidebar.game;
+        const buildMenu = document.querySelector("build-menu");
+        const th = buildMenu?.transformHandler;
+        if (!th) return null;
+
+        // Find target from leaderboard or game API
+        let target = null;
+        const lb = document.querySelector("leader-board");
+        if (lb?.players) {
+          for (const entry of lb.players) {
+            if (entry.name === targetName && entry.player) {
+              target = entry.player;
+              break;
+            }
+          }
+        }
+        if (!target && typeof g.players === "function") {
+          try {
+            for (const n of g.players()) {
+              const dn =
+                typeof n.displayName === "function" ? n.displayName() : "";
+              if (dn === targetName) {
+                target = n;
+                break;
+              }
+            }
+          } catch (e) {}
+        }
+        if (!target) return null;
+
+        let targetBorder = [];
+        try {
+          if (typeof target.borderTiles === "function") {
+            targetBorder = [...(await target.borderTiles()).borderTiles];
+          }
+        } catch (e) {}
+        if (targetBorder.length === 0) return null;
+
+        // Compute target centroid screen position
+        let sx = 0,
+          sy = 0,
+          c = 0;
+        const step = Math.max(1, Math.floor(targetBorder.length / 20));
+        for (let i = 0; i < targetBorder.length; i += step) {
+          sx += g.x(targetBorder[i]);
+          sy += g.y(targetBorder[i]);
+          c++;
+        }
+        const screen = th.worldToScreenCoordinates({ x: sx / c, y: sy / c });
+        const dx = screen.x - window.innerWidth / 2;
+        const dy = screen.y - window.innerHeight / 2;
+        return Math.atan2(dy, dx);
+      } catch (e) {
+        return null;
+      }
+    },
+    targetName,
+  );
+}
+
+// Get a good screen position for placing a building.
+// Uses our own border/interior tiles + worldToScreenCoordinates.
+async function getBuildClickPos(page, isBorderBuilding) {
+  return safeEval(
+    page,
+    async (isBorderBuilding) => {
+      try {
+        const sidebar = document.querySelector("game-right-sidebar");
+        if (!sidebar?.game) return null;
+        const g = sidebar.game;
+        const buildMenu = document.querySelector("build-menu");
+        const th = buildMenu?.transformHandler;
+        if (!th) return null;
+        const me = g.myPlayer?.();
+        if (!me) return null;
+
+        let border = [];
+        try {
+          if (typeof me.borderTiles === "function") {
+            const bt = await me.borderTiles();
+            border = bt?.borderTiles ? [...bt.borderTiles] : [];
+          }
+        } catch (e) {}
+        if (border.length === 0) return null;
+
+        const vw = window.innerWidth,
+          vh = window.innerHeight;
+
+        // Find which of our border tiles are adjacent to enemy territory
+        // by checking ownerID of neighboring tiles (no need to fetch enemy borderTiles)
+        const mySmallID = typeof me.smallID === "function" ? me.smallID() : -1;
+        const enemyAdjacentBorder = []; // our border tiles that touch enemy
+        try {
+          const step = Math.max(1, Math.floor(border.length / 200));
+          for (let i = 0; i < border.length; i += step) {
+            const bt = border[i];
+            const adjTiles = g.neighbors(bt);
+            for (const adj of adjTiles) {
+              const oid = g.ownerID(adj);
+              if (oid !== 0 && oid !== mySmallID) {
+                enemyAdjacentBorder.push(bt);
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+
+        // Get existing unit positions to avoid stacking
+        const unitWorldPositions = [];
+        try {
+          const myUnits = typeof me.units === "function" ? me.units() : [];
+          for (const u of myUnits) {
+            const t = typeof u.tile === "function" ? u.tile() : null;
+            if (t != null) {
+              unitWorldPositions.push({ x: g.x(t), y: g.y(t) });
+            }
+          }
+        } catch (e) {}
+
+        // Separate border tiles into enemy-adjacent (for defenses) and safe (for cities)
+        const enemySet = new Set(enemyAdjacentBorder);
+        const nearEnemy = [];
+        const safe = [];
+        const MIN_UNIT_DIST = 8;
+        const step2 = Math.max(1, Math.floor(border.length / 100));
+        for (let i = 0; i < border.length; i += step2) {
+          const t = border[i];
+          const tx = g.x(t),
+            ty = g.y(t);
+          let tooClose = false;
+          for (const u of unitWorldPositions) {
+            if (Math.abs(tx - u.x) + Math.abs(ty - u.y) < MIN_UNIT_DIST) {
+              tooClose = true;
+              break;
+            }
+          }
+          if (tooClose) continue;
+          const screen = th.worldToScreenCoordinates({ x: tx, y: ty });
+          const onScreen =
+            screen.x > 80 &&
+            screen.x < vw - 80 &&
+            screen.y > 50 &&
+            screen.y < vh - 120;
+          if (!onScreen) continue;
+          const pos = { x: screen.x, y: screen.y };
+          if (enemySet.has(t)) nearEnemy.push(pos);
+          else safe.push(pos);
+        }
+
+        if (isBorderBuilding) {
+          // Defense/SAM/Port: place near enemy border
+          const pool = nearEnemy.length > 0 ? nearEnemy : safe;
+          if (pool.length === 0) return null;
+          return pool[Math.floor(Math.random() * pool.length)];
+        } else {
+          // City/Factory/Silo: place far from enemy (safe interior)
+          const pool = safe.length > 0 ? safe : nearEnemy;
+          if (pool.length === 0) return null;
+          return pool[Math.floor(Math.random() * pool.length)];
+        }
+      } catch (e) {
+        return null;
+      }
+    },
+    isBorderBuilding,
+  );
+}
+
+// Check if a point is too close to an existing unit (for build placement)
+function isNearUnit(x, y, unitPositions, minDist = 35) {
+  for (const u of unitPositions) {
+    const dx = x - u.x;
+    const dy = y - u.y;
+    if (dx * dx + dy * dy < minDist * minDist) return true;
+  }
+  return false;
 }
 
 // ── Execute RL action via keyboard/mouse ─────────────────────────
@@ -938,6 +1719,7 @@ async function executeRLAction(
   neighbors,
   unitPositions,
   gameState,
+  cachedNeighborDirections,
 ) {
   if (!action || !zone) return;
 
@@ -968,45 +1750,199 @@ async function executeRLAction(
       await sleep(30);
     }
 
-    // Aim toward the target neighbor's screen position (from NameLayer labels)
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
-    let x, y;
-    // Use our actual label position if available, otherwise fall back to zone center
     const originX = gameState?.myLabelX || zone.cx;
     const originY = gameState?.myLabelY || zone.cy;
-    if (target && target.labelX && target.labelY) {
-      const dx = target.labelX - originX;
-      const dy = target.labelY - originY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist > 10) {
-        // Click 55-70% of the way from our center to the target's center.
-        // This naturally scales with zoom level and lands near/past our border.
-        const frac = 0.55 + Math.random() * 0.15;
-        x = originX + dx * frac;
-        y = originY + dy * frac;
+
+    let x, y;
+    let method = "none";
+    let didPan = false;
+
+    // PRIMARY: Use game API for precise targeting (works for ALL neighbor players)
+    // Get position RIGHT before clicking to minimize camera drift
+    const apiPos = target ? await getAttackClickPos(page, target.name) : null;
+    if (apiPos && apiPos.onScreen) {
+      x = apiPos.x;
+      y = apiPos.y;
+      method = `api-${apiPos.method}`;
+    } else if (apiPos && !apiPos.onScreen) {
+      // Target exists but is off-screen — pan toward it
+      const dir = await getDirectionToTarget(page, target.name);
+      if (dir !== null) {
+        await panInDirection(page, dir, 600);
+        didPan = true;
+        const apiPos2 = await getAttackClickPos(page, target.name);
+        if (apiPos2) {
+          x = apiPos2.x + (Math.random() - 0.5) * 20;
+          y = apiPos2.y + (Math.random() - 0.5) * 20;
+          method = `pan+api-${apiPos2.method}`;
+        } else {
+          x = zone.cx + Math.cos(dir) * zone.width * 0.4;
+          y = zone.cy + Math.sin(dir) * zone.height * 0.4;
+          method = "pan+api-edge";
+        }
       } else {
-        // Target is very close to center — fall back to random border
-        ({ x, y } = randomBorder(zone));
+        // API found player but can't get direction — use label as fallback
+        if (target.labelX && target.labelY) {
+          x = target.labelX + (Math.random() - 0.5) * 30;
+          y = target.labelY + (Math.random() - 0.5) * 30;
+          method = "label";
+        } else {
+          x = apiPos.x;
+          y = apiPos.y;
+          method = "api-offscreen";
+        }
       }
+    } else if (target && target.labelX && target.labelY) {
+      // Fallback: label click (works for visible players)
+      x = target.labelX + (Math.random() - 0.5) * 30;
+      y = target.labelY + (Math.random() - 0.5) * 30;
+      method = "label";
     } else {
-      // No position data for target — fall back to random border
       ({ x, y } = randomBorder(zone));
-      log(
-        `RL: Warning — no label position for target ${target?.name || targetIdx}`,
-      );
+      method = "random-fallback";
+      log(`RL: Warning — no targeting data for ${target?.name || targetIdx}`);
     }
 
     // Clamp to safe zone to avoid clicking UI elements
     x = Math.max(zone.left, Math.min(zone.right, x));
     y = Math.max(zone.top, Math.min(zone.bottom, y));
+
+    // NEVER click on leaderboard — if target is behind it, pan camera instead
+    const lbBounds = await safeEval(page, () => {
+      const lb = document.querySelector("leader-board");
+      if (!lb) return null;
+      const rect = lb.getBoundingClientRect();
+      if (rect.width === 0) return null;
+      return { right: rect.right + 15, bottom: rect.bottom + 15 };
+    });
+    if (lbBounds && x < lbBounds.right && y < lbBounds.bottom) {
+      // Target is behind leaderboard — pan away from it
+      log(`RL: Attack target behind leaderboard, panning right`);
+      await panInDirection(page, 0, 400); // pan right
+      // Re-query position after pan
+      const apiPos3 = target
+        ? await getAttackClickPos(page, target.name)
+        : null;
+      if (apiPos3 && apiPos3.onScreen) {
+        x = apiPos3.x;
+        y = apiPos3.y;
+        // Re-check leaderboard
+        const lb2 = await safeEval(page, () => {
+          const lb = document.querySelector("leader-board");
+          if (!lb) return null;
+          const rect = lb.getBoundingClientRect();
+          return rect.width > 0
+            ? { right: rect.right + 15, bottom: rect.bottom + 15 }
+            : null;
+        });
+        if (lb2 && x < lb2.right && y < lb2.bottom) {
+          log(`RL: Attack still behind leaderboard, skipping`);
+          return;
+        }
+        didPan = true;
+      } else {
+        log(`RL: Target off-screen after pan, skipping`);
+        return;
+      }
+    }
+
+    // Count outgoing attacks before clicking
+    const outBefore =
+      (await safeEval(page, () => {
+        const d = document.querySelector("attacks-display");
+        if (!d) return 0;
+        let c = 0;
+        if (d.outgoingAttacks) c += d.outgoingAttacks.length;
+        if (d.outgoingLandAttacks) c += d.outgoingLandAttacks.length;
+        if (d.outgoingBoats) c += d.outgoingBoats.length;
+        return c;
+      })) || 0;
+
     await page.mouse.click(x, y);
-    await sleep(50);
+    await sleep(150);
     const targetName = target ? target.name : "unknown";
-    const hasLabel = !!(target && target.labelX && target.labelY);
-    log(
-      `RL: Attack ${targetName} at (${Math.round(x)},${Math.round(y)}) from (${Math.round(originX)},${Math.round(originY)}) ratio=${troopFraction} label=${hasLabel}`,
+    await showDebugMarker(
+      page,
+      x,
+      y,
+      originX,
+      originY,
+      `ATK → ${targetName} (${method})`,
+      "red",
     );
+
+    // Check if attack actually started
+    const outAfter =
+      (await safeEval(page, () => {
+        const d = document.querySelector("attacks-display");
+        if (!d) return 0;
+        let c = 0;
+        if (d.outgoingAttacks) c += d.outgoingAttacks.length;
+        if (d.outgoingLandAttacks) c += d.outgoingLandAttacks.length;
+        if (d.outgoingBoats) c += d.outgoingBoats.length;
+        return c;
+      })) || 0;
+
+    if (outAfter <= outBefore && target) {
+      // Attack didn't start — zoom in for precision, retry, zoom back out
+      log(`RL: Attack miss on ${targetName}, zooming in to retry`);
+      for (let i = 0; i < 4; i++) await zoomStep(page, -100); // zoom in 4 steps
+      await sleep(100);
+      // Re-focus canvas and re-set troop ratio (zoom may have unfocused)
+      await focusCanvas(page);
+      const retrySteps = Math.round((troopFraction - currentAttackRatio) / 0.1);
+      if (retrySteps !== 0) {
+        const key = retrySteps > 0 ? "y" : "t";
+        for (let i = 0; i < Math.abs(retrySteps); i++)
+          await page.keyboard.press(key);
+        currentAttackRatio = troopFraction;
+        await sleep(30);
+      }
+      const retryPos = await getAttackClickPos(page, target.name);
+      if (retryPos && retryPos.onScreen) {
+        // Check leaderboard before retry click
+        const lb3 = await safeEval(page, () => {
+          const lb = document.querySelector("leader-board");
+          if (!lb) return null;
+          const rect = lb.getBoundingClientRect();
+          return rect.width > 0
+            ? { right: rect.right + 15, bottom: rect.bottom + 15 }
+            : null;
+        });
+        if (lb3 && retryPos.x < lb3.right && retryPos.y < lb3.bottom) {
+          log(`RL: Retry target behind leaderboard, skipping`);
+        } else {
+          await page.mouse.click(retryPos.x, retryPos.y);
+          await sleep(150);
+          await showDebugMarker(
+            page,
+            retryPos.x,
+            retryPos.y,
+            originX,
+            originY,
+            `ATK retry → ${targetName}`,
+            "orange",
+          );
+          log(
+            `RL: Attack retry ${targetName} at (${Math.round(retryPos.x)},${Math.round(retryPos.y)})`,
+          );
+        }
+      }
+      // Zoom back out and recenter
+      for (let i = 0; i < 4; i++) await zoomStep(page, 100);
+      await centerCamera(page);
+    } else {
+      log(
+        `RL: Attack ${targetName} at (${Math.round(x)},${Math.round(y)}) ratio=${troopFraction} method=${method}`,
+      );
+    }
+
+    // If we panned for this attack, recenter so subsequent actions work correctly
+    if (didPan) {
+      await centerCamera(page);
+    }
   } else if (actionType === ACTION_RETREAT) {
     // Click the ❌ button on the most recent outgoing attack in attacks-display
     const retreated = await safeEval(page, () => {
@@ -1031,79 +1967,152 @@ async function executeRLAction(
       log(
         `RL: Skip build ${name} — need ${(minGold / 1000).toFixed(0)}K gold, have ${(gold / 1000).toFixed(0)}K. Expanding instead.`,
       );
+      // Use raycast to find border and expand
       for (let i = 0; i < 5; i++) {
-        const { x, y } = randomBorder(zone);
-        await page.mouse.click(x, y);
-        await sleep(50);
+        const angle = Math.random() * Math.PI * 2;
+        const hit = await raycastToBorder(page, angle);
+        if (hit) {
+          const cx = Math.max(zone.left, Math.min(zone.right, hit.x));
+          const cy = Math.max(zone.top, Math.min(zone.bottom, hit.y));
+          await page.mouse.click(cx, cy);
+          await sleep(50);
+        }
       }
       return;
     }
 
-    // Center + zoom in very close so our territory fills the screen
     await centerCamera(page);
-    const savedScale = currentScale;
-    const targetBuildScale = 1.5; // very zoomed in — territory must fill viewport
-    const zoomInSteps = Math.max(
-      0,
-      Math.round(Math.log(currentScale / targetBuildScale) / Math.log(1.2)),
-    );
-    for (let i = 0; i < Math.min(zoomInSteps, 15); i++)
-      await zoomStep(page, -100);
-    await sleep(200);
-
-    const box2 = await getCanvasBounds(page);
-    if (!box2) return;
-    const trueCx = box2.x + box2.width / 2;
-    const trueCy = box2.y + box2.height / 2;
 
     const isBorderBuilding =
       actionType === ACTION_BUILD_DEFENSE ||
       actionType === ACTION_BUILD_SAM ||
       actionType === ACTION_BUILD_PORT;
 
-    // At high zoom, our territory should fill most of screen after centering
-    // Just click near center (interior) or slightly off-center (border)
-    let spot;
-    if (isBorderBuilding) {
-      const angle = Math.random() * Math.PI * 2;
-      const dist = 60 + Math.random() * 40;
-      spot = {
-        x: trueCx + Math.cos(angle) * dist,
-        y: trueCy + Math.sin(angle) * dist,
-      };
+    // PRIMARY: Use game API to find a good build position (screen coords at current zoom)
+    const apiBuildPos = await getBuildClickPos(page, isBorderBuilding);
+
+    // Helper: attempt a build click at (bx, by) — press key, click, check gold
+    const tryBuild = async (bx, by, method) => {
+      await page.mouse.move(bx, by);
+      await sleep(100);
+      await focusCanvas(page);
+      await page.keyboard.press(key).catch(() => {});
+      await sleep(500);
+      await page.mouse.click(bx, by);
+      await sleep(300);
+      await page.keyboard.press("Escape").catch(() => {});
+      // Check if gold decreased (= build succeeded)
+      const newGold = await safeEval(page, () => {
+        const sb = document.querySelector("game-right-sidebar");
+        const me = sb?.game?.myPlayer?.();
+        return me ? Number(me.gold()) : null;
+      });
+      const succeeded = newGold !== null && newGold < gold - 1000;
+      await showDebugMarker(
+        page,
+        bx,
+        by,
+        bx,
+        by,
+        `BUILD ${name} (${method}${succeeded ? "" : " MISS"})`,
+        succeeded ? "lime" : "yellow",
+      );
+      return succeeded;
+    };
+
+    if (apiBuildPos) {
+      let built = await tryBuild(apiBuildPos.x, apiBuildPos.y, "api");
+      if (!built) {
+        // Retry: zoom in for precision
+        log(`RL: Build ${name} miss, zooming in to retry`);
+        for (let i = 0; i < 4; i++) await zoomStep(page, -100);
+        await sleep(100);
+        await centerCamera(page);
+        const retryPos = await getBuildClickPos(page, isBorderBuilding);
+        if (retryPos) {
+          built = await tryBuild(retryPos.x, retryPos.y, "api-retry");
+        }
+        for (let i = 0; i < 4; i++) await zoomStep(page, 100);
+      }
+      lastBuildResult = built ? "success" : "fail";
+      lastActionSucceeded = built;
+      log(
+        `RL: Build ${name} at (${Math.round(apiBuildPos.x)},${Math.round(apiBuildPos.y)}) method=api ${built ? "✓" : "✗"} [gold=${(gold / 1000).toFixed(0)}K]`,
+      );
     } else {
-      spot = {
-        x: trueCx + (Math.random() - 0.5) * 60,
-        y: trueCy + (Math.random() - 0.5) * 60,
-      };
+      // FALLBACK: Zoom in and pick random spots near center
+      const savedScale = currentScale;
+      const targetBuildScale = 1.5;
+      const zoomInSteps = Math.max(
+        0,
+        Math.round(Math.log(currentScale / targetBuildScale) / Math.log(1.2)),
+      );
+      for (let i = 0; i < Math.min(zoomInSteps, 15); i++)
+        await zoomStep(page, -100);
+      await sleep(200);
+
+      const box2 = await getCanvasBounds(page);
+      if (!box2) return;
+      const trueCx = box2.x + box2.width / 2;
+      const trueCy = box2.y + box2.height / 2;
+
+      const currentUnits = unitPositions || [];
+      let spot = null;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        let candidate;
+        if (isBorderBuilding) {
+          const angle = Math.random() * Math.PI * 2;
+          const dist = 50 + Math.random() * 50;
+          candidate = {
+            x: trueCx + Math.cos(angle) * dist,
+            y: trueCy + Math.sin(angle) * dist,
+          };
+        } else {
+          candidate = {
+            x: trueCx + (Math.random() - 0.5) * 100,
+            y: trueCy + (Math.random() - 0.5) * 100,
+          };
+        }
+        if (!isNearUnit(candidate.x, candidate.y, currentUnits)) {
+          spot = candidate;
+          break;
+        }
+      }
+      if (!spot) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 70 + Math.random() * 50;
+        spot = {
+          x: trueCx + Math.cos(angle) * dist,
+          y: trueCy + Math.sin(angle) * dist,
+        };
+      }
+
+      let built = await tryBuild(spot.x, spot.y, "fallback");
+      if (!built) {
+        // Retry with a different spot
+        log(`RL: Build ${name} fallback miss, retrying different spot`);
+        const angle2 = Math.random() * Math.PI * 2;
+        const dist2 = 40 + Math.random() * 40;
+        const spot2 = {
+          x: trueCx + Math.cos(angle2) * dist2,
+          y: trueCy + Math.sin(angle2) * dist2,
+        };
+        built = await tryBuild(spot2.x, spot2.y, "fallback-retry");
+      }
+      lastBuildResult = built ? "success" : "fail";
+      lastActionSucceeded = built;
+      log(
+        `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) method=fallback ${built ? "✓" : "✗"} [gold=${(gold / 1000).toFixed(0)}K]`,
+      );
+
+      // Zoom back out
+      const zoomOutSteps = Math.max(
+        0,
+        Math.round(Math.log(currentScale / savedScale) / Math.log(1.2)),
+      );
+      for (let i = 0; i < Math.min(zoomOutSteps, 15); i++)
+        await zoomStep(page, 100);
     }
-
-    // Step 1: Move mouse to spot
-    await page.mouse.move(spot.x, spot.y);
-    await sleep(100);
-    // Step 2: Press build key → ghost structure appears at mouse location
-    await focusCanvas(page);
-    await page.keyboard.press(key).catch(() => {});
-    await sleep(500);
-    // Step 3: Click to confirm placement
-    await page.mouse.click(spot.x, spot.y);
-    await sleep(200);
-    // Step 4: Escape to exit build mode if placement failed
-    await page.keyboard.press("Escape").catch(() => {});
-    // Track build feedback: if gold dropped significantly, build likely succeeded
-    lastBuildResult = "none"; // will be updated on next extractGameState
-    lastActionSucceeded = true; // optimistic — model learns from actual results
-    log(
-      `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) scale=${currentScale.toFixed(1)} [gold=${(gold / 1000).toFixed(0)}K]`,
-    );
-
-    // Zoom back out to previous level
-    const zoomOutSteps = Math.max(
-      0,
-      Math.round(Math.log(currentScale / savedScale) / Math.log(1.2)),
-    );
-    for (let i = 0; i < Math.min(zoomOutSteps, 15); i++)
-      await zoomStep(page, 100);
   } else if (NUKE_KEYS[actionType]) {
     const { key, name, minGold } = NUKE_KEYS[actionType];
     if (gold < minGold) {
@@ -1113,20 +2122,87 @@ async function executeRLAction(
     // Nukes: press key, then click on enemy territory
     await page.keyboard.press(key).catch(() => {});
     await sleep(300);
-    // Aim toward target player's label position
+
+    // Aim toward target player using game API first
     const nukeTargetIdx = action.targetIdx || 0;
     const nukeTarget = neighbors[nukeTargetIdx];
     let nx, ny;
-    if (nukeTarget && nukeTarget.labelX && nukeTarget.labelY) {
-      // Click near/at the target's label (their territory center)
-      nx = nukeTarget.labelX + (Math.random() - 0.5) * 40;
-      ny = nukeTarget.labelY + (Math.random() - 0.5) * 40;
+    let nukeMethod = "random";
+
+    // Try game API for target position
+    const nukeApiPos = nukeTarget
+      ? await getAttackClickPos(page, nukeTarget.name)
+      : null;
+    if (nukeApiPos) {
+      if (nukeApiPos.onScreen) {
+        nx = nukeApiPos.x;
+        ny = nukeApiPos.y;
+        nukeMethod = `api-${nukeApiPos.method}`;
+      } else {
+        const dir = await getDirectionToTarget(page, nukeTarget.name);
+        if (dir !== null) {
+          await panInDirection(page, dir, 600);
+          const pos2 = await getAttackClickPos(page, nukeTarget.name);
+          if (pos2) {
+            nx = pos2.x;
+            ny = pos2.y;
+            nukeMethod = `pan+api-${pos2.method}`;
+          } else {
+            nx = zone.cx + Math.cos(dir) * zone.width * 0.4;
+            ny = zone.cy + Math.sin(dir) * zone.height * 0.4;
+            nukeMethod = "pan+api-edge";
+          }
+        } else {
+          nx = nukeApiPos.x;
+          ny = nukeApiPos.y;
+          nukeMethod = "api-offscreen";
+        }
+      }
     } else {
-      const angle = Math.random() * Math.PI * 2;
-      const dist = 150 + Math.random() * 100;
-      nx = zone.cx + Math.cos(angle) * dist;
-      ny = zone.cy + Math.sin(angle) * dist;
+      // Fallback: cached direction + raycast
+      let nukeAngle = null;
+      if (nukeTarget && nukeTarget.labelX && nukeTarget.labelY) {
+        const dx = nukeTarget.labelX - zone.cx;
+        const dy = nukeTarget.labelY - zone.cy;
+        if (Math.sqrt(dx * dx + dy * dy) > 10) {
+          nukeAngle = Math.atan2(dy, dx);
+        }
+      }
+      if (
+        nukeAngle === null &&
+        nukeTarget &&
+        cachedNeighborDirections.has(nukeTarget.name)
+      ) {
+        nukeAngle = cachedNeighborDirections.get(nukeTarget.name).angle;
+      }
+      if (nukeAngle === null && nukeTarget) {
+        const dir = await getDirectionToTarget(page, nukeTarget.name);
+        if (dir !== null) nukeAngle = dir;
+      }
+
+      if (nukeAngle !== null) {
+        const hit = await raycastToBorder(page, nukeAngle);
+        if (hit) {
+          const extra = 60 + Math.random() * 40;
+          nx = hit.x + Math.cos(nukeAngle) * extra;
+          ny = hit.y + Math.sin(nukeAngle) * extra;
+          nukeMethod = "raycast";
+        } else {
+          nx = zone.cx + Math.cos(nukeAngle) * zone.width * 0.4;
+          ny = zone.cy + Math.sin(nukeAngle) * zone.height * 0.4;
+          nukeMethod = "edge";
+        }
+      } else {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 150 + Math.random() * 100;
+        nx = zone.cx + Math.cos(angle) * dist;
+        ny = zone.cy + Math.sin(angle) * dist;
+      }
     }
+
+    nx = Math.max(zone.left, Math.min(zone.right, nx));
+    ny = Math.max(zone.top, Math.min(zone.bottom, ny));
+
     await page.mouse.move(nx, ny);
     await sleep(300);
     await page.mouse.click(nx, ny);
@@ -1134,8 +2210,12 @@ async function executeRLAction(
     await page.keyboard.press("Escape").catch(() => {});
     const nukeTargetName = nukeTarget ? nukeTarget.name : "unknown";
     log(
-      `RL: Launch ${name} at ${nukeTargetName} (${Math.round(nx)},${Math.round(ny)})`,
+      `RL: Launch ${name} at ${nukeTargetName} (${Math.round(nx)},${Math.round(ny)}) method=${nukeMethod}`,
     );
+    // Recenter if we panned
+    if (nukeMethod.startsWith("pan")) {
+      await centerCamera(page);
+    }
     return { nukeLaunched: true };
   } else if (actionType === ACTION_UPGRADE) {
     // Right-click near a unit to open radial menu, then click "build" slot,
@@ -1318,6 +2398,7 @@ async function main() {
   let lastNeighborScan = 0; // Brief zoom-out to refresh neighbor label data
   const playerRelations = new Map(); // name -> Relation (0=Hostile,1=Distrustful,2=Neutral,3=Friendly)
   let nukeCount = 0; // Track nukes launched (increment on launch, decrement on resolve)
+  const cachedNeighborDirections = new Map(); // name -> { angle }
 
   while (true) {
     try {
@@ -1433,17 +2514,24 @@ async function main() {
         lastRecenter = Date.now();
         await centerCamera(page);
 
-        // Zoom targets: need enough zoom to see and click on our territory
+        // Sync actual scale from game
+        const realScale2 = await safeEval(page, () => {
+          const bm = document.querySelector("build-menu");
+          return bm?.transformHandler?.scale ?? null;
+        });
+        if (realScale2) currentScale = realScale2;
+
+        // Zoom targets: balance seeing our territory and neighbors
         const tPct = lastTerritoryPct;
         let targetScale;
-        if (tPct < 0.005) targetScale = 7.0;
-        else if (tPct < 0.01) targetScale = 5.0;
-        else if (tPct < 0.03) targetScale = 3.5;
-        else if (tPct < 0.05) targetScale = 2.5;
-        else targetScale = 1.8;
+        if (tPct < 0.005) targetScale = 4.0;
+        else if (tPct < 0.01) targetScale = 3.5;
+        else if (tPct < 0.03) targetScale = 2.5;
+        else if (tPct < 0.05) targetScale = 2.0;
+        else targetScale = 1.5;
 
         const scaleRatio = currentScale / targetScale;
-        if (scaleRatio > 1.5 || scaleRatio < 0.67) {
+        if (scaleRatio > 1.3 || scaleRatio < 0.77) {
           const stepsNeeded = Math.round(
             Math.log(targetScale / currentScale) / Math.log(1.2),
           );
@@ -1460,27 +2548,73 @@ async function main() {
       }
 
       // ── NEIGHBOR SCAN: briefly zoom out to refresh player labels ──
-      // NameLayer only updates troop text when elements are visible (display !== none).
-      // Visibility requires scale * baseSize >= 7. By zooming to ~1.5, even small
-      // players (baseSize ~5) become visible, refreshing their troop counts.
-      // Fix 6: scan every 10s instead of 30s for better isLandNeighbor accuracy
+      // We get neighbor data from the game API now, so we just need directions.
+      // Zoom out, grab label positions, zoom back to target scale.
       if (
-        Date.now() - lastNeighborScan > 10000 &&
+        Date.now() - lastNeighborScan > 15000 &&
         Date.now() - spawnTime > 5000
       ) {
         lastNeighborScan = Date.now();
-        const savedScale2 = currentScale;
-        // Zoom out to ~1.5 to make most labels visible
-        if (currentScale > 2.0) {
+        // Sync actual scale from game
+        const realScale = await safeEval(page, () => {
+          const bm = document.querySelector("build-menu");
+          return bm?.transformHandler?.scale ?? null;
+        });
+        if (realScale) currentScale = realScale;
+
+        if (currentScale > 2.5) {
+          const tPct = lastTerritoryPct;
+          let targetScale;
+          if (tPct < 0.005) targetScale = 4.0;
+          else if (tPct < 0.01) targetScale = 3.5;
+          else if (tPct < 0.03) targetScale = 2.5;
+          else if (tPct < 0.05) targetScale = 2.0;
+          else targetScale = 1.5;
+
+          // Zoom out to ~1.5 for label visibility
           const outSteps = Math.round(
             Math.log(currentScale / 1.5) / Math.log(1.2),
           );
           const clamped = Math.min(outSteps, 8);
           for (let i = 0; i < clamped; i++) await zoomStep(page, 100);
-          await sleep(600); // Wait for NameLayer to refresh (500ms rate)
-          // Zoom back in
-          for (let i = 0; i < clamped; i++) await zoomStep(page, -100);
-          log(`Neighbor scan: zoomed out ${clamped} steps to refresh labels`);
+          await sleep(600);
+
+          // Extract neighbor directions while zoomed out
+          const zoomedOutState = await extractGameState(page, BOT_NAME);
+          if (zoomedOutState && zoomedOutState.myLabelX) {
+            const ox = zoomedOutState.myLabelX;
+            const oy = zoomedOutState.myLabelY;
+            cachedNeighborDirections.clear();
+            for (const n of zoomedOutState.neighbors) {
+              if (n.labelX && n.labelY) {
+                const dx = n.labelX - ox;
+                const dy = n.labelY - oy;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist > 5) {
+                  cachedNeighborDirections.set(n.name, {
+                    angle: Math.atan2(dy, dx),
+                  });
+                }
+              }
+            }
+            log(
+              `Neighbor scan: cached directions for ${cachedNeighborDirections.size} players`,
+            );
+          }
+
+          // Zoom back to target scale (not previous scale)
+          const nowScale = await safeEval(page, () => {
+            const bm = document.querySelector("build-menu");
+            return bm?.transformHandler?.scale ?? null;
+          });
+          if (nowScale) currentScale = nowScale;
+          const inSteps = Math.round(
+            Math.log(targetScale / currentScale) / Math.log(1.2),
+          );
+          const clampedIn = Math.max(-8, Math.min(8, inSteps));
+          if (clampedIn > 0) {
+            for (let i = 0; i < clampedIn; i++) await zoomStep(page, -100);
+          }
         }
       }
 
@@ -1515,33 +2649,35 @@ async function main() {
           const hasSilo = gameState.hasSilo || false;
           const hasPort = gameState.hasPort || false;
           const numWarships = gameState.numWarships || 0;
-          const numCities = gameState.numCities || 0;
 
-          // City cost scales: min(1M, 2^numCities * 125K) — matches DefaultConfig.ts
-          const cityCost = Math.min(
-            1_000_000,
-            Math.pow(2, numCities) * 125_000,
-          );
+          // Use game API costs (accounts for scaling) to determine affordability
+          const costs = gameState._buildCosts || {};
+          const canAfford = (type) => {
+            const cost = costs[type];
+            return cost !== undefined ? g >= cost : false;
+          };
 
-          // Action mask matching env_server.ts canBuild checks
+          // Action mask — check affordability using real costs from API
           gameState.actionMask = [
             true, // 0: NOOP
             hasN && hasT, // 1: ATTACK
             hasN && hasT && hasPort, // 2: BOAT_ATTACK
             hasOut, // 3: RETREAT
-            g >= cityCost, // 4: BUILD_CITY (exponential cost)
-            g >= 125_000, // 5: BUILD_FACTORY
-            g >= 50_000, // 6: BUILD_DEFENSE
-            g >= 125_000, // 7: BUILD_PORT
-            g >= 1_500_000, // 8: BUILD_SAM
-            g >= 1_000_000, // 9: BUILD_SILO
-            g >= 250_000 && hasPort, // 10: BUILD_WARSHIP
-            hasSilo && hasN && g >= 750_000, // 11: LAUNCH_ATOM
-            hasSilo && hasN && g >= 5_000_000, // 12: LAUNCH_HBOMB
-            hasSilo && hasN && g >= 10_000_000, // 13: LAUNCH_MIRV
+            canAfford("City"), // 4: BUILD_CITY
+            canAfford("Factory"), // 5: BUILD_FACTORY
+            canAfford("Defense Post"), // 6: BUILD_DEFENSE
+            canAfford("Port"), // 7: BUILD_PORT
+            canAfford("SAM Launcher"), // 8: BUILD_SAM
+            canAfford("Missile Silo"), // 9: BUILD_SILO
+            canAfford("Warship") && hasPort, // 10: BUILD_WARSHIP
+            hasSilo && hasN && canAfford("Atom Bomb"), // 11: LAUNCH_ATOM
+            hasSilo && hasN && canAfford("Hydrogen Bomb"), // 12: LAUNCH_HBOMB
+            hasSilo && hasN && canAfford("MIRV"), // 13: LAUNCH_MIRV
             numWarships > 0 && hasN, // 14: MOVE_WARSHIP
             hasUnits && g >= 50_000, // 15: UPGRADE
-            hasUnits && gameState.canDeleteUnit !== false, // 16: DELETE_UNIT (respects game cooldown)
+            hasUnits &&
+              gameState.canDeleteUnit !== false &&
+              (gameState.unitPositions || []).some((u) => u.active !== false), // 16: DELETE_UNIT (respects cooldown + needs active unit)
           ];
           // Add build feedback (tracked from previous action)
           gameState.lastBuildResult = lastBuildResult;
@@ -1572,17 +2708,12 @@ async function main() {
         lastNeighbors,
         lastUnitPositions,
         lastGameState,
+        cachedNeighborDirections,
       );
       if (actionResult?.nukeLaunched) nukeCount++;
-      // One-shot actions should only execute once, not every tick until next policy query.
-      // Attack/boat_attack are fine to repeat (clicks on different border tiles).
-      // NOOP is fine to repeat (does nothing).
-      if (
-        currentAction &&
-        currentAction.actionType !== ACTION_NOOP &&
-        currentAction.actionType !== ACTION_ATTACK &&
-        currentAction.actionType !== ACTION_BOAT_ATTACK
-      ) {
+      // Clear action after execution — matches training where 1 action = 1 step.
+      // Repeating attacks wastes troops and doesn't match how the model was trained.
+      if (currentAction && currentAction.actionType !== ACTION_NOOP) {
         currentAction = null;
       }
 
@@ -1631,8 +2762,23 @@ async function main() {
           ? `silo=${gs.hasSilo} port=${gs.hasPort} sam=${gs.hasSAM} ships=${gs.numWarships}`
           : "";
         log(
-          `[${elapsed.toFixed(0)}s] ${pct}% terr, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, tiles=${gs?.myTiles || 0}, tick=${gs?.tick || 0}, units=${units}, ${attacks}, ${bldgs}, neighbors=${nNeighbors}(${visNeighbors}vis), scale=${currentScale.toFixed(1)}`,
+          `[${elapsed.toFixed(0)}s] ${pct}% terr, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, tiles=${gs?.myTiles || 0}, tick=${gs?.tick || 0}, units=${units}, ${attacks}, ${bldgs}, neighbors=${nNeighbors}(${visNeighbors}vis), scale=${currentScale.toFixed(1)}, dirs=${cachedNeighborDirections.size}`,
         );
+        if (gs?._borderDebug) {
+          const bd = gs._borderDebug;
+          log(
+            `  border: myBorder=${bd.myBorderLen} landN=[${bd.landNames.slice(0, 3)}] apiN=${bd.apiNeighborCount}`,
+          );
+          if (gs._buildDebug) {
+            log(`  build: ${JSON.stringify(gs._buildDebug.slice(0, 5))}`);
+          }
+          if (gs._buildError) {
+            log(`  buildErr: ${gs._buildError}`);
+          }
+          if (gs.canBuildFromAPI) {
+            log(`  canBuild: ${JSON.stringify(gs.canBuildFromAPI)}`);
+          }
+        }
       }
     } catch (err) {
       log(`Error: ${err.message.slice(0, 80)}`);

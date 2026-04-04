@@ -179,6 +179,18 @@ class PolicyHandler(BaseHTTPRequestHandler):
 
         obs_t = torch.FloatTensor(obs_vec).unsqueeze(0).to(self.device)
 
+        # Build target masks from neighbor data (matches env_server.ts logic)
+        land_mask = np.zeros(16, dtype=np.float32)
+        sea_mask = np.zeros(16, dtype=np.float32)
+        for i, n in enumerate(neighbors[:16]):
+            not_allied = not n.get("isAllied", False)
+            if n.get("isLandNeighbor", False) and not_allied:
+                land_mask[i] = 1.0
+            if not_allied:
+                sea_mask[i] = 1.0
+        land_t = torch.FloatTensor(land_mask).unsqueeze(0).to(self.device)
+        sea_t = torch.FloatTensor(sea_mask).unsqueeze(0).to(self.device)
+
         # Debug: log raw dict values AND obs vector
         with torch.no_grad():
             out = self.model.forward(obs_t)
@@ -193,13 +205,16 @@ class PolicyHandler(BaseHTTPRequestHandler):
                 for ni in range(min(3, len(neighbors))):
                     base = 16 + ni * 4
                     n = neighbors[ni]
-                    f.write(f"  n{ni}: raw=[tiles={n.get('tiles')} troops={n.get('troops')} rel={n.get('relation')} alive={n.get('alive')}] vec=[{obs_vec[base]:.5f}, {obs_vec[base+1]:.4f}, {obs_vec[base+2]:.2f}, {obs_vec[base+3]:.0f}]\n")
+                    f.write(f"  n{ni}: raw=[tiles={n.get('tiles')} troops={n.get('troops')} rel={n.get('relation')} alive={n.get('alive')} land={n.get('isLandNeighbor')}] vec=[{obs_vec[base]:.5f}, {obs_vec[base+1]:.4f}, {obs_vec[base+2]:.2f}, {obs_vec[base+3]:.0f}]\n")
                 if mask_t is not None:
                     mask_np = mask_t.squeeze(0).cpu().numpy()
                     masked_logits = raw_logits + (1 - mask_np) * (-1e8)
                     top3 = sorted(enumerate(masked_logits), key=lambda x: -x[1])[:3]
                     f.write(f"mask={mask_np.astype(int).tolist()} top3={[(i, f'{v:.1f}') for i,v in top3]}\n")
-            action, _, _, _ = self.model.get_action_and_value(obs_t, action_mask=mask_t)
+                f.write(f"land_mask={land_mask.astype(int).tolist()} sea_mask={sea_mask.astype(int).tolist()}\n")
+            action, _, _, _ = self.model.get_action_and_value(
+                obs_t, action_mask=mask_t,
+                land_target_mask=land_t, sea_target_mask=sea_t)
 
         action_np = action.squeeze(0).cpu().numpy().tolist()
 
