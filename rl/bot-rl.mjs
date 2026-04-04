@@ -1866,9 +1866,7 @@ async function executeRLAction(
       await sleep(30);
     }
 
-    // Zoom in for click precision, recenter so coordinates are fresh
-    const atkZoomSteps = await ensureClickZoom(page);
-    if (atkZoomSteps > 0) await centerCamera(page);
+    const atkZoomSteps = 0; // no pre-zoom for attacks — retry handles zoom
 
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
@@ -2430,8 +2428,7 @@ async function executeRLAction(
       return;
     }
     // Nukes: zoom in for precision, press key, then click on enemy territory
-    const nukeZoomSteps = await ensureClickZoom(page);
-    if (nukeZoomSteps > 0) await centerCamera(page);
+    const nukeZoomSteps = 0; // no pre-zoom for nukes
     await page.keyboard.press(key).catch(() => {});
     await sleep(300);
 
@@ -2538,33 +2535,8 @@ async function executeRLAction(
       log("RL: Upgrade — no unit positions");
       return;
     }
-    const upgZoomSteps = await ensureClickZoom(page);
-    if (upgZoomSteps > 0) await centerCamera(page);
-    // Re-query unit positions at new zoom level
-    const freshUpgUnits =
-      upgZoomSteps > 0
-        ? await safeEval(page, () => {
-            const sb = document.querySelector("game-right-sidebar");
-            const g = sb?.game;
-            const bm = document.querySelector("build-menu");
-            const th = bm?.transformHandler;
-            const me = g?.myPlayer?.();
-            if (!me || !th) return null;
-            const units = typeof me.units === "function" ? me.units() : [];
-            return [...units].slice(0, 10).map((u) => {
-              const tile = typeof u.tile === "function" ? u.tile() : u.tile;
-              const s = th.worldToScreenCoordinates({
-                x: g.x(tile),
-                y: g.y(tile),
-              });
-              return { x: s.x, y: s.y };
-            });
-          })
-        : null;
-    const upgUnit =
-      freshUpgUnits && freshUpgUnits.length > 0
-        ? freshUpgUnits[0]
-        : unitPositions[0];
+    const upgZoomSteps = 0; // no pre-zoom for upgrades
+    const upgUnit = unitPositions[0];
     await page.mouse.click(upgUnit.x, upgUnit.y, { button: "right" });
     await sleep(400);
     // Click the "build" slot in the SVG radial menu
@@ -2595,36 +2567,11 @@ async function executeRLAction(
       log("RL: Delete unit — no unit positions");
       return;
     }
-    const delZoomSteps = await ensureClickZoom(page);
-    if (delZoomSteps > 0) await centerCamera(page);
-    // Re-query unit positions at new zoom level
-    const freshDelUnits =
-      delZoomSteps > 0
-        ? await safeEval(page, () => {
-            const sb = document.querySelector("game-right-sidebar");
-            const g = sb?.game;
-            const bm = document.querySelector("build-menu");
-            const th = bm?.transformHandler;
-            const me = g?.myPlayer?.();
-            if (!me || !th) return null;
-            const units = typeof me.units === "function" ? me.units() : [];
-            return [...units].slice(0, 10).map((u) => {
-              const tile = typeof u.tile === "function" ? u.tile() : u.tile;
-              const s = th.worldToScreenCoordinates({
-                x: g.x(tile),
-                y: g.y(tile),
-              });
-              const active =
-                typeof u.isActive === "function" ? u.isActive() : true;
-              return { x: s.x, y: s.y, active };
-            });
-          })
-        : null;
+    const delZoomSteps = 0; // no pre-zoom for deletes
     // Pick last active unit
-    const delCandidates = freshDelUnits || unitPositions;
     const delUnit =
-      [...delCandidates].reverse().find((u) => u.active !== false) ||
-      delCandidates[delCandidates.length - 1];
+      [...unitPositions].reverse().find((u) => u.active !== false) ||
+      unitPositions[unitPositions.length - 1];
     await page.mouse.click(delUnit.x, delUnit.y, { button: "right" });
     await sleep(400);
     const deleted = await safeEval(page, () => {
