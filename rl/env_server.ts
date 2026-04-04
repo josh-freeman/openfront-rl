@@ -440,14 +440,14 @@ function getObservation() {
   // Per-target masks: which neighbors are valid targets for land vs sea actions
   const landTargetMask = new Array(16).fill(0);
   const seaTargetMask = new Array(16).fill(0);
+  const canReachBySea = hasCoast || hasPort;
   neighbors.slice(0, 16).forEach((n, i) => {
     if (n.id.startsWith("wilderness_")) {
       landTargetMask[i] = 1; // wilderness always attackable on land
-      // seaTargetMask stays 0 — can't boat-attack wilderness
     } else {
       const notAllied = !rlPlayer!.isAlliedWith(game!.player(n.id));
       if (n.isLandNeighbor && notAllied) landTargetMask[i] = 1;
-      if (notAllied) seaTargetMask[i] = 1; // boat/nuke/warship
+      if (notAllied && canReachBySea) seaTargetMask[i] = 1;
     }
   });
   const hasAttackableNeighbor = landTargetMask.some((v) => v === 1);
@@ -458,12 +458,12 @@ function getObservation() {
   const actionMask = [
     true, // 0: NOOP — always valid
     hasAttackableNeighbor && hasTroops, // 1: ATTACK
-    hasAttackableBySeaNeighbor && hasTroops && (hasCoast || hasPort), // 2: BOAT_ATTACK (needs coast)
+    hasAttackableBySeaNeighbor && hasTroops, // 2: BOAT_ATTACK (sea mask already gates on coast)
     hasOutgoingAttacks, // 3: RETREAT
     canAffordCity, // 4: BUILD_CITY
     canAffordFactory, // 5: BUILD_FACTORY
     canAffordDefense, // 6: BUILD_DEFENSE
-    canAffordPort, // 7: BUILD_PORT
+    canAffordPort && hasCoast, // 7: BUILD_PORT (need coast to place a port)
     canAffordSAM, // 8: BUILD_SAM
     canAffordSilo, // 9: BUILD_SILO
     canAffordWarship && hasPort, // 10: BUILD_WARSHIP
@@ -493,7 +493,6 @@ function getObservation() {
     territoryPct: myTiles / (width * height),
     hasSilo,
     hasPort,
-    hasCoast,
     hasSAM,
     numWarships,
     numNukes,
