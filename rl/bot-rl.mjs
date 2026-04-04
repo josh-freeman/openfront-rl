@@ -536,11 +536,9 @@ async function extractGameState(page, botName) {
             const borderNeighborIDs = new Set();
             const mySmallID =
               typeof me2.smallID === "function" ? me2.smallID() : -1;
-            // Wilderness CC detection: BFS from our border into unclaimed land
-            const wildernessVisited = new Set();
+            // Wilderness CC detection: fringe-only scan (1-layer from our border)
             const wildernessCCs = []; // {id, tileCount, ourBorderTiles, centroidX, centroidY}
             let wildCCIndex = 0;
-            const WILD_CC_CAP = 5000;
             const hasIsLand = typeof g.isLand === "function";
 
             if (
@@ -549,6 +547,9 @@ async function extractGameState(page, botName) {
               typeof g.ownerID === "function"
             ) {
               const step = Math.max(1, Math.floor(myBorder.length / 300));
+              // Step 1: find all unclaimed fringe tiles + track border associations
+              const fringeTiles = new Set();
+              const fringeToOurBorder = new Map(); // fringe tile → [border tiles]
               for (let i = 0; i < myBorder.length; i += step) {
                 const adjTiles = g.neighbors(myBorder[i]);
                 for (const adj of adjTiles) {
@@ -556,53 +557,46 @@ async function extractGameState(page, botName) {
                   if (oid !== 0 && oid !== mySmallID) {
                     borderNeighborIDs.add(oid);
                   }
-                  // Seed wilderness BFS
-                  if (
-                    oid === 0 &&
-                    !wildernessVisited.has(adj) &&
-                    (!hasIsLand || g.isLand(adj))
-                  ) {
-                    const ccTiles = new Set();
-                    const queue = [adj];
-                    ccTiles.add(adj);
-                    wildernessVisited.add(adj);
-                    let sx = 0,
-                      sy = 0;
-                    while (queue.length > 0 && ccTiles.size < WILD_CC_CAP) {
-                      const curr = queue.pop();
-                      sx += g.x(curr);
-                      sy += g.y(curr);
-                      for (const n of g.neighbors(curr)) {
-                        if (
-                          !wildernessVisited.has(n) &&
-                          g.ownerID(n) === 0 &&
-                          (!hasIsLand || g.isLand(n))
-                        ) {
-                          wildernessVisited.add(n);
-                          ccTiles.add(n);
-                          queue.push(n);
-                        }
-                      }
-                    }
-                    // Find our border tiles adjacent to this CC
-                    const ourBT = [];
-                    for (let j = 0; j < myBorder.length; j += step) {
-                      for (const n of g.neighbors(myBorder[j])) {
-                        if (ccTiles.has(n)) {
-                          ourBT.push(myBorder[j]);
-                          break;
-                        }
-                      }
-                    }
-                    wildernessCCs.push({
-                      id: `wilderness_${wildCCIndex++}`,
-                      tileCount: ccTiles.size,
-                      ourBorderTiles: ourBT,
-                      centroidX: sx / ccTiles.size,
-                      centroidY: sy / ccTiles.size,
-                    });
+                  if (oid === 0 && (!hasIsLand || g.isLand(adj))) {
+                    fringeTiles.add(adj);
+                    if (!fringeToOurBorder.has(adj))
+                      fringeToOurBorder.set(adj, []);
+                    fringeToOurBorder.get(adj).push(myBorder[i]);
                   }
                 }
+              }
+              // Step 2: group fringe tiles into CCs (BFS among fringe only)
+              const visited = new Set();
+              for (const seed of fringeTiles) {
+                if (visited.has(seed)) continue;
+                visited.add(seed);
+                const ccFringe = [seed];
+                const queue = [seed];
+                const ourBorderSet = new Set();
+                let sx = 0,
+                  sy = 0;
+                while (queue.length > 0) {
+                  const curr = queue.pop();
+                  sx += g.x(curr);
+                  sy += g.y(curr);
+                  for (const bt of fringeToOurBorder.get(curr) || []) {
+                    ourBorderSet.add(bt);
+                  }
+                  for (const n of g.neighbors(curr)) {
+                    if (!visited.has(n) && fringeTiles.has(n)) {
+                      visited.add(n);
+                      ccFringe.push(n);
+                      queue.push(n);
+                    }
+                  }
+                }
+                wildernessCCs.push({
+                  id: `wilderness_${wildCCIndex++}`,
+                  tileCount: ccFringe.length,
+                  ourBorderTiles: Array.from(ourBorderSet),
+                  centroidX: sx / ccFringe.length,
+                  centroidY: sy / ccFringe.length,
+                });
               }
             }
 
