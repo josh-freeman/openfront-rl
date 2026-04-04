@@ -353,13 +353,23 @@ function getObservation() {
     y: game!.y(u.tile()),
   }));
 
-  // Border tiles (for action targeting)
+  // Border tiles (for action targeting) + coast detection
   const borderTilesArr: { x: number; y: number; ref: number }[] = [];
   let count = 0;
+  let hasCoast = false;
   const borderSet = rlPlayer.borderTiles();
   for (const t of borderSet) {
     if (count++ > 200) break; // Cap for performance
     borderTilesArr.push({ x: game.x(t), y: game.y(t), ref: t });
+    // Check if any neighbor is water (not land) → we have coast
+    if (!hasCoast) {
+      for (const adj of game.neighbors(t)) {
+        if (!game.isLand(adj)) {
+          hasCoast = true;
+          break;
+        }
+      }
+    }
   }
 
   // Incoming/outgoing attacks
@@ -448,7 +458,7 @@ function getObservation() {
   const actionMask = [
     true, // 0: NOOP — always valid
     hasAttackableNeighbor && hasTroops, // 1: ATTACK
-    hasAttackableBySeaNeighbor && hasTroops, // 2: BOAT_ATTACK (no port required)
+    hasAttackableBySeaNeighbor && hasTroops && (hasCoast || hasPort), // 2: BOAT_ATTACK (needs coast)
     hasOutgoingAttacks, // 3: RETREAT
     canAffordCity, // 4: BUILD_CITY
     canAffordFactory, // 5: BUILD_FACTORY
@@ -483,6 +493,7 @@ function getObservation() {
     territoryPct: myTiles / (width * height),
     hasSilo,
     hasPort,
+    hasCoast,
     hasSAM,
     numWarships,
     numNukes,
