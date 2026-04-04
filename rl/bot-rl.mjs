@@ -1870,6 +1870,15 @@ async function executeRLAction(
 
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
+
+    // Guard: land attacks require land neighbor, boat attacks require non-land
+    if (target && !target._wildernessCC) {
+      if (actionType === ACTION_ATTACK && !target.isLandNeighbor) {
+        log(`RL: Skip ATTACK on ${target.name} — not a land neighbor`);
+        return;
+      }
+    }
+
     const originX = gameState?.myLabelX || zone.cx;
     const originY = gameState?.myLabelY || zone.cy;
 
@@ -2140,9 +2149,13 @@ async function executeRLAction(
         return c;
       })) || 0;
 
+    // Log what we're clicking and verify it's on our territory's neighbor
+    const targetName = target ? target.name : "unknown";
+    log(
+      `RL: Clicking attack at (${Math.round(x)},${Math.round(y)}) target=${targetName} method=${method} isLand=${target?.isLandNeighbor} isWild=${!!target?._wildernessCC}`,
+    );
     await page.mouse.click(x, y);
     await sleep(150);
-    const targetName = target ? target.name : "unknown";
     await showDebugMarker(
       page,
       x,
