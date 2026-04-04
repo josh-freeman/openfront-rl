@@ -46,8 +46,14 @@ import "./TerritoryPatternsModal";
 import { TerritoryPatternsModal } from "./TerritoryPatternsModal";
 import { TokenLoginModal } from "./TokenLoginModal";
 import {
+  BuildUnitIntentEvent,
+  SendAttackIntentEvent,
+  SendBoatAttackIntentEvent,
+  SendDeleteUnitIntentEvent,
   SendKickPlayerIntentEvent,
+  SendSpawnIntentEvent,
   SendUpdateGameConfigIntentEvent,
+  SendUpgradeStructureIntentEvent,
 } from "./Transport";
 import { UserSettingModal } from "./UserSettingModal";
 import "./UsernameInput";
@@ -748,6 +754,72 @@ class Client {
       gameStartInfo: lobby.gameStartInfo ?? lobby.gameRecord?.info,
       gameRecord: lobby.gameRecord,
     });
+
+    // Expose RL bot API so Puppeteer can dispatch actions without mouse/keyboard simulation.
+    // Usage: await page.evaluate(() => window.__rl__.attack("DisplayName", 50000))
+    const eb = this.eventBus;
+    const getGame = () =>
+      (document.querySelector("game-right-sidebar") as any)?.game ?? null;
+    const playerByName = (displayName: string) => {
+      const g = getGame();
+      if (!g) return null;
+      const players: any[] =
+        typeof g.players === "function" ? g.players() : [];
+      return (
+        players.find((p: any) => {
+          const n =
+            typeof p.displayName === "function" ? p.displayName() : null;
+          return n === displayName;
+        }) ?? null
+      );
+    };
+    (window as any).__rl__ = {
+      // Attack a named player with an absolute troop count.
+      attack: (displayName: string | null, troops: number) => {
+        const targetID = displayName
+          ? (playerByName(displayName) as any)?.id?.() ?? null
+          : null;
+        eb.emit(new SendAttackIntentEvent(targetID, troops));
+      },
+      // Boat attack: dst is a TileRef number (sea tile near enemy).
+      boatAttack: (dst: number, troops: number) =>
+        eb.emit(new SendBoatAttackIntentEvent(dst, troops)),
+      // Build a unit at a specific tile. unit is a UnitType string e.g. "City".
+      // If tile is omitted, picks a tile from our own territory automatically.
+      build: (unit: string, tile: number | null) => {
+        const g = getGame();
+        const me = g?.myPlayer?.();
+        let t = tile;
+        if (t == null && me) {
+          const tiles: any[] =
+            typeof me.tiles === "function" ? [...me.tiles()] : [];
+          if (tiles.length) t = tiles[Math.floor(Math.random() * tiles.length)];
+        }
+        if (t == null) return;
+        eb.emit(new BuildUnitIntentEvent(unit as any, t));
+      },
+      // Build a unit on a border tile (for ports, SAMs, defense posts).
+      buildOnBorder: (unit: string) => {
+        const g = getGame();
+        const me = g?.myPlayer?.();
+        if (!me) return;
+        const border: any[] =
+          typeof me.borderTiles === "function"
+            ? [...(me.borderTiles()?.borderTiles ?? [])]
+            : [];
+        if (!border.length) return;
+        const t = border[Math.floor(Math.random() * border.length)];
+        eb.emit(new BuildUnitIntentEvent(unit as any, t));
+      },
+      // Spawn at a tile.
+      spawn: (tile: number) => eb.emit(new SendSpawnIntentEvent(tile)),
+      // Delete a unit by its game unit ID.
+      deleteUnit: (unitId: number) =>
+        eb.emit(new SendDeleteUnitIntentEvent(unitId)),
+      // Upgrade a unit by its game unit ID.
+      upgrade: (unitId: number, unit: string) =>
+        eb.emit(new SendUpgradeStructureIntentEvent(unitId, unit as any)),
+    };
 
     this.lobbyHandle.prestart.then(() => {
       console.log("Closing modals");

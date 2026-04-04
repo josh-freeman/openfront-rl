@@ -11,7 +11,9 @@
  *      python play.py --model checkpoints/best_model.pt --mode server --port 8765
  *
  *   2. Run this bot:
- *      node bot-rl.mjs [BotName] [policyServerUrl]
+ *      node bot-rl.mjs [BotName] [policyServerUrl] [gameUrl]
+ *      gameUrl defaults to http://localhost:9000 (local dev server with window.__rl__ support).
+ *      Use https://openfront.io for online play (window.__rl__ won't be available there).
  */
 
 import puppeteer from "puppeteer-extra";
@@ -23,6 +25,7 @@ puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
 const BOT_NAME = process.argv[2] || "xXDarkLord42Xx";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
+const GAME_URL = process.argv[4] || "http://localhost:9000";
 
 // Training: ticksPerStep=10, turnInterval=100ms → 1 action per 1000ms game time.
 // Live server ticks faster, so poll more frequently to stay responsive.
@@ -129,7 +132,7 @@ async function safePage(browser) {
   const pages = await browser.pages();
   for (const p of pages) {
     try {
-      if (p.url().includes("openfront.io")) return p;
+      if (p.url().includes(new URL(GAME_URL).host)) return p;
     } catch {}
   }
   if (pages.length > 0) return pages[0];
@@ -149,8 +152,8 @@ async function safeEval(page, fn, ...args) {
 // ── Lobby: join a public game ────────────────────────────────────
 
 async function joinGame(page) {
-  log("Going to openfront.io...");
-  await page.goto("https://openfront.io", {
+  log(`Going to ${GAME_URL}...`);
+  await page.goto(GAME_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
@@ -868,11 +871,14 @@ async function extractGameState(page, botName) {
                   typeof u.type === "function" ? u.type() : u.type;
                 const active =
                   typeof u.isActive === "function" ? u.isActive() : true;
+                const unitId =
+                  typeof u.id === "function" ? u.id() : null;
                 state.unitPositions.push({
                   x: screen.x,
                   y: screen.y,
                   type: typeName,
                   active,
+                  unitId,
                 });
               }
             }
@@ -1867,6 +1873,24 @@ const BUILD_KEYS = {
   [ACTION_BUILD_WARSHIP]: { key: "7", name: "warship", minGold: 250_000 },
 };
 
+// UnitType strings matching the game's enum (src/core/game/Game.ts)
+// Border buildings are placed on border/coast tiles; interior ones anywhere.
+const BUILD_UNIT_TYPES = {
+  [ACTION_BUILD_CITY]: { unitType: "City", border: false },
+  [ACTION_BUILD_FACTORY]: { unitType: "Factory", border: false },
+  [ACTION_BUILD_PORT]: { unitType: "Port", border: true },
+  [ACTION_BUILD_DEFENSE]: { unitType: "Defense Post", border: true },
+  [ACTION_BUILD_SILO]: { unitType: "Missile Silo", border: false },
+  [ACTION_BUILD_SAM]: { unitType: "SAM Launcher", border: true },
+  [ACTION_BUILD_WARSHIP]: { unitType: "Warship", border: false }, // spawns at port
+};
+
+const NUKE_UNIT_TYPES = {
+  [ACTION_LAUNCH_ATOM]: { unitType: "Atom Bomb", minGold: 750_000 },
+  [ACTION_LAUNCH_HBOMB]: { unitType: "Hydrogen Bomb", minGold: 5_000_000 },
+  [ACTION_LAUNCH_MIRV]: { unitType: "MIRV", minGold: 10_000_000 },
+};
+
 // Nuke launch keys (separate from builds — these require a silo)
 const NUKE_KEYS = {
   [ACTION_LAUNCH_ATOM]: { key: "8", name: "atom bomb", minGold: 750_000 },
@@ -1893,7 +1917,6 @@ async function executeRLAction(
   neighbors,
   unitPositions,
   gameState,
-  cachedNeighborDirections,
 ) {
   if (!action || !zone) return;
 
@@ -1913,26 +1936,10 @@ async function executeRLAction(
     actionType === ACTION_ATTACK ||
     actionType === ACTION_BOAT_ATTACK
   ) {
-    // Always focus canvas before attack clicks
-    await focusCanvas(page);
-    // Adjust attack ratio using T (down 10%) / Y (up 10%) to match troopFraction
-    // troopFraction: 0.2, 0.4, 0.6, 0.8, or 1.0
-    const steps = Math.round((troopFraction - currentAttackRatio) / 0.1);
-    if (steps !== 0) {
-      const key = steps > 0 ? "y" : "t";
-      for (let i = 0; i < Math.abs(steps); i++) await page.keyboard.press(key);
-      currentAttackRatio = troopFraction;
-      await sleep(30);
-    }
-
     const targetIdx = action.targetIdx || 0;
     const target = neighbors[targetIdx];
 
-    // Zoom in for wilderness attacks — tiles are tiny at normal zoom
-    const atkZoomSteps =
-      target && target._wildernessCC ? await ensureClickZoom(page) : 0;
-
-    // Guard: land attacks require land neighbor, boat attacks require non-land
+    // Guard: land attacks require land neighbor
     if (target && !target._wildernessCC) {
       if (actionType === ACTION_ATTACK && !target.isLandNeighbor) {
         log(`RL: Skip ATTACK on ${target.name} — not a land neighbor`);
@@ -1940,560 +1947,27 @@ async function executeRLAction(
       }
     }
 
-    const originX = gameState?.myLabelX || zone.cx;
-    const originY = gameState?.myLabelY || zone.cy;
-
-    let x, y;
-    let method = "none";
-    let didPan = false;
-
-    // Wilderness targeting: click on unclaimed territory adjacent to our border
-    if (target && target._wildernessCC) {
-      const wcc = target._wildernessCC;
-      const wildPos = await safeEval(
-        page,
-        async (ccData) => {
-          try {
-            const sidebar = document.querySelector("game-right-sidebar");
-            if (!sidebar?.game) return null;
-            const g = sidebar.game;
-            const buildMenu = document.querySelector("build-menu");
-            const th = buildMenu?.transformHandler;
-            if (!th) return null;
-            const me = g.myPlayer?.();
-            if (!me) return null;
-
-            // Use the CC's centroid to find wilderness tiles near this specific CC
-            const vw = window.innerWidth,
-              vh = window.innerHeight;
-            const mySmallID =
-              typeof me.smallID === "function" ? me.smallID() : -1;
-
-            // Get our border tiles
-            let ourBorder = [];
-            try {
-              if (typeof me.borderTiles === "function") {
-                ourBorder = [...(await me.borderTiles()).borderTiles];
-              }
-            } catch (e) {
-              return null;
-            }
-
-            // Find border tiles closest to this CC's centroid
-            const ccX = ccData.centroidX,
-              ccY = ccData.centroidY;
-            const scored = ourBorder.map((t, idx) => ({
-              t,
-              idx,
-              d: Math.abs(g.x(t) - ccX) + Math.abs(g.y(t) - ccY),
-            }));
-            scored.sort((a, b) => a.d - b.d);
-
-            // Check the closest border tiles for adjacent wilderness
-            const checkCount = Math.min(scored.length, 50);
-            for (let i = 0; i < checkCount; i++) {
-              const borderTile = scored[i].t;
-              for (const adj of g.neighbors(borderTile)) {
-                if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
-                  // Found unclaimed tile — walk 2 tiles deeper into wilderness
-                  let deepTile = adj;
-                  for (let depth = 0; depth < 2; depth++) {
-                    let found = false;
-                    for (const adj2 of g.neighbors(deepTile)) {
-                      if (
-                        g.ownerID(adj2) === 0 &&
-                        (!g.isLand || g.isLand(adj2))
-                      ) {
-                        deepTile = adj2;
-                        found = true;
-                        break;
-                      }
-                    }
-                    if (!found) break;
-                  }
-                  // Get screen coords of deep tile and our border tile
-                  const deepScreen = th.worldToScreenCoordinates({
-                    x: g.x(deepTile),
-                    y: g.y(deepTile),
-                  });
-                  const ourScreen = th.worldToScreenCoordinates({
-                    x: g.x(borderTile),
-                    y: g.y(borderTile),
-                  });
-                  // Offset 12px further away from our border
-                  const dx = deepScreen.x - ourScreen.x;
-                  const dy = deepScreen.y - ourScreen.y;
-                  const len = Math.sqrt(dx * dx + dy * dy) || 1;
-                  const fx = deepScreen.x + (dx / len) * 12;
-                  const fy = deepScreen.y + (dy / len) * 12;
-                  return {
-                    x: fx,
-                    y: fy,
-                    onScreen:
-                      fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
-                    method: "wilderness-border",
-                  };
-                }
-              }
-            }
-            // Fallback: use CC centroid
-            const screen = th.worldToScreenCoordinates({
-              x: ccData.centroidX,
-              y: ccData.centroidY,
-            });
-            return {
-              x: screen.x,
-              y: screen.y,
-              onScreen:
-                screen.x > 50 &&
-                screen.x < vw - 50 &&
-                screen.y > 30 &&
-                screen.y < vh - 100,
-              method: "wilderness-centroid",
-            };
-          } catch (e) {
-            return null;
-          }
-        },
-        wcc,
+    // ── Named-player attack: use EventBus directly (no camera/click needed) ──
+    if (target && !target._wildernessCC) {
+      const troops = Math.floor((gameState?.myTroops || 0) * troopFraction);
+      await page.evaluate(
+        (name, t) => window.__rl__?.attack(name, t),
+        target.id,
+        troops,
       );
-      if (wildPos) {
-        x = wildPos.x;
-        y = wildPos.y;
-        method = wildPos.method;
-      } else {
-        ({ x, y } = randomBorder(zone));
-        method = "wilderness-fallback";
-      }
-    }
-
-    // PRIMARY: Use game API for precise targeting (works for ALL neighbor players)
-    // Get position RIGHT before clicking to minimize camera drift
-    const apiPos =
-      target && !target._wildernessCC
-        ? await getAttackClickPos(page, target.name)
-        : null;
-    if (target && target._wildernessCC) {
-      // Already handled above — x,y are set
-    } else if (apiPos && apiPos.onScreen) {
-      x = apiPos.x;
-      y = apiPos.y;
-      method = `api-${apiPos.method}`;
-    } else if (apiPos && !apiPos.onScreen) {
-      // Target exists but is off-screen — pan toward it
-      const dir = await getDirectionToTarget(page, target.name);
-      if (dir !== null) {
-        // Show pan debug marker: arrow from center toward pan direction
-        const panEndX = zone.cx + Math.cos(dir) * 150;
-        const panEndY = zone.cy + Math.sin(dir) * 150;
-        await showDebugMarker(
-          page,
-          panEndX,
-          panEndY,
-          zone.cx,
-          zone.cy,
-          `PAN → ${target.name} (off-screen)`,
-          "yellow",
-        );
-        await panInDirection(page, dir, 600);
-        didPan = true;
-        const apiPos2 = await getAttackClickPos(page, target.name);
-        if (apiPos2) {
-          x = apiPos2.x + (Math.random() - 0.5) * 20;
-          y = apiPos2.y + (Math.random() - 0.5) * 20;
-          method = `pan+api-${apiPos2.method}`;
-        } else {
-          x = zone.cx + Math.cos(dir) * zone.width * 0.4;
-          y = zone.cy + Math.sin(dir) * zone.height * 0.4;
-          method = "pan+api-edge";
-        }
-      } else {
-        // API found player but can't get direction — use label as fallback
-        if (target.labelX && target.labelY) {
-          x = target.labelX + (Math.random() - 0.5) * 30;
-          y = target.labelY + (Math.random() - 0.5) * 30;
-          method = "label";
-        } else {
-          x = apiPos.x;
-          y = apiPos.y;
-          method = "api-offscreen";
-        }
-      }
-    } else if (target && target.labelX && target.labelY) {
-      // Fallback: label click (works for visible players)
-      x = target.labelX + (Math.random() - 0.5) * 30;
-      y = target.labelY + (Math.random() - 0.5) * 30;
-      method = "label";
-    } else {
-      ({ x, y } = randomBorder(zone));
-      method = "random-fallback";
-      log(`RL: Warning — no targeting data for ${target?.name || targetIdx}`);
-    }
-
-    const isWilderness = !!(target && target._wildernessCC);
-
-    // Clamp to safe zone to avoid clicking UI elements
-    x = Math.max(zone.left, Math.min(zone.right, x));
-    y = Math.max(zone.top, Math.min(zone.bottom, y));
-
-    // Check if click would hit ANY UI element — if so, pan away or skip
-    const uiCheck = await safeEval(
-      page,
-      (cx, cy) => {
-        const pad = 15;
-        const vw = window.innerWidth,
-          vh = window.innerHeight;
-        // Collect all UI element bounding rects
-        const selectors = [
-          "leader-board",
-          "player-info-bar",
-          "attacks-display",
-          "game-right-sidebar",
-          "build-menu",
-          "[class*='player-info']",
-          "[class*='bottom-bar']",
-          "[class*='hud']",
-          ".player-name",
-        ];
-        for (const sel of selectors) {
-          const els = document.querySelectorAll(sel);
-          for (const el of els) {
-            const r = el.getBoundingClientRect();
-            if (r.width === 0 || r.height === 0) continue;
-            if (
-              cx >= r.left - pad &&
-              cx <= r.right + pad &&
-              cy >= r.top - pad &&
-              cy <= r.bottom + pad
-            ) {
-              const elCx = (r.left + r.right) / 2;
-              const elCy = (r.top + r.bottom) / 2;
-              const angle = Math.atan2(elCy - vh / 2, elCx - vw / 2);
-              return { blocked: true, element: sel, panAngle: angle + Math.PI };
-            }
-          }
-        }
-        // Also check: top 170px is always dangerous (banners, info bars)
-        if (cy < 170)
-          return { blocked: true, element: "top-zone", panAngle: Math.PI / 2 };
-        // Bottom 120px (HUD)
-        if (cy > vh - 120)
-          return {
-            blocked: true,
-            element: "bottom-zone",
-            panAngle: -Math.PI / 2,
-          };
-        return { blocked: false };
-      },
-      x,
-      y,
-    );
-
-    if (uiCheck && uiCheck.blocked) {
       log(
-        `RL: Attack ${target?.name || "?"} at (${Math.round(x)},${Math.round(y)}) behind ${uiCheck.element}, panning`,
+        `RL: Attack ${target.id} troops=${troops} ratio=${troopFraction} [EventBus]`,
       );
-      // Show debug marker: where we wanted to click (blocked) and pan direction
-      const panEndX2 = zone.cx + Math.cos(uiCheck.panAngle) * 150;
-      const panEndY2 = zone.cy + Math.sin(uiCheck.panAngle) * 150;
-      await showDebugMarker(
-        page,
-        x,
-        y,
-        zone.cx,
-        zone.cy,
-        `BLOCKED by ${uiCheck.element} → pan`,
-        "orange",
-      );
-      // Pan opposite to the UI element, then recenter + re-query
-      await panInDirection(page, uiCheck.panAngle, 500);
-      didPan = true;
-      await sleep(200);
-      // Re-query position after pan
-      let apiRetry = null;
-      if (isWilderness && target._wildernessCC) {
-        apiRetry = await safeEval(
-          page,
-          async (ccData) => {
-            try {
-              const sidebar = document.querySelector("game-right-sidebar");
-              if (!sidebar?.game) return null;
-              const g = sidebar.game;
-              const th = document.querySelector("build-menu")?.transformHandler;
-              if (!th) return null;
-              const me = g.myPlayer?.();
-              if (!me || typeof me.borderTiles !== "function") return null;
-              const vw = window.innerWidth,
-                vh = window.innerHeight;
-              let ourBorder = [...(await me.borderTiles()).borderTiles];
-              const scored = ourBorder.map((t) => ({
-                t,
-                d:
-                  Math.abs(g.x(t) - ccData.centroidX) +
-                  Math.abs(g.y(t) - ccData.centroidY),
-              }));
-              scored.sort((a, b) => a.d - b.d);
-              for (let i = 0; i < Math.min(scored.length, 50); i++) {
-                for (const adj of g.neighbors(scored[i].t)) {
-                  if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
-                    let deep = adj;
-                    for (let d = 0; d < 2; d++) {
-                      for (const a2 of g.neighbors(deep)) {
-                        if (
-                          g.ownerID(a2) === 0 &&
-                          (!g.isLand || g.isLand(a2))
-                        ) {
-                          deep = a2;
-                          break;
-                        }
-                      }
-                    }
-                    const ds = th.worldToScreenCoordinates({
-                      x: g.x(deep),
-                      y: g.y(deep),
-                    });
-                    const os = th.worldToScreenCoordinates({
-                      x: g.x(scored[i].t),
-                      y: g.y(scored[i].t),
-                    });
-                    const dx = ds.x - os.x,
-                      dy = ds.y - os.y,
-                      len = Math.sqrt(dx * dx + dy * dy) || 1;
-                    return {
-                      x: ds.x + (dx / len) * 12,
-                      y: ds.y + (dy / len) * 12,
-                      onScreen:
-                        ds.x > 50 &&
-                        ds.x < vw - 50 &&
-                        ds.y > 30 &&
-                        ds.y < vh - 100,
-                    };
-                  }
-                }
-              }
-              return null;
-            } catch (e) {
-              return null;
-            }
-          },
-          target._wildernessCC,
-        );
-      } else if (target) {
-        apiRetry = await getAttackClickPos(page, target.name);
-      }
-      if (apiRetry && apiRetry.onScreen) {
-        x = apiRetry.x;
-        y = apiRetry.y;
-        method = "pan-retry";
-      } else {
-        log(`RL: Target off-screen after pan, will retry next tick`);
-        await centerCamera(page);
-        await restoreClickZoom(page, atkZoomSteps);
-        return;
-      }
+      return;
     }
 
-    // Count outgoing attacks before clicking
-    const outBefore =
-      (await safeEval(page, () => {
-        const d = document.querySelector("attacks-display");
-        if (!d) return 0;
-        let c = 0;
-        if (d.outgoingAttacks) c += d.outgoingAttacks.length;
-        if (d.outgoingLandAttacks) c += d.outgoingLandAttacks.length;
-        if (d.outgoingBoats) c += d.outgoingBoats.length;
-        return c;
-      })) || 0;
-
-    // Log what we're clicking and verify it's on our territory's neighbor
-    const targetName = target ? target.name : "unknown";
-    log(
-      `RL: Clicking attack at (${Math.round(x)},${Math.round(y)}) target=${targetName} method=${method} isLand=${target?.isLandNeighbor} isWild=${isWilderness}`,
-    );
-    await page.mouse.click(x, y);
-    await sleep(150);
-    await showDebugMarker(
-      page,
-      x,
-      y,
-      originX,
-      originY,
-      `ATK → ${targetName} (${method})`,
-      "red",
-    );
-
-    // Check if attack actually started
-    const outAfter =
-      (await safeEval(page, () => {
-        const d = document.querySelector("attacks-display");
-        if (!d) return 0;
-        let c = 0;
-        if (d.outgoingAttacks) c += d.outgoingAttacks.length;
-        if (d.outgoingLandAttacks) c += d.outgoingLandAttacks.length;
-        if (d.outgoingBoats) c += d.outgoingBoats.length;
-        return c;
-      })) || 0;
-
-    if (outAfter <= outBefore && target) {
-      // Attack didn't start — zoom in for precision, retry, zoom back out
-      log(`RL: Attack miss on ${targetName}, zooming in to retry`);
-      for (let i = 0; i < 4; i++) await zoomStep(page, -100); // zoom in 4 steps
-      await sleep(100);
-      // Re-focus canvas and re-set troop ratio (zoom may have unfocused)
-      await focusCanvas(page);
-      const retrySteps = Math.round((troopFraction - currentAttackRatio) / 0.1);
-      if (retrySteps !== 0) {
-        const key = retrySteps > 0 ? "y" : "t";
-        for (let i = 0; i < Math.abs(retrySteps); i++)
-          await page.keyboard.press(key);
-        currentAttackRatio = troopFraction;
-        await sleep(30);
-      }
-      // For wilderness: re-run wilderness targeting (getAttackClickPos only finds players)
-      let retryPos = null;
-      if (isWilderness) {
-        retryPos = await safeEval(
-          page,
-          async (ccData) => {
-            try {
-              const sidebar = document.querySelector("game-right-sidebar");
-              if (!sidebar?.game) return null;
-              const g = sidebar.game;
-              const buildMenu = document.querySelector("build-menu");
-              const th = buildMenu?.transformHandler;
-              if (!th) return null;
-              const me = g.myPlayer?.();
-              if (!me || typeof me.borderTiles !== "function") return null;
-              const vw = window.innerWidth,
-                vh = window.innerHeight;
-              let ourBorder = [];
-              try {
-                ourBorder = [...(await me.borderTiles()).borderTiles];
-              } catch (e) {
-                return null;
-              }
-              const ccX = ccData.centroidX,
-                ccY = ccData.centroidY;
-              const scored = ourBorder.map((t) => ({
-                t,
-                d: Math.abs(g.x(t) - ccX) + Math.abs(g.y(t) - ccY),
-              }));
-              scored.sort((a, b) => a.d - b.d);
-              for (let i = 0; i < Math.min(scored.length, 50); i++) {
-                const borderTile = scored[i].t;
-                for (const adj of g.neighbors(borderTile)) {
-                  if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
-                    let deepTile = adj;
-                    for (let depth = 0; depth < 2; depth++) {
-                      for (const adj2 of g.neighbors(deepTile)) {
-                        if (
-                          g.ownerID(adj2) === 0 &&
-                          (!g.isLand || g.isLand(adj2))
-                        ) {
-                          deepTile = adj2;
-                          break;
-                        }
-                      }
-                    }
-                    const deepScreen = th.worldToScreenCoordinates({
-                      x: g.x(deepTile),
-                      y: g.y(deepTile),
-                    });
-                    const ourScreen = th.worldToScreenCoordinates({
-                      x: g.x(borderTile),
-                      y: g.y(borderTile),
-                    });
-                    const dx = deepScreen.x - ourScreen.x,
-                      dy = deepScreen.y - ourScreen.y;
-                    const len = Math.sqrt(dx * dx + dy * dy) || 1;
-                    const fx = deepScreen.x + (dx / len) * 12,
-                      fy = deepScreen.y + (dy / len) * 12;
-                    return {
-                      x: fx,
-                      y: fy,
-                      onScreen:
-                        fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
-                    };
-                  }
-                }
-              }
-              return null;
-            } catch (e) {
-              return null;
-            }
-          },
-          target._wildernessCC,
-        );
-      } else {
-        retryPos = await getAttackClickPos(page, target.name);
-      }
-      if (retryPos && retryPos.onScreen) {
-        // Check all UI elements before retry click
-        const retryBlocked = await safeEval(
-          page,
-          (cx, cy) => {
-            const pad = 15;
-            const vh = window.innerHeight;
-            const selectors = [
-              "leader-board",
-              "player-info-bar",
-              "attacks-display",
-              "game-right-sidebar",
-              "build-menu",
-              "[class*='player-info']",
-            ];
-            for (const sel of selectors) {
-              const el = document.querySelector(sel);
-              if (!el) continue;
-              const r = el.getBoundingClientRect();
-              if (r.width === 0 || r.height === 0) continue;
-              if (
-                cx >= r.left - pad &&
-                cx <= r.right + pad &&
-                cy >= r.top - pad &&
-                cy <= r.bottom + pad
-              )
-                return true;
-            }
-            if (cy < 170 || cy > vh - 120) return true;
-            return false;
-          },
-          retryPos.x,
-          retryPos.y,
-        );
-        if (retryBlocked) {
-          log(`RL: Retry target behind UI, skipping`);
-        } else {
-          await page.mouse.click(retryPos.x, retryPos.y);
-          await sleep(150);
-          await showDebugMarker(
-            page,
-            retryPos.x,
-            retryPos.y,
-            originX,
-            originY,
-            `ATK retry → ${targetName}`,
-            "orange",
-          );
-          log(
-            `RL: Attack retry ${targetName} at (${Math.round(retryPos.x)},${Math.round(retryPos.y)})`,
-          );
-        }
-      }
-      // Zoom back out and recenter
-      for (let i = 0; i < 4; i++) await zoomStep(page, 100);
-      await centerCamera(page);
-    } else {
-      log(
-        `RL: Attack ${targetName} at (${Math.round(x)},${Math.round(y)}) ratio=${troopFraction} method=${method}`,
-      );
-    }
-
-    // Restore zoom level after attack
-    await restoreClickZoom(page, atkZoomSteps);
-    // If we panned or zoomed for this attack, recenter so subsequent actions work correctly
-    if (didPan || atkZoomSteps > 0) {
-      await centerCamera(page);
+    // ── Wilderness / boat attack: targetID=null → attack terraNullius (unclaimed territory) ──
+    // SendAttackIntentEvent(null, troops) expands into unclaimed land; server picks the tile.
+    if (target && target._wildernessCC) {
+      const troops = Math.floor((gameState?.myTroops || 0) * troopFraction);
+      await page.evaluate((t) => window.__rl__?.attack(null, t), troops);
+      log(`RL: Expand wilderness troops=${troops} [EventBus]`);
+      return;
     }
   } else if (actionType === ACTION_RETREAT) {
     // Click the ❌ button on the most recent outgoing attack in attacks-display
@@ -2511,342 +1985,96 @@ async function executeRLAction(
       return false;
     });
     log(`RL: Retreat ${retreated ? "✓" : "no outgoing attacks"}`);
-  } else if (BUILD_KEYS[actionType]) {
-    const { key, name, minGold } = BUILD_KEYS[actionType];
+  } else if (BUILD_UNIT_TYPES[actionType]) {
+    const { name, minGold } = BUILD_KEYS[actionType];
+    const { unitType, border } = BUILD_UNIT_TYPES[actionType];
 
-    // Don't waste time trying to build if we can't afford it
     if (gold < minGold) {
       log(
-        `RL: Skip build ${name} — need ${(minGold / 1000).toFixed(0)}K gold, have ${(gold / 1000).toFixed(0)}K. Expanding instead.`,
+        `RL: Skip build ${name} — need ${(minGold / 1000).toFixed(0)}K gold, have ${(gold / 1000).toFixed(0)}K`,
       );
-      // Use raycast to find border and expand
-      for (let i = 0; i < 5; i++) {
-        const angle = Math.random() * Math.PI * 2;
-        const hit = await raycastToBorder(page, angle);
-        if (hit) {
-          const cx = Math.max(zone.left, Math.min(zone.right, hit.x));
-          const cy = Math.max(zone.top, Math.min(zone.bottom, hit.y));
-          await page.mouse.click(cx, cy);
-          await sleep(50);
-        }
-      }
       return;
     }
 
-    // Zoom in for click precision
-    const buildZoomSteps = await ensureClickZoom(page);
-    await centerCamera(page);
-
-    const isBorderBuilding =
-      actionType === ACTION_BUILD_DEFENSE ||
-      actionType === ACTION_BUILD_SAM ||
-      actionType === ACTION_BUILD_PORT;
-
-    // PRIMARY: Use game API to find a good build position (screen coords at current zoom)
-    const apiBuildPos = await getBuildClickPos(page, isBorderBuilding);
-
-    // Helper: attempt a build click at (bx, by) — press key, click, check gold
-    const tryBuild = async (bx, by, method) => {
-      await page.mouse.move(bx, by);
-      await sleep(100);
-      await focusCanvas(page);
-      await page.keyboard.press(key).catch(() => {});
-      await sleep(500);
-      await page.mouse.click(bx, by);
-      await sleep(300);
-      await page.keyboard.press("Escape").catch(() => {});
-      // Check if gold decreased (= build succeeded)
-      const newGold = await safeEval(page, () => {
-        const sb = document.querySelector("game-right-sidebar");
-        const me = sb?.game?.myPlayer?.();
-        return me ? Number(me.gold()) : null;
-      });
-      const succeeded = newGold !== null && newGold < gold - 1000;
-      await showDebugMarker(
-        page,
-        bx,
-        by,
-        bx,
-        by,
-        `BUILD ${name} (${method}${succeeded ? "" : " MISS"})`,
-        succeeded ? "lime" : "yellow",
-      );
-      return succeeded;
-    };
-
-    if (apiBuildPos) {
-      let built = await tryBuild(apiBuildPos.x, apiBuildPos.y, "api");
-      if (!built) {
-        // Retry: recenter and recompute position (already zoomed in via ensureClickZoom)
-        log(`RL: Build ${name} miss, retrying with fresh coords`);
-        await centerCamera(page);
-        const retryPos = await getBuildClickPos(page, isBorderBuilding);
-        if (retryPos) {
-          built = await tryBuild(retryPos.x, retryPos.y, "api-retry");
-        }
-      }
-      lastBuildResult = built ? "success" : "fail";
-      lastActionSucceeded = built;
-      log(
-        `RL: Build ${name} at (${Math.round(apiBuildPos.x)},${Math.round(apiBuildPos.y)}) method=api ${built ? "✓" : "✗"} [gold=${(gold / 1000).toFixed(0)}K]`,
-      );
+    const goldBefore = gold;
+    if (border) {
+      await page.evaluate((ut) => window.__rl__?.buildOnBorder(ut), unitType);
     } else {
-      // FALLBACK: Zoom in and pick random spots near center
-      const savedScale = currentScale;
-      const targetBuildScale = 1.5;
-      const zoomInSteps = Math.max(
-        0,
-        Math.round(Math.log(currentScale / targetBuildScale) / Math.log(1.2)),
-      );
-      for (let i = 0; i < Math.min(zoomInSteps, 15); i++)
-        await zoomStep(page, -100);
-      await sleep(200);
-
-      const box2 = await getCanvasBounds(page);
-      if (!box2) return;
-      const trueCx = box2.x + box2.width / 2;
-      const trueCy = box2.y + box2.height / 2;
-
-      const currentUnits = unitPositions || [];
-      let spot = null;
-      for (let attempt = 0; attempt < 12; attempt++) {
-        let candidate;
-        if (isBorderBuilding) {
-          const angle = Math.random() * Math.PI * 2;
-          const dist = 50 + Math.random() * 50;
-          candidate = {
-            x: trueCx + Math.cos(angle) * dist,
-            y: trueCy + Math.sin(angle) * dist,
-          };
-        } else {
-          candidate = {
-            x: trueCx + (Math.random() - 0.5) * 100,
-            y: trueCy + (Math.random() - 0.5) * 100,
-          };
-        }
-        if (!isNearUnit(candidate.x, candidate.y, currentUnits)) {
-          spot = candidate;
-          break;
-        }
-      }
-      if (!spot) {
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 70 + Math.random() * 50;
-        spot = {
-          x: trueCx + Math.cos(angle) * dist,
-          y: trueCy + Math.sin(angle) * dist,
-        };
-      }
-
-      let built = await tryBuild(spot.x, spot.y, "fallback");
-      if (!built) {
-        // Retry with a different spot
-        log(`RL: Build ${name} fallback miss, retrying different spot`);
-        const angle2 = Math.random() * Math.PI * 2;
-        const dist2 = 40 + Math.random() * 40;
-        const spot2 = {
-          x: trueCx + Math.cos(angle2) * dist2,
-          y: trueCy + Math.sin(angle2) * dist2,
-        };
-        built = await tryBuild(spot2.x, spot2.y, "fallback-retry");
-      }
-      lastBuildResult = built ? "success" : "fail";
-      lastActionSucceeded = built;
-      log(
-        `RL: Build ${name} at (${Math.round(spot.x)},${Math.round(spot.y)}) method=fallback ${built ? "✓" : "✗"} [gold=${(gold / 1000).toFixed(0)}K]`,
-      );
-
-      // Zoom back out (fallback's own zoom)
-      const zoomOutSteps = Math.max(
-        0,
-        Math.round(Math.log(currentScale / savedScale) / Math.log(1.2)),
-      );
-      for (let i = 0; i < Math.min(zoomOutSteps, 15); i++)
-        await zoomStep(page, 100);
+      await page.evaluate((ut) => window.__rl__?.build(ut, null), unitType);
     }
-    // Restore the ensureClickZoom zoom
-    await restoreClickZoom(page, buildZoomSteps);
-    if (buildZoomSteps > 0) await centerCamera(page);
-  } else if (NUKE_KEYS[actionType]) {
-    const { key, name, minGold } = NUKE_KEYS[actionType];
+    await sleep(200);
+    const newGold = await safeEval(page, () => {
+      const sb = document.querySelector("game-right-sidebar");
+      const me = sb?.game?.myPlayer?.();
+      return me ? Number(me.gold()) : null;
+    });
+    const built = newGold !== null && newGold < goldBefore - 1000;
+    lastBuildResult = built ? "success" : "fail";
+    lastActionSucceeded = built;
+    log(`RL: Build ${unitType} [EventBus] ${built ? "✓" : "✗"} [gold=${(goldBefore / 1000).toFixed(0)}K]`);
+  } else if (NUKE_UNIT_TYPES[actionType]) {
+    const { unitType, minGold } = NUKE_UNIT_TYPES[actionType];
     if (gold < minGold) {
-      log(`RL: Skip ${name} — need ${(minGold / 1000).toFixed(0)}K gold`);
+      log(`RL: Skip ${unitType} — need ${(minGold / 1000).toFixed(0)}K gold`);
       return;
     }
-    // Nukes: zoom in for precision, press key, then click on enemy territory
-    const nukeZoomSteps = 0; // no pre-zoom for nukes
-    await page.keyboard.press(key).catch(() => {});
-    await sleep(300);
-
-    // Aim toward target player using game API first
     const nukeTargetIdx = action.targetIdx || 0;
     const nukeTarget = neighbors[nukeTargetIdx];
-    let nx, ny;
-    let nukeMethod = "random";
-
-    // Try game API for target position
-    const nukeApiPos = nukeTarget
-      ? await getAttackClickPos(page, nukeTarget.name)
-      : null;
-    if (nukeApiPos) {
-      if (nukeApiPos.onScreen) {
-        nx = nukeApiPos.x;
-        ny = nukeApiPos.y;
-        nukeMethod = `api-${nukeApiPos.method}`;
-      } else {
-        const dir = await getDirectionToTarget(page, nukeTarget.name);
-        if (dir !== null) {
-          const npx = zone.cx + Math.cos(dir) * 150;
-          const npy = zone.cy + Math.sin(dir) * 150;
-          await showDebugMarker(
-            page,
-            npx,
-            npy,
-            zone.cx,
-            zone.cy,
-            `PAN → ${nukeTarget.name} (nuke, off-screen)`,
-            "magenta",
+    // Pick any tile owned by the target player as the nuke destination
+    const targetTile = nukeTarget
+      ? await safeEval(page, (targetName) => {
+          const g = document.querySelector("game-right-sidebar")?.game;
+          if (!g) return null;
+          const players = typeof g.players === "function" ? g.players() : [];
+          const tp = players.find(
+            (p) =>
+              (typeof p.displayName === "function" ? p.displayName() : null) ===
+              targetName,
           );
-          await panInDirection(page, dir, 600);
-          const pos2 = await getAttackClickPos(page, nukeTarget.name);
-          if (pos2) {
-            nx = pos2.x;
-            ny = pos2.y;
-            nukeMethod = `pan+api-${pos2.method}`;
-          } else {
-            nx = zone.cx + Math.cos(dir) * zone.width * 0.4;
-            ny = zone.cy + Math.sin(dir) * zone.height * 0.4;
-            nukeMethod = "pan+api-edge";
-          }
-        } else {
-          nx = nukeApiPos.x;
-          ny = nukeApiPos.y;
-          nukeMethod = "api-offscreen";
-        }
-      }
-    } else {
-      // Fallback: cached direction + raycast
-      let nukeAngle = null;
-      if (nukeTarget && nukeTarget.labelX && nukeTarget.labelY) {
-        const dx = nukeTarget.labelX - zone.cx;
-        const dy = nukeTarget.labelY - zone.cy;
-        if (Math.sqrt(dx * dx + dy * dy) > 10) {
-          nukeAngle = Math.atan2(dy, dx);
-        }
-      }
-      if (
-        nukeAngle === null &&
-        nukeTarget &&
-        cachedNeighborDirections.has(nukeTarget.name)
-      ) {
-        nukeAngle = cachedNeighborDirections.get(nukeTarget.name).angle;
-      }
-      if (nukeAngle === null && nukeTarget) {
-        const dir = await getDirectionToTarget(page, nukeTarget.name);
-        if (dir !== null) nukeAngle = dir;
-      }
-
-      if (nukeAngle !== null) {
-        const hit = await raycastToBorder(page, nukeAngle);
-        if (hit) {
-          const extra = 60 + Math.random() * 40;
-          nx = hit.x + Math.cos(nukeAngle) * extra;
-          ny = hit.y + Math.sin(nukeAngle) * extra;
-          nukeMethod = "raycast";
-        } else {
-          nx = zone.cx + Math.cos(nukeAngle) * zone.width * 0.4;
-          ny = zone.cy + Math.sin(nukeAngle) * zone.height * 0.4;
-          nukeMethod = "edge";
-        }
-      } else {
-        const angle = Math.random() * Math.PI * 2;
-        const dist = 150 + Math.random() * 100;
-        nx = zone.cx + Math.cos(angle) * dist;
-        ny = zone.cy + Math.sin(angle) * dist;
-      }
+          if (!tp) return null;
+          const tiles =
+            typeof tp.tiles === "function" ? [...tp.tiles()] : [];
+          return tiles.length
+            ? tiles[Math.floor(Math.random() * tiles.length)]
+            : null;
+        }, nukeTarget.name)
+      : null;
+    if (targetTile === null) {
+      log(`RL: Skip ${unitType} — no target tile found`);
+      return;
     }
-
-    nx = Math.max(zone.left, Math.min(zone.right, nx));
-    ny = Math.max(zone.top, Math.min(zone.bottom, ny));
-
-    await page.mouse.move(nx, ny);
-    await sleep(300);
-    await page.mouse.click(nx, ny);
-    await sleep(200);
-    await page.keyboard.press("Escape").catch(() => {});
-    const nukeTargetName = nukeTarget ? nukeTarget.name : "unknown";
-    log(
-      `RL: Launch ${name} at ${nukeTargetName} (${Math.round(nx)},${Math.round(ny)}) method=${nukeMethod}`,
+    await page.evaluate(
+      (ut, tile) => window.__rl__?.build(ut, tile),
+      unitType,
+      targetTile,
     );
-    // Restore zoom and recenter
-    await restoreClickZoom(page, nukeZoomSteps);
-    if (nukeMethod.startsWith("pan") || nukeZoomSteps > 0) {
-      await centerCamera(page);
-    }
+    log(`RL: Launch ${unitType} → ${nukeTarget?.name ?? "?"} tile=${targetTile} [EventBus]`);
     return { nukeLaunched: true };
   } else if (actionType === ACTION_UPGRADE) {
-    // Right-click near a unit to open radial menu, then click "build" slot,
-    // then click the unit type to upgrade it
     unitPositions = unitPositions || [];
-    if (unitPositions.length === 0) {
+    const upgUnit = unitPositions.find((u) => u.unitId !== null) || unitPositions[0];
+    if (!upgUnit) {
       log("RL: Upgrade — no unit positions");
       return;
     }
-    const upgZoomSteps = 0; // no pre-zoom for upgrades
-    const upgUnit = unitPositions[0];
-    await page.mouse.click(upgUnit.x, upgUnit.y, { button: "right" });
-    await sleep(400);
-    // Click the "build" slot in the SVG radial menu
-    const opened = await safeEval(page, () => {
-      const el =
-        document.querySelector('path[data-id="build"]') ||
-        document.querySelector('g[data-id="build"]');
-      if (el) {
-        el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-        return true;
-      }
-      return false;
-    });
-    if (opened) {
-      await sleep(300);
-      // In the build submenu, clicking near an existing unit upgrades it
-      await page.mouse.click(upgUnit.x, upgUnit.y);
-    }
-    log(
-      `RL: Upgrade at (${Math.round(upgUnit.x)},${Math.round(upgUnit.y)}) ${opened ? "✓" : "no menu"}`,
+    await page.evaluate(
+      (uid, ut) => window.__rl__?.upgrade(uid, ut),
+      upgUnit.unitId,
+      upgUnit.type,
     );
-    await restoreClickZoom(page, upgZoomSteps);
-    if (upgZoomSteps > 0) await centerCamera(page);
+    log(`RL: Upgrade ${upgUnit.type} id=${upgUnit.unitId} [EventBus]`);
   } else if (actionType === ACTION_DELETE_UNIT) {
-    // Right-click near a unit to open radial menu, then click "delete" slot
     unitPositions = unitPositions || [];
-    if (unitPositions.length === 0) {
+    const delUnit =
+      [...unitPositions].reverse().find((u) => u.active !== false && u.unitId !== null) ||
+      unitPositions[unitPositions.length - 1];
+    if (!delUnit) {
       log("RL: Delete unit — no unit positions");
       return;
     }
-    const delZoomSteps = 0; // no pre-zoom for deletes
-    // Pick last active unit
-    const delUnit =
-      [...unitPositions].reverse().find((u) => u.active !== false) ||
-      unitPositions[unitPositions.length - 1];
-    await page.mouse.click(delUnit.x, delUnit.y, { button: "right" });
-    await sleep(400);
-    const deleted = await safeEval(page, () => {
-      const el =
-        document.querySelector('path[data-id="delete"]') ||
-        document.querySelector('g[data-id="delete"]');
-      if (el) {
-        el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-        return true;
-      }
-      return false;
-    });
-    log(
-      `RL: Delete unit at (${Math.round(delUnit.x)},${Math.round(delUnit.y)}) ${deleted ? "✓" : "no menu"}`,
-    );
-    await restoreClickZoom(page, delZoomSteps);
-    if (delZoomSteps > 0) await centerCamera(page);
-    if (deleted) return { deleted: true };
+    await page.evaluate((uid) => window.__rl__?.deleteUnit(uid), delUnit.unitId);
+    log(`RL: Delete ${delUnit.type} id=${delUnit.unitId} [EventBus]`);
+    return { deleted: true };
   }
 }
 
@@ -2909,7 +2137,7 @@ async function main() {
         const p = await target.page();
         if (
           p &&
-          !p.url().includes("openfront.io") &&
+          !p.url().includes(new URL(GAME_URL).host) &&
           p.url() !== "about:blank"
         ) {
           log(`Closing ad tab: ${p.url().slice(0, 50)}`);
@@ -2966,15 +2194,12 @@ async function main() {
   let lastNeighbors = [];
   let lastUnitPositions = [];
   let lastGameState = null;
-  let lastRecenter = 0;
   lastGold = 0;
   currentScale = 1.8; // reset to game default at game start
   lastTerritoryPct = 0;
   let spawnTime = 0;
-  let lastNeighborScan = 0; // Brief zoom-out to refresh neighbor label data
   const playerRelations = new Map(); // name -> Relation (0=Hostile,1=Distrustful,2=Neutral,3=Friendly)
   let nukeCount = 0; // Track nukes launched (increment on launch, decrement on resolve)
-  const cachedNeighborDirections = new Map(); // name -> { angle }
 
   while (true) {
     try {
@@ -3134,7 +2359,6 @@ async function main() {
           }
           // One final re-center after all zooming
           await centerCamera(page);
-          lastRecenter = Date.now();
         }
         continue;
       }
@@ -3145,121 +2369,6 @@ async function main() {
         continue;
       }
       const zone = getSafeZone(box);
-
-      // ── RECENTER & DYNAMIC ZOOM every 10 seconds ──
-      if (Date.now() - lastRecenter > 10000) {
-        lastRecenter = Date.now();
-        await centerCamera(page);
-
-        // Sync actual scale from game
-        const realScale2 = await safeEval(page, () => {
-          const bm = document.querySelector("build-menu");
-          return bm?.transformHandler?.scale ?? null;
-        });
-        if (realScale2) currentScale = realScale2;
-
-        // Zoom targets: balance seeing our territory and neighbors
-        const tPct = lastTerritoryPct;
-        let targetScale;
-        if (tPct < 0.0005) targetScale = 10.0;
-        else if (tPct < 0.001) targetScale = 6.0;
-        else if (tPct < 0.003) targetScale = 4.0;
-        else if (tPct < 0.005) targetScale = 3.0;
-        else if (tPct < 0.01) targetScale = 2.5;
-        else if (tPct < 0.03) targetScale = 2.0;
-        else if (tPct < 0.05) targetScale = 1.8;
-        else targetScale = 1.5;
-
-        const scaleRatio = currentScale / targetScale;
-        if (scaleRatio > 1.3 || scaleRatio < 0.77) {
-          const stepsNeeded = Math.round(
-            Math.log(targetScale / currentScale) / Math.log(1.2),
-          );
-          const clamped = Math.max(-10, Math.min(10, stepsNeeded));
-          if (clamped !== 0) {
-            const delta = clamped > 0 ? -100 : 100;
-            for (let i = 0; i < Math.abs(clamped); i++)
-              await zoomStep(page, delta);
-            log(
-              `Zoom: ${currentScale.toFixed(1)} → target ${targetScale.toFixed(1)}, ${Math.abs(clamped)} steps ${clamped > 0 ? "in" : "out"} (territory=${(tPct * 100).toFixed(2)}%)`,
-            );
-          }
-        }
-      }
-
-      // ── NEIGHBOR SCAN: briefly zoom out to refresh player labels ──
-      // We get neighbor data from the game API now, so we just need directions.
-      // Zoom out, grab label positions, zoom back to target scale.
-      if (
-        Date.now() - lastNeighborScan > 15000 &&
-        Date.now() - spawnTime > 15000
-      ) {
-        lastNeighborScan = Date.now();
-        // Sync actual scale from game
-        const realScale = await safeEval(page, () => {
-          const bm = document.querySelector("build-menu");
-          return bm?.transformHandler?.scale ?? null;
-        });
-        if (realScale) currentScale = realScale;
-
-        if (currentScale > 2.5) {
-          const tPct = lastTerritoryPct;
-          let targetScale;
-          if (tPct < 0.0005) targetScale = 10.0;
-          else if (tPct < 0.001) targetScale = 6.0;
-          else if (tPct < 0.003) targetScale = 4.0;
-          else if (tPct < 0.005) targetScale = 3.0;
-          else if (tPct < 0.01) targetScale = 2.5;
-          else if (tPct < 0.03) targetScale = 2.0;
-          else if (tPct < 0.05) targetScale = 1.8;
-          else targetScale = 1.5;
-
-          // Zoom out to ~1.5 for label visibility
-          const outSteps = Math.round(
-            Math.log(currentScale / 1.5) / Math.log(1.2),
-          );
-          const clamped = Math.min(outSteps, 8);
-          for (let i = 0; i < clamped; i++) await zoomStep(page, 100);
-          await sleep(600);
-
-          // Extract neighbor directions while zoomed out
-          const zoomedOutState = await extractGameState(page, BOT_NAME);
-          if (zoomedOutState && zoomedOutState.myLabelX) {
-            const ox = zoomedOutState.myLabelX;
-            const oy = zoomedOutState.myLabelY;
-            cachedNeighborDirections.clear();
-            for (const n of zoomedOutState.neighbors) {
-              if (n.labelX && n.labelY) {
-                const dx = n.labelX - ox;
-                const dy = n.labelY - oy;
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                if (dist > 5) {
-                  cachedNeighborDirections.set(n.name, {
-                    angle: Math.atan2(dy, dx),
-                  });
-                }
-              }
-            }
-            log(
-              `Neighbor scan: cached directions for ${cachedNeighborDirections.size} players`,
-            );
-          }
-
-          // Zoom back to target scale (not previous scale)
-          const nowScale = await safeEval(page, () => {
-            const bm = document.querySelector("build-menu");
-            return bm?.transformHandler?.scale ?? null;
-          });
-          if (nowScale) currentScale = nowScale;
-          const inSteps = Math.round(
-            Math.log(targetScale / currentScale) / Math.log(1.2),
-          );
-          const clampedIn = Math.max(-12, Math.min(12, inSteps));
-          if (clampedIn > 0) {
-            for (let i = 0; i < clampedIn; i++) await zoomStep(page, -100);
-          }
-        }
-      }
 
       // ── QUERY POLICY SERVER (interval matches training: TICKS_PER_STEP × TURN_INTERVAL_MS) ──
       if (Date.now() - lastPolicyQuery > POLICY_INTERVAL_MS) {
@@ -3361,7 +2470,6 @@ async function main() {
         lastNeighbors,
         lastUnitPositions,
         lastGameState,
-        cachedNeighborDirections,
       );
       if (actionResult?.nukeLaunched) nukeCount++;
       // Clear action after execution — matches training where 1 action = 1 step.
@@ -3415,7 +2523,7 @@ async function main() {
           ? `silo=${gs.hasSilo} port=${gs.hasPort} sam=${gs.hasSAM} ships=${gs.numWarships}`
           : "";
         log(
-          `[${elapsed.toFixed(0)}s] ${pct}% terr, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, tiles=${gs?.myTiles || 0}, tick=${gs?.tick || 0}, units=${units}, ${attacks}, ${bldgs}, neighbors=${nNeighbors}(${visNeighbors}vis), scale=${currentScale.toFixed(1)}, dirs=${cachedNeighborDirections.size}`,
+          `[${elapsed.toFixed(0)}s] ${pct}% terr, troops=${troops}, gold=${(lastGold / 1000).toFixed(0)}K, tiles=${gs?.myTiles || 0}, tick=${gs?.tick || 0}, units=${units}, ${attacks}, ${bldgs}, neighbors=${nNeighbors}(${visNeighbors}vis)`,
         );
         if (gs?._borderDebug) {
           const bd = gs._borderDebug;
