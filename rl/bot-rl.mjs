@@ -1028,8 +1028,11 @@ async function centerCamera(page) {
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 80) return; // already centered enough
 
-    // Pan with arrows: direction from screen center TOWARD our territory
-    const angle = Math.atan2(dy, dx);
+    // Pan so our territory moves toward screen center.
+    // Arrow keys in this game move the MAP (not camera), so pressing ArrowRight
+    // moves objects LEFT on screen. To bring territory toward center, we pan in
+    // the OPPOSITE direction of where territory currently is.
+    const angle = Math.atan2(-dy, -dx); // inverted direction
     const duration = Math.min(600, Math.max(100, dist * 0.4));
     await panInDirection(page, angle, duration);
     log(
@@ -1543,6 +1546,16 @@ async function getAttackClickPos(page, targetName) {
                 bestOursDist = d;
                 bestOurs = ourBorder[i];
               }
+            }
+            // If borders are far apart (>10 tiles), target is across water — skip
+            if (bestDist > 10) {
+              return {
+                x: 0,
+                y: 0,
+                onScreen: false,
+                method: "too-far",
+                dist: bestDist,
+              };
             }
             // Click on the target border tile, with screen coords shifted slightly
             // AWAY from our tile to ensure we land on their side
