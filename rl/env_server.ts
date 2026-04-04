@@ -151,6 +151,12 @@ let prevAliveCount = 0;
 let numOpponentsAtStart = 0;
 // Wilderness CC cache: maps synthetic IDs to our border tiles adjacent to that CC
 let wildernessBorderCache: Map<string, TileRef[]> = new Map();
+let cachedWildernessData: {
+  neighbors: any[];
+  borderCache: Map<string, TileRef[]>;
+} | null = null;
+let wildernessLastTick = -1;
+const WILDERNESS_RECOMPUTE_INTERVAL = 10; // recompute every N ticks
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -235,58 +241,86 @@ function getObservation() {
     }));
 
   // Wilderness connected components: unclaimed land regions bordering us
-  wildernessBorderCache.clear();
-  const visited = new Set<TileRef>();
-  const borderSet = rlPlayer.borderTiles();
-  let ccIndex = 0;
-  const CC_CAP = 5000;
+  // Only recompute every N ticks — wilderness changes slowly
+  const currentTick = tickCount;
+  if (
+    !cachedWildernessData ||
+    currentTick - wildernessLastTick >= WILDERNESS_RECOMPUTE_INTERVAL
+  ) {
+    wildernessLastTick = currentTick;
+    const newBorderCache = new Map<string, TileRef[]>();
+    const newNeighbors: typeof neighbors = [];
 
-  for (const bt of borderSet) {
-    for (const adj of game.neighbors(bt)) {
-      if (!game.isLand(adj) || game.hasOwner(adj) || visited.has(adj)) continue;
+    // Step 1: Find all unclaimed tiles directly adjacent to our border (1-layer fringe)
+    const borderSet = rlPlayer.borderTiles();
+    const fringeTiles = new Set<TileRef>(); // unclaimed tiles touching our border
+    const fringeToOurBorder = new Map<TileRef, TileRef[]>(); // fringe tile → our border tiles next to it
+    const borderToFringe = new Map<TileRef, TileRef[]>(); // our border tile → fringe tiles next to it
 
-      // BFS to find this connected component of unclaimed land
-      const ccTiles = new Set<TileRef>();
-      const queue: TileRef[] = [adj];
-      ccTiles.add(adj);
-      visited.add(adj);
+    for (const bt of borderSet) {
+      for (const adj of game.neighbors(bt)) {
+        if (!game.isLand(adj) || game.hasOwner(adj)) continue;
+        fringeTiles.add(adj);
+        // Track which border tiles connect to this fringe tile
+        if (!fringeToOurBorder.has(adj)) fringeToOurBorder.set(adj, []);
+        fringeToOurBorder.get(adj)!.push(bt);
+        if (!borderToFringe.has(bt)) borderToFringe.set(bt, []);
+        borderToFringe.get(bt)!.push(adj);
+      }
+    }
 
-      while (queue.length > 0 && ccTiles.size < CC_CAP) {
+    // Step 2: Group fringe tiles into CCs via BFS (only among fringe tiles — very fast)
+    const visited = new Set<TileRef>();
+    let ccIndex = 0;
+
+    for (const seed of fringeTiles) {
+      if (visited.has(seed)) continue;
+      visited.add(seed);
+
+      const ccFringe: TileRef[] = [seed];
+      const queue: TileRef[] = [seed];
+      const ourBorderSet = new Set<TileRef>();
+
+      // BFS among fringe tiles only (tiles in fringeTiles set)
+      while (queue.length > 0) {
         const curr = queue.pop()!;
+        // Add border tiles that connect to this fringe tile
+        for (const bt of fringeToOurBorder.get(curr) || []) {
+          ourBorderSet.add(bt);
+        }
         for (const n of game.neighbors(curr)) {
-          if (!visited.has(n) && game.isLand(n) && !game.hasOwner(n)) {
+          if (!visited.has(n) && fringeTiles.has(n)) {
             visited.add(n);
-            ccTiles.add(n);
+            ccFringe.push(n);
             queue.push(n);
           }
         }
       }
 
       const ccId = `wilderness_${ccIndex++}`;
+      newBorderCache.set(ccId, Array.from(ourBorderSet));
 
-      // Find our border tiles adjacent to this CC
-      const ourBorderTiles: TileRef[] = [];
-      for (const bt2 of borderSet) {
-        for (const n of game.neighbors(bt2)) {
-          if (ccTiles.has(n)) {
-            ourBorderTiles.push(bt2);
-            break;
-          }
-        }
-      }
-
-      wildernessBorderCache.set(ccId, ourBorderTiles);
-
-      neighbors.push({
+      newNeighbors.push({
         id: ccId,
         name: "Wilderness",
-        tiles: ccTiles.size,
+        tiles: ccFringe.length, // fringe size as proxy for CC size
         troops: 0,
         alive: true,
         relation: 0,
         isLandNeighbor: true,
       });
     }
+
+    cachedWildernessData = {
+      neighbors: newNeighbors,
+      borderCache: newBorderCache,
+    };
+  }
+
+  // Apply cached wilderness data
+  wildernessBorderCache = cachedWildernessData.borderCache;
+  for (const wn of cachedWildernessData.neighbors) {
+    neighbors.push({ ...wn });
   }
 
   // Sort: land neighbors first, then by territory size
@@ -895,6 +929,8 @@ async function resetGame(config: ResetConfig = {}) {
 
   rlPlayer = game.player("rl_agent");
   tickCount = 0;
+  cachedWildernessData = null;
+  wildernessLastTick = -1;
 
   // Cache land tile count for reward normalization
   landTiles = 0;
