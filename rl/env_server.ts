@@ -149,6 +149,8 @@ let tickCount = 0;
 let landTiles = 0; // cached at reset for reward normalization
 let prevAliveCount = 0;
 let numOpponentsAtStart = 0;
+// Wilderness CC cache: maps synthetic IDs to our border tiles adjacent to that CC
+let wildernessBorderCache: Map<string, TileRef[]> = new Map();
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -211,7 +213,15 @@ function getObservation() {
       .filter((n) => n.isPlayer())
       .map((n) => (n as Player).id()),
   );
-  const neighbors = game
+  const neighbors: Array<{
+    id: string;
+    name: string;
+    tiles: number;
+    troops: number;
+    alive: boolean;
+    relation: number;
+    isLandNeighbor: boolean;
+  }> = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
     .map((p) => ({
@@ -222,13 +232,68 @@ function getObservation() {
       alive: p.isAlive(),
       relation: rlPlayer!.relation(p),
       isLandNeighbor: landNeighborIds.has(p.id()),
-    }))
-    .sort((a, b) => {
-      // Land neighbors first, then by territory size (biggest threat)
-      if (a.isLandNeighbor !== b.isLandNeighbor)
-        return a.isLandNeighbor ? -1 : 1;
-      return b.tiles - a.tiles;
-    });
+    }));
+
+  // Wilderness connected components: unclaimed land regions bordering us
+  wildernessBorderCache.clear();
+  const visited = new Set<TileRef>();
+  const borderSet = rlPlayer.borderTiles();
+  let ccIndex = 0;
+  const CC_CAP = 5000;
+
+  for (const bt of borderSet) {
+    for (const adj of game.neighbors(bt)) {
+      if (!game.isLand(adj) || game.hasOwner(adj) || visited.has(adj)) continue;
+
+      // BFS to find this connected component of unclaimed land
+      const ccTiles = new Set<TileRef>();
+      const queue: TileRef[] = [adj];
+      ccTiles.add(adj);
+      visited.add(adj);
+
+      while (queue.length > 0 && ccTiles.size < CC_CAP) {
+        const curr = queue.pop()!;
+        for (const n of game.neighbors(curr)) {
+          if (!visited.has(n) && game.isLand(n) && !game.hasOwner(n)) {
+            visited.add(n);
+            ccTiles.add(n);
+            queue.push(n);
+          }
+        }
+      }
+
+      const ccId = `wilderness_${ccIndex++}`;
+
+      // Find our border tiles adjacent to this CC
+      const ourBorderTiles: TileRef[] = [];
+      for (const bt2 of borderSet) {
+        for (const n of game.neighbors(bt2)) {
+          if (ccTiles.has(n)) {
+            ourBorderTiles.push(bt2);
+            break;
+          }
+        }
+      }
+
+      wildernessBorderCache.set(ccId, ourBorderTiles);
+
+      neighbors.push({
+        id: ccId,
+        name: "Wilderness",
+        tiles: ccTiles.size,
+        troops: 0,
+        alive: true,
+        relation: 0,
+        isLandNeighbor: true,
+      });
+    }
+  }
+
+  // Sort: land neighbors first, then by territory size
+  neighbors.sort((a, b) => {
+    if (a.isLandNeighbor !== b.isLandNeighbor) return a.isLandNeighbor ? -1 : 1;
+    return b.tiles - a.tiles;
+  });
 
   // Our units
   const units = rlPlayer.units().map((u) => ({
@@ -240,7 +305,6 @@ function getObservation() {
 
   // Border tiles (for action targeting)
   const borderTilesArr: { x: number; y: number; ref: number }[] = [];
-  const borderSet = rlPlayer.borderTiles();
   let count = 0;
   for (const t of borderSet) {
     if (count++ > 200) break; // Cap for performance
@@ -316,9 +380,14 @@ function getObservation() {
   const landTargetMask = new Array(16).fill(0);
   const seaTargetMask = new Array(16).fill(0);
   neighbors.slice(0, 16).forEach((n, i) => {
-    const notAllied = !rlPlayer!.isAlliedWith(game!.player(n.id));
-    if (n.isLandNeighbor && notAllied) landTargetMask[i] = 1;
-    if (notAllied) seaTargetMask[i] = 1; // boat/nuke/warship
+    if (n.id.startsWith("wilderness_")) {
+      landTargetMask[i] = 1; // wilderness always attackable on land
+      // seaTargetMask stays 0 — can't boat-attack wilderness
+    } else {
+      const notAllied = !rlPlayer!.isAlliedWith(game!.player(n.id));
+      if (n.isLandNeighbor && notAllied) landTargetMask[i] = 1;
+      if (notAllied) seaTargetMask[i] = 1; // boat/nuke/warship
+    }
   });
   const hasAttackableNeighbor = landTargetMask.some((v) => v === 1);
   const hasAttackableBySeaNeighbor = seaTargetMask.some((v) => v === 1);
@@ -556,22 +625,33 @@ function executeAction(action: RLAction) {
 
   switch (action.type) {
     case "attack": {
-      if (!action.targetPlayerId || !game.hasPlayer(action.targetPlayerId))
-        break;
-      const target = game.player(action.targetPlayerId);
-      if (!target.isAlive()) break;
+      if (!action.targetPlayerId) break;
 
       const fraction = Math.max(0.1, Math.min(1, action.troopFraction ?? 0.5));
       const troops = Math.floor(rlPlayer.troops() * fraction);
       if (troops < 10) break;
 
-      const tile = findClosestBorderTile(target);
-      if (!tile) break;
-
-      game.addExecution(
-        new AttackExecution(troops, rlPlayer, target.id(), tile, true),
-      );
-      lastActionSucceeded = true;
+      if (action.targetPlayerId.startsWith("wilderness_")) {
+        // Attack unclaimed territory
+        const borderTiles = wildernessBorderCache.get(action.targetPlayerId);
+        if (!borderTiles || borderTiles.length === 0) break;
+        const sourceTile =
+          borderTiles[Math.floor(Math.random() * borderTiles.length)];
+        game.addExecution(
+          new AttackExecution(troops, rlPlayer, null, sourceTile, true),
+        );
+        lastActionSucceeded = true;
+      } else {
+        if (!game.hasPlayer(action.targetPlayerId)) break;
+        const target = game.player(action.targetPlayerId);
+        if (!target.isAlive()) break;
+        const tile = findClosestBorderTile(target);
+        if (!tile) break;
+        game.addExecution(
+          new AttackExecution(troops, rlPlayer, target.id(), tile, true),
+        );
+        lastActionSucceeded = true;
+      }
       break;
     }
 

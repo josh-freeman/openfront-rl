@@ -358,7 +358,7 @@ def train(args):
 
         # Win-rate-gated curriculum: advance when win rate exceeds threshold
         if args.curriculum and curriculum_stage < len(CURRICULUM_STAGES) - 1:
-            win_thresh = CURRICULUM_STAGES[curriculum_stage][4]
+            win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][4]
             if (win_thresh is not None
                     and len(episode_wins) >= CURRICULUM_MIN_EPISODES
                     and np.mean(episode_wins) >= win_thresh):
@@ -655,6 +655,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--anneal-lr", action="store_true", help="Linear LR annealing to zero")
     parser.add_argument("--curriculum", action="store_true", help="Curriculum learning: ramp difficulty/opponents over training")
+    parser.add_argument("--win-threshold", type=float, default=None, help="Override all curriculum win thresholds with this value")
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")
