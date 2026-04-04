@@ -1912,40 +1912,22 @@ async function executeRLAction(
               const borderTile = ourBorder[i];
               for (const adj of g.neighbors(borderTile)) {
                 if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
-                  // Found unclaimed tile — walk 2 more tiles into wilderness
-                  let deepTile = adj;
-                  for (let s = 0; s < 2; s++) {
-                    let went = false;
-                    for (const a2 of g.neighbors(deepTile)) {
-                      if (g.ownerID(a2) === 0 && (!g.isLand || g.isLand(a2))) {
-                        deepTile = a2;
-                        went = true;
-                        break;
-                      }
-                    }
-                    if (!went) break;
-                  }
-                  // Also offset screen coords away from our border tile
+                  // Found unclaimed tile adjacent to our border — click it directly
+                  // No walking deeper or offsetting, as that risks clicking into enemy territory
                   const wildScreen = th.worldToScreenCoordinates({
-                    x: g.x(deepTile),
-                    y: g.y(deepTile),
+                    x: g.x(adj),
+                    y: g.y(adj),
                   });
-                  const ourScreen = th.worldToScreenCoordinates({
-                    x: g.x(borderTile),
-                    y: g.y(borderTile),
-                  });
-                  const dx = wildScreen.x - ourScreen.x;
-                  const dy = wildScreen.y - ourScreen.y;
-                  const len = Math.sqrt(dx * dx + dy * dy) || 1;
-                  const fx = wildScreen.x + (dx / len) * 10;
-                  const fy = wildScreen.y + (dy / len) * 10;
                   const vw = window.innerWidth,
                     vh = window.innerHeight;
                   return {
-                    x: fx,
-                    y: fy,
+                    x: wildScreen.x,
+                    y: wildScreen.y,
                     onScreen:
-                      fx > 50 && fx < vw - 50 && fy > 30 && fy < vh - 100,
+                      wildScreen.x > 50 &&
+                      wildScreen.x < vw - 50 &&
+                      wildScreen.y > 30 &&
+                      wildScreen.y < vh - 100,
                     method: "wilderness-border",
                   };
                 }
