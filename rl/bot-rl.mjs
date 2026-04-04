@@ -3032,8 +3032,17 @@ async function main() {
           lastGold = gameState.myGold || 0;
           lastTerritoryPct = gameState.territoryPct || 0;
           const g = lastGold;
-          const hasN = gameState.neighbors.length > 0;
+          const neighbors = gameState.neighbors || [];
           const hasT = gameState.myTroops > 10;
+          const hasLandNeighbor = neighbors.some(
+            (n) => n.isLandNeighbor && !n.isAllied,
+          );
+          const hasSeaNeighbor = neighbors.some(
+            (n) =>
+              !n.isLandNeighbor &&
+              !n.isAllied &&
+              !n.id?.startsWith("wilderness_"),
+          );
           const hasOut = (gameState.outgoingAttacks || 0) > 0;
           const hasUnits = gameState.hasUnits || false;
           const hasSilo = gameState.hasSilo || false;
@@ -3042,6 +3051,7 @@ async function main() {
 
           // Use game API costs (accounts for scaling) to determine affordability
           const costs = gameState._buildCosts || {};
+          const canBuildAPI = gameState.canBuildFromAPI || {};
           const canAfford = (type) => {
             const cost = costs[type];
             return cost !== undefined ? g >= cost : false;
@@ -3050,20 +3060,20 @@ async function main() {
           // Action mask — check affordability using real costs from API
           gameState.actionMask = [
             true, // 0: NOOP
-            hasN && hasT, // 1: ATTACK
-            hasN && hasT, // 2: BOAT_ATTACK (no port required)
+            hasLandNeighbor && hasT, // 1: ATTACK (land neighbors only)
+            hasSeaNeighbor && hasT, // 2: BOAT_ATTACK (sea neighbors only)
             hasOut, // 3: RETREAT
             canAfford("City"), // 4: BUILD_CITY
             canAfford("Factory"), // 5: BUILD_FACTORY
             canAfford("Defense Post"), // 6: BUILD_DEFENSE
-            canAfford("Port"), // 7: BUILD_PORT
+            canAfford("Port") && canBuildAPI["Port"] !== false, // 7: BUILD_PORT (needs coast)
             canAfford("SAM Launcher"), // 8: BUILD_SAM
             canAfford("Missile Silo"), // 9: BUILD_SILO
             canAfford("Warship") && hasPort, // 10: BUILD_WARSHIP
-            hasSilo && hasN && canAfford("Atom Bomb"), // 11: LAUNCH_ATOM
-            hasSilo && hasN && canAfford("Hydrogen Bomb"), // 12: LAUNCH_HBOMB
-            hasSilo && hasN && canAfford("MIRV"), // 13: LAUNCH_MIRV
-            numWarships > 0 && hasN, // 14: MOVE_WARSHIP
+            hasSilo && neighbors.length > 0 && canAfford("Atom Bomb"), // 11: LAUNCH_ATOM
+            hasSilo && neighbors.length > 0 && canAfford("Hydrogen Bomb"), // 12: LAUNCH_HBOMB
+            hasSilo && neighbors.length > 0 && canAfford("MIRV"), // 13: LAUNCH_MIRV
+            numWarships > 0 && neighbors.length > 0, // 14: MOVE_WARSHIP
             hasUnits && g >= 50_000, // 15: UPGRADE
             hasUnits &&
               gameState.canDeleteUnit !== false &&
