@@ -540,6 +540,7 @@ async function extractGameState(page, botName) {
             const wildernessCCs = []; // {id, tileCount, ourBorderTiles, centroidX, centroidY}
             let wildCCIndex = 0;
             const hasIsLand = typeof g.isLand === "function";
+            let hasCoast = false;
 
             if (
               myBorder.length > 0 &&
@@ -556,6 +557,10 @@ async function extractGameState(page, botName) {
                   const oid = g.ownerID(adj);
                   if (oid !== 0 && oid !== mySmallID) {
                     borderNeighborIDs.add(oid);
+                  }
+                  // Check for coast: border tile adjacent to water
+                  if (hasIsLand && !g.isLand(adj)) {
+                    hasCoast = true;
                   }
                   if (oid === 0 && (!hasIsLand || g.isLand(adj))) {
                     fringeTiles.add(adj);
@@ -651,9 +656,11 @@ async function extractGameState(page, botName) {
                 isAllied: allied,
               });
             }
+            state.hasCoast = hasCoast;
             state._borderDebug = {
               myBorderLen: myBorder.length,
               mySmallID,
+              hasCoast,
               hasNeighborsFn: typeof g.neighbors === "function",
               hasOwnerIDFn: typeof g.ownerID === "function",
               hasPlayersFn: typeof g.players === "function",
@@ -3003,7 +3010,7 @@ async function main() {
           gameState.actionMask = [
             true, // 0: NOOP
             hasLandNeighbor && hasT, // 1: ATTACK (land neighbors only)
-            hasSeaNeighbor && hasT, // 2: BOAT_ATTACK (sea neighbors only)
+            hasSeaNeighbor && hasT && (gameState.hasCoast || hasPort), // 2: BOAT_ATTACK (needs coast access)
             hasOut, // 3: RETREAT
             canAfford("City"), // 4: BUILD_CITY
             canAfford("Factory"), // 5: BUILD_FACTORY
