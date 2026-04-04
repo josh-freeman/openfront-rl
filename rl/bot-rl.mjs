@@ -227,32 +227,8 @@ async function joinGame(page) {
     log("Found game card, clicking to select...");
     await page.mouse.click(cardClicked.x, cardClicked.y);
     await sleep(1000);
-  }
-
-  // Click the SOLO button to actually join the game
-  const soloBtn = await safeEval(page, () => {
-    const allEls = [...document.querySelectorAll("*")];
-    document.querySelectorAll("*").forEach((el) => {
-      if (el.shadowRoot) {
-        for (const c of el.shadowRoot.querySelectorAll("*")) allEls.push(c);
-      }
-    });
-    for (const el of allEls) {
-      const text = el.childNodes.length <= 3 ? el.textContent?.trim() : "";
-      if (text === "SOLO") {
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0)
-          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-      }
-    }
-    return null;
-  });
-
-  if (soloBtn) {
-    log("Clicking SOLO button...");
-    await page.mouse.click(soloBtn.x, soloBtn.y);
   } else {
-    log("SOLO button not found, trying fallback click at featured area...");
+    log("No card found, clicking featured area...");
     const vp = await safeEval(page, () => ({
       w: window.innerWidth,
       h: window.innerHeight,
