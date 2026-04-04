@@ -536,6 +536,13 @@ async function extractGameState(page, botName) {
             const borderNeighborIDs = new Set();
             const mySmallID =
               typeof me2.smallID === "function" ? me2.smallID() : -1;
+            // Wilderness CC detection: BFS from our border into unclaimed land
+            const wildernessVisited = new Set();
+            const wildernessCCs = []; // {id, tileCount, ourBorderTiles, centroidX, centroidY}
+            let wildCCIndex = 0;
+            const WILD_CC_CAP = 5000;
+            const hasIsLand = typeof g.isLand === "function";
+
             if (
               myBorder.length > 0 &&
               typeof g.neighbors === "function" &&
@@ -548,6 +555,52 @@ async function extractGameState(page, botName) {
                   const oid = g.ownerID(adj);
                   if (oid !== 0 && oid !== mySmallID) {
                     borderNeighborIDs.add(oid);
+                  }
+                  // Seed wilderness BFS
+                  if (
+                    oid === 0 &&
+                    !wildernessVisited.has(adj) &&
+                    (!hasIsLand || g.isLand(adj))
+                  ) {
+                    const ccTiles = new Set();
+                    const queue = [adj];
+                    ccTiles.add(adj);
+                    wildernessVisited.add(adj);
+                    let sx = 0,
+                      sy = 0;
+                    while (queue.length > 0 && ccTiles.size < WILD_CC_CAP) {
+                      const curr = queue.pop();
+                      sx += g.x(curr);
+                      sy += g.y(curr);
+                      for (const n of g.neighbors(curr)) {
+                        if (
+                          !wildernessVisited.has(n) &&
+                          g.ownerID(n) === 0 &&
+                          (!hasIsLand || g.isLand(n))
+                        ) {
+                          wildernessVisited.add(n);
+                          ccTiles.add(n);
+                          queue.push(n);
+                        }
+                      }
+                    }
+                    // Find our border tiles adjacent to this CC
+                    const ourBT = [];
+                    for (let j = 0; j < myBorder.length; j += step) {
+                      for (const n of g.neighbors(myBorder[j])) {
+                        if (ccTiles.has(n)) {
+                          ourBT.push(myBorder[j]);
+                          break;
+                        }
+                      }
+                    }
+                    wildernessCCs.push({
+                      id: `wilderness_${wildCCIndex++}`,
+                      tileCount: ccTiles.size,
+                      ourBorderTiles: ourBT,
+                      centroidX: sx / ccTiles.size,
+                      centroidY: sy / ccTiles.size,
+                    });
                   }
                 }
               }
@@ -594,7 +647,9 @@ async function extractGameState(page, botName) {
               borderNeighborIDs: [...borderNeighborIDs],
               landNames: [...landNeighborNames],
               apiNeighborCount: apiNeighborData.size,
+              wildernessCCCount: wildernessCCs.length,
             };
+            state._wildernessCCs = wildernessCCs;
           } catch (e) {
             state._borderDebugError = e?.message || String(e);
           }
@@ -631,7 +686,7 @@ async function extractGameState(page, botName) {
       for (const [name, info] of playerMap) {
         if (name === botName || name.includes(botName.slice(0, 6))) continue;
         if (name === "") continue;
-        if (name.toLowerCase() === "wilderness") continue; // not a real player
+        if (name.toLowerCase() === "wilderness") continue; // skip DOM wilderness label — we use CCs instead
 
         const lb = lbData[name] || {};
         // Use exact values from leaderboard PlayerView when available,
@@ -660,12 +715,35 @@ async function extractGameState(page, botName) {
         });
       }
 
+      // Add wilderness CCs as neighbors (computed from game API)
+      if (state._wildernessCCs) {
+        for (const wcc of state._wildernessCCs) {
+          neighbors.push({
+            id: wcc.id,
+            name: wcc.id,
+            tiles: wcc.tileCount,
+            troops: 0,
+            relation: 0,
+            alive: true,
+            isLandNeighbor: true,
+            isAllied: false,
+            visible: true,
+            labelX: null,
+            labelY: null,
+            _wildernessCC: wcc, // stash for attack targeting
+          });
+        }
+      }
+
       // Filter out dead players — leaderboard only shows alive players,
       // so use that as the alive set. Also keep anyone visible with troops > 0
-      // (leaderboard may lag by a tick).
+      // (leaderboard may lag by a tick). Wilderness CCs always pass.
       const aliveNames = new Set(Object.keys(lbData));
       const filteredNeighbors = neighbors.filter(
-        (n) => aliveNames.has(n.name) || n.troops > 0,
+        (n) =>
+          n.id.startsWith("wilderness_") ||
+          aliveNames.has(n.name) ||
+          n.troops > 0,
       );
 
       // Sort to match training: land neighbors first, then by territory size
@@ -1759,10 +1837,100 @@ async function executeRLAction(
     let method = "none";
     let didPan = false;
 
+    // Wilderness targeting: click on unclaimed territory adjacent to our border
+    if (target && target._wildernessCC) {
+      const wcc = target._wildernessCC;
+      const wildPos = await safeEval(
+        page,
+        async (ccData) => {
+          try {
+            const sidebar = document.querySelector("game-right-sidebar");
+            if (!sidebar?.game) return null;
+            const g = sidebar.game;
+            const buildMenu = document.querySelector("build-menu");
+            const th = buildMenu?.transformHandler;
+            if (!th) return null;
+            const me = g.myPlayer?.();
+            if (!me) return null;
+
+            // Find an unclaimed tile adjacent to our border
+            let ourBorder = [];
+            try {
+              if (typeof me.borderTiles === "function") {
+                ourBorder = [...(await me.borderTiles()).borderTiles];
+              }
+            } catch (e) {
+              return null;
+            }
+
+            const mySmallID =
+              typeof me.smallID === "function" ? me.smallID() : -1;
+            const step = Math.max(1, Math.floor(ourBorder.length / 200));
+            for (let i = 0; i < ourBorder.length; i += step) {
+              for (const adj of g.neighbors(ourBorder[i])) {
+                if (g.ownerID(adj) === 0 && (!g.isLand || g.isLand(adj))) {
+                  // Found unclaimed tile adjacent to our border — click it
+                  const screen = th.worldToScreenCoordinates({
+                    x: g.x(adj),
+                    y: g.y(adj),
+                  });
+                  const vw = window.innerWidth,
+                    vh = window.innerHeight;
+                  return {
+                    x: screen.x,
+                    y: screen.y,
+                    onScreen:
+                      screen.x > 50 &&
+                      screen.x < vw - 50 &&
+                      screen.y > 30 &&
+                      screen.y < vh - 100,
+                    method: "wilderness-border",
+                  };
+                }
+              }
+            }
+            // Fallback: use CC centroid
+            const screen = th.worldToScreenCoordinates({
+              x: ccData.centroidX,
+              y: ccData.centroidY,
+            });
+            const vw = window.innerWidth,
+              vh = window.innerHeight;
+            return {
+              x: screen.x,
+              y: screen.y,
+              onScreen:
+                screen.x > 50 &&
+                screen.x < vw - 50 &&
+                screen.y > 30 &&
+                screen.y < vh - 100,
+              method: "wilderness-centroid",
+            };
+          } catch (e) {
+            return null;
+          }
+        },
+        wcc,
+      );
+      if (wildPos) {
+        x = wildPos.x;
+        y = wildPos.y;
+        method = wildPos.method;
+      } else {
+        ({ x, y } = randomBorder(zone));
+        method = "wilderness-fallback";
+      }
+    }
+
     // PRIMARY: Use game API for precise targeting (works for ALL neighbor players)
     // Get position RIGHT before clicking to minimize camera drift
-    const apiPos = target ? await getAttackClickPos(page, target.name) : null;
-    if (apiPos && apiPos.onScreen) {
+    const apiPos =
+      target && !target._wildernessCC
+        ? await getAttackClickPos(page, target.name)
+        : null;
+    if (target && target._wildernessCC) {
+      // Already handled above — x,y are set
+    } else if (apiPos && apiPos.onScreen) {
       x = apiPos.x;
       y = apiPos.y;
       method = `api-${apiPos.method}`;
