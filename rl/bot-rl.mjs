@@ -2191,24 +2191,69 @@ async function executeRLAction(
 
     if (uiCheck && uiCheck.blocked) {
       log(
-        `RL: Attack ${target?.name || "?"} at (${Math.round(x)},${Math.round(y)}) behind ${uiCheck.element}, panning`,
+        `RL: Attack ${target?.name || "?"} at (${Math.round(x)},${Math.round(y)}) behind ${uiCheck.element}`,
       );
-      // Show debug marker: where we wanted to click (blocked) and pan direction
-      const panEndX2 = zone.cx + Math.cos(uiCheck.panAngle) * 150;
-      const panEndY2 = zone.cy + Math.sin(uiCheck.panAngle) * 150;
-      await showDebugMarker(
-        page,
-        x,
-        y,
-        zone.cx,
-        zone.cy,
-        `BLOCKED by ${uiCheck.element} → pan`,
-        "orange",
-      );
-      // Pan opposite to the UI element, then recenter + re-query
-      await panInDirection(page, uiCheck.panAngle, 500);
-      didPan = true;
-      await sleep(200);
+
+      // If blocked by leaderboard, just close it instead of panning
+      if (uiCheck.element === "leader-board") {
+        log("RL: Closing leaderboard");
+        const closed = await safeEval(page, () => {
+          // Find the leaderboard toggle button by its icon
+          const img = document.querySelector('img[src*="LeaderboardIcon"]');
+          if (img) {
+            const btn = img.closest("button") || img.parentElement;
+            if (btn) {
+              btn.click();
+              return true;
+            }
+          }
+          // Fallback: try the leader-board element directly
+          const lb = document.querySelector("leader-board");
+          if (!lb) return false;
+          const btn = lb.querySelector(
+            "button, [class*='close'], [class*='toggle']",
+          );
+          if (btn) {
+            btn.click();
+            return true;
+          }
+          if (lb.shadowRoot) {
+            const sBtn = lb.shadowRoot.querySelector(
+              "button, [class*='close'], [class*='toggle']",
+            );
+            if (sBtn) {
+              sBtn.click();
+              return true;
+            }
+          }
+          lb.style.display = "none";
+          return true;
+        });
+        if (closed) await sleep(150);
+        // After closing, also pan toward target in case it's far off-screen
+        const lbDir = target
+          ? await getDirectionToTarget(page, target.name)
+          : null;
+        if (lbDir !== null) {
+          await panInDirection(page, lbDir, 600);
+          didPan = true;
+          await sleep(200);
+        }
+      } else {
+        // Show debug marker and pan for other UI elements
+        await showDebugMarker(
+          page,
+          x,
+          y,
+          zone.cx,
+          zone.cy,
+          `BLOCKED by ${uiCheck.element} → pan`,
+          "orange",
+        );
+        await panInDirection(page, uiCheck.panAngle, 500);
+        didPan = true;
+        await sleep(200);
+      }
       // Re-query position after pan
       let apiRetry = null;
       if (isWilderness && target._wildernessCC) {
