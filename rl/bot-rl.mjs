@@ -980,97 +980,17 @@ async function focusCanvas(page) {
 // Computes our territory centroid in screen space, then pans to bring it to center.
 // Falls back to 'c' key if game API isn't available.
 async function centerCamera(page) {
-  const panInfo = await safeEval(page, async () => {
-    const sidebar = document.querySelector("game-right-sidebar");
-    if (!sidebar?.game) return null;
-    const g = sidebar.game;
-    const buildMenu = document.querySelector("build-menu");
-    const th = buildMenu?.transformHandler;
-    if (!th) return null;
-    const me = g.myPlayer?.();
-    if (!me) return null;
-
-    // Compute centroid of our border tiles (approximates territory center)
-    let border = [];
-    try {
-      if (typeof me.borderTiles === "function") {
-        border = [...(await me.borderTiles()).borderTiles];
-      }
-    } catch (e) {}
-    if (border.length === 0) return null;
-
-    let sumX = 0,
-      sumY = 0,
-      count = 0;
-    const step = Math.max(1, Math.floor(border.length / 60));
-    for (let i = 0; i < border.length; i += step) {
-      sumX += g.x(border[i]);
-      sumY += g.y(border[i]);
-      count++;
-    }
-    const cwx = sumX / count,
-      cwy = sumY / count;
-    const screen = th.worldToScreenCoordinates({ x: cwx, y: cwy });
-    return {
-      ourX: screen.x,
-      ourY: screen.y,
-      vpW: window.innerWidth,
-      vpH: window.innerHeight,
-      gameScale: th.scale,
-    };
-  });
-
-  if (panInfo) {
-    // Sync actual game scale
-    if (panInfo.gameScale) currentScale = panInfo.gameScale;
-    const dx = panInfo.ourX - panInfo.vpW / 2;
-    const dy = panInfo.ourY - panInfo.vpH / 2;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < 80) return; // already centered enough
-
-    // Pan so our territory moves toward screen center.
-    // Arrow keys in this game move the MAP (not camera), so pressing ArrowRight
-    // moves objects LEFT on screen. To bring territory toward center, we pan in
-    // the OPPOSITE direction of where territory currently is.
-    const angle = Math.atan2(-dy, -dx); // inverted direction
-    const duration = Math.min(600, Math.max(100, dist * 0.4));
-    await panInDirection(page, angle, duration);
-    log(
-      `Center: panned ${duration.toFixed(0)}ms toward our territory (offset=${Math.round(dist)}px)`,
-    );
-    return;
-  }
-
-  // Fallback: try leaderboard click
-  const clicked = await safeEval(
-    page,
-    (botName) => {
-      for (const el of document.querySelectorAll("*")) {
-        const text = el.textContent?.trim() || "";
-        const r = el.getBoundingClientRect();
-        if (r.x > window.innerWidth * 0.3 || r.y > window.innerHeight * 0.6)
-          continue;
-        if (r.width < 50 || r.height < 10 || r.height > 40) continue;
-        if (text.includes(botName)) {
-          el.click();
-          return true;
-        }
-      }
-      return null;
-    },
-    BOT_NAME,
-  );
-  if (clicked) {
-    await sleep(800);
-    log("Center: leaderboard click fallback");
-    return;
-  }
-
-  // Last resort: 'c' key
+  // PRIMARY: Use the game's built-in center-on-player via 'c' key
   await focusCanvas(page);
   await page.keyboard.press("c").catch(() => {});
-  await sleep(800);
-  log("Center: 'c' key fallback");
+  await sleep(300);
+
+  // Sync actual game scale
+  const scaleInfo = await safeEval(page, () => {
+    const bm = document.querySelector("build-menu");
+    return bm?.transformHandler?.scale ?? null;
+  });
+  if (scaleInfo) currentScale = scaleInfo;
 }
 
 // ── Zoom helpers ──────────────────────────────────────────────────
