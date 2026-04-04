@@ -3392,14 +3392,16 @@ async function main() {
                   panel = document.createElement("div");
                   panel.id = "rl-obs-debug";
                   panel.style.cssText = `
-                  position:fixed; top:10px; right:10px; width:340px; max-height:85vh;
-                  overflow-y:auto; background:rgba(0,0,0,0.85); color:#0f0;
-                  font:11px/1.4 monospace; padding:8px; border-radius:6px;
+                  position:fixed; top:10px; right:10px; width:340px;
+                  background:rgba(0,0,0,0.85); color:#0f0;
+                  font:11px/1.4 monospace; border-radius:6px;
                   z-index:100000; pointer-events:auto; user-select:text;
                   border:1px solid #0f04; scrollbar-width:thin;
                 `;
                   document.body.appendChild(panel);
                 }
+                // Preserve collapsed state
+                const wasCollapsed = panel.dataset.collapsed === "1";
                 const fmt = (n) =>
                   n >= 1e6
                     ? (n / 1e6).toFixed(1) + "M"
@@ -3408,7 +3410,14 @@ async function main() {
                       : String(n);
                 const relStr = (r) =>
                   ["hostile", "neutral", "friendly", "allied"][r] || "?";
-                let html = `<div style="color:#ff0;font-weight:bold;margin-bottom:4px">RL OBS DEBUG</div>`;
+                // Header bar (always visible, clickable to toggle)
+                let html = `<div id="rl-obs-header" style="color:#ff0;font-weight:bold;padding:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center">
+                  <span>RL OBS DEBUG</span>
+                  <span style="color:#ff0;font-size:13px"><b>${d.actionName}</b>→${d.targetName}</span>
+                  <span id="rl-obs-toggle" style="font-size:14px">${wasCollapsed ? "▶" : "▼"}</span>
+                </div>`;
+                // Collapsible body
+                html += `<div id="rl-obs-body" style="padding:0 8px 8px 8px;max-height:80vh;overflow-y:auto;${wasCollapsed ? "display:none" : ""}">`;
                 // Player stats
                 html += `<div style="color:#aaf">── Player ──</div>`;
                 html += `<div>tiles: ${fmt(d.tiles)} | pct: ${d.pct}%</div>`;
@@ -3440,7 +3449,19 @@ async function main() {
                 } else {
                   html += `<div style="color:#888">no cost data</div>`;
                 }
+                html += `</div>`; // close body
                 panel.innerHTML = html;
+                // Attach toggle listener
+                document
+                  .getElementById("rl-obs-header")
+                  .addEventListener("click", () => {
+                    const body = document.getElementById("rl-obs-body");
+                    const toggle = document.getElementById("rl-obs-toggle");
+                    const collapsed = body.style.display !== "none";
+                    body.style.display = collapsed ? "none" : "";
+                    toggle.textContent = collapsed ? "▶" : "▼";
+                    panel.dataset.collapsed = collapsed ? "1" : "0";
+                  });
               },
               debugData,
             );
