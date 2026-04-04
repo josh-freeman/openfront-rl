@@ -2779,10 +2779,21 @@ async function executeRLAction(
       log("RL: Delete unit — no unit positions");
       return;
     }
+    // Double-check cooldown at execution time (mask may be stale)
+    const canDel = await safeEval(page, () => {
+      const sidebar = document.querySelector("game-right-sidebar");
+      const me = sidebar?.game?.myPlayer?.();
+      if (!me || typeof me.deleteUnitCooldown !== "function") return false;
+      return me.deleteUnitCooldown() === 0;
+    });
+    if (!canDel) {
+      log("RL: Delete unit — cooldown not ready, skipping");
+      return;
+    }
     const delZoomSteps = 0; // no pre-zoom for deletes
-    // Pick last active unit
+    // Pick last active unit (must be explicitly active)
     const delUnit =
-      [...unitPositions].reverse().find((u) => u.active !== false) ||
+      [...unitPositions].reverse().find((u) => u.active === true) ||
       unitPositions[unitPositions.length - 1];
     await page.mouse.click(delUnit.x, delUnit.y, { button: "right" });
     await sleep(400);
@@ -3284,8 +3295,8 @@ async function main() {
             numWarships > 0 && neighbors.length > 0, // 14: MOVE_WARSHIP
             hasUnits && g >= 50_000, // 15: UPGRADE
             hasUnits &&
-              gameState.canDeleteUnit !== false &&
-              (gameState.unitPositions || []).some((u) => u.active !== false), // 16: DELETE_UNIT (respects cooldown + needs active unit)
+              gameState.canDeleteUnit === true &&
+              (gameState.unitPositions || []).some((u) => u.active === true), // 16: DELETE_UNIT (strict: cooldown must be 0, unit must be explicitly active)
           ];
           // Add build feedback (tracked from previous action)
           gameState.lastBuildResult = lastBuildResult;
@@ -3303,6 +3314,136 @@ async function main() {
                 `RL action: type=${action.actionType} target=${action.targetIdx} troops=${action.troopFraction} gold=${(lastGold / 1000).toFixed(0)}K`,
               );
             }
+            // Update real-time debug overlay with obs vector + action
+            const ACTION_NAMES = [
+              "NOOP",
+              "ATTACK",
+              "BOAT_ATK",
+              "RETREAT",
+              "CITY",
+              "FACTORY",
+              "DEFENSE",
+              "PORT",
+              "SAM",
+              "SILO",
+              "WARSHIP",
+              "ATOM",
+              "HBOMB",
+              "MIRV",
+              "MV_SHIP",
+              "UPGRADE",
+              "DELETE",
+            ];
+            const mask = gameState.actionMask || [];
+            const neighbors = gameState.neighbors || [];
+            const targetName =
+              action.targetIdx < neighbors.length
+                ? neighbors[action.targetIdx]?.name || `idx${action.targetIdx}`
+                : `idx${action.targetIdx}`;
+            const debugData = {
+              // Player stats (raw)
+              tiles: gameState.myTiles || 0,
+              troops: gameState.myTroops || 0,
+              gold: gameState.myGold || 0,
+              pct: ((gameState.territoryPct || 0) * 100).toFixed(2),
+              tick: gameState.tick || 0,
+              inAtk: gameState.incomingAttacks || 0,
+              outAtk: gameState.outgoingAttacks || 0,
+              units: (gameState.units || []).length,
+              silo: gameState.hasSilo,
+              port: gameState.hasPort,
+              sam: gameState.hasSAM,
+              ships: gameState.numWarships || 0,
+              nukes: gameState.numNukes || 0,
+              coast: gameState.hasCoast || false,
+              canDel: gameState.canDeleteUnit || false,
+              // Neighbors summary
+              nCount: neighbors.length,
+              neighbors: neighbors.slice(0, 16).map((n, i) => ({
+                i,
+                name: (n.name || "?").slice(0, 12),
+                tiles: n.tiles || 0,
+                troops: n.troops || 0,
+                rel: n.relation || 0,
+                land: n.isLandNeighbor ? "L" : "S",
+                ally: n.isAllied ? "A" : "",
+              })),
+              // Action mask
+              maskStr: mask
+                .map((v, i) => (v ? ACTION_NAMES[i] || i : null))
+                .filter(Boolean)
+                .join(", "),
+              // Current action
+              actionName: ACTION_NAMES[action.actionType] || action.actionType,
+              targetIdx: action.targetIdx,
+              targetName,
+              troopFrac: action.troopFraction,
+              // Build costs
+              costs: gameState._buildCosts || {},
+              // Feedback
+              lastBuild: gameState.lastBuildResult || "none",
+              lastOK: gameState.lastActionSucceeded || false,
+            };
+            await safeEval(
+              page,
+              (d) => {
+                let panel = document.getElementById("rl-obs-debug");
+                if (!panel) {
+                  panel = document.createElement("div");
+                  panel.id = "rl-obs-debug";
+                  panel.style.cssText = `
+                  position:fixed; top:10px; right:10px; width:340px; max-height:85vh;
+                  overflow-y:auto; background:rgba(0,0,0,0.85); color:#0f0;
+                  font:11px/1.4 monospace; padding:8px; border-radius:6px;
+                  z-index:100000; pointer-events:auto; user-select:text;
+                  border:1px solid #0f04; scrollbar-width:thin;
+                `;
+                  document.body.appendChild(panel);
+                }
+                const fmt = (n) =>
+                  n >= 1e6
+                    ? (n / 1e6).toFixed(1) + "M"
+                    : n >= 1e3
+                      ? (n / 1e3).toFixed(1) + "K"
+                      : String(n);
+                const relStr = (r) =>
+                  ["hostile", "neutral", "friendly", "allied"][r] || "?";
+                let html = `<div style="color:#ff0;font-weight:bold;margin-bottom:4px">RL OBS DEBUG</div>`;
+                // Player stats
+                html += `<div style="color:#aaf">── Player ──</div>`;
+                html += `<div>tiles: ${fmt(d.tiles)} | pct: ${d.pct}%</div>`;
+                html += `<div>troops: ${fmt(d.troops)} | gold: ${fmt(d.gold)}</div>`;
+                html += `<div>tick: ${d.tick} | in: ${d.inAtk} out: ${d.outAtk}</div>`;
+                html += `<div>units: ${d.units} | silo:${d.silo ? 1 : 0} port:${d.port ? 1 : 0} sam:${d.sam ? 1 : 0} ships:${d.ships} nukes:${d.nukes}</div>`;
+                html += `<div>coast:${d.coast ? 1 : 0} canDel:${d.canDel ? 1 : 0}</div>`;
+                // Action
+                html += `<div style="color:#ff0;margin-top:4px">── Action ──</div>`;
+                html += `<div style="color:#ff0;font-size:13px"><b>${d.actionName}</b> → ${d.targetName} (${(d.troopFrac * 100).toFixed(0)}%)</div>`;
+                html += `<div style="color:#888">lastBuild: ${d.lastBuild} | lastOK: ${d.lastOK ? 1 : 0}</div>`;
+                // Mask
+                html += `<div style="color:#aaf;margin-top:4px">── Mask ──</div>`;
+                html += `<div style="color:#8f8;word-break:break-all">${d.maskStr || "NONE"}</div>`;
+                // Neighbors
+                html += `<div style="color:#aaf;margin-top:4px">── Neighbors (${d.nCount}) ──</div>`;
+                for (const n of d.neighbors) {
+                  const hi =
+                    n.i === d.targetIdx ? "color:#ff0;font-weight:bold" : "";
+                  html += `<div style="${hi}">${n.i}: ${n.name} ${n.land}${n.ally} t:${fmt(n.tiles)} tr:${fmt(n.troops)} ${relStr(n.rel)}</div>`;
+                }
+                // Costs
+                html += `<div style="color:#aaf;margin-top:4px">── Costs ──</div>`;
+                const costEntries = Object.entries(d.costs).filter(
+                  ([, v]) => v > 0,
+                );
+                if (costEntries.length) {
+                  html += `<div>${costEntries.map(([k, v]) => `${k}:${fmt(v)}`).join(" | ")}</div>`;
+                } else {
+                  html += `<div style="color:#888">no cost data</div>`;
+                }
+                panel.innerHTML = html;
+              },
+              debugData,
+            );
           }
         }
       }
