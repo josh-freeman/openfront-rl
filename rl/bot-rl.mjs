@@ -1395,10 +1395,14 @@ async function readOurColor(page) {
 // Uses borderTiles() to find the closest enemy tile to our border,
 // then worldToScreenCoordinates to get exact screen position.
 // Returns { x, y, onScreen, method } or null if game API unavailable.
-async function getAttackClickPos(page, targetName) {
+async function getAttackClickPos(
+  page,
+  targetName,
+  { isBoatAttack = false } = {},
+) {
   return safeEval(
     page,
-    async (targetName) => {
+    async (targetName, isBoatAttack) => {
       try {
         const sidebar = document.querySelector("game-right-sidebar");
         if (!sidebar?.game) return null;
@@ -1495,8 +1499,10 @@ async function getAttackClickPos(page, targetName) {
                 bestOurs = ourBorder[i];
               }
             }
-            // If borders are far apart (>10 tiles), target is across water — skip
-            if (bestDist > 10) {
+            // If borders are far apart, target is across water
+            // For boat attacks, allow up to 200 tiles; for land attacks, skip at >10
+            const maxDist = isBoatAttack ? 200 : 10;
+            if (bestDist > maxDist) {
               return {
                 x: 0,
                 y: 0,
@@ -1575,6 +1581,7 @@ async function getAttackClickPos(page, targetName) {
       }
     },
     targetName,
+    isBoatAttack,
   );
 }
 
@@ -2045,9 +2052,10 @@ async function executeRLAction(
 
     // PRIMARY: Use game API for precise targeting (works for ALL neighbor players)
     // Get position RIGHT before clicking to minimize camera drift
+    const isBoat = actionType === ACTION_BOAT_ATTACK;
     const apiPos =
       target && !target._wildernessCC
-        ? await getAttackClickPos(page, target.name)
+        ? await getAttackClickPos(page, target.name, { isBoatAttack: isBoat })
         : null;
     if (target && target._wildernessCC) {
       // Already handled above — x,y are set
@@ -2073,7 +2081,9 @@ async function executeRLAction(
         );
         await panInDirection(page, dir, 600);
         didPan = true;
-        const apiPos2 = await getAttackClickPos(page, target.name);
+        const apiPos2 = await getAttackClickPos(page, target.name, {
+          isBoatAttack: isBoat,
+        });
         if (apiPos2) {
           x = apiPos2.x + (Math.random() - 0.5) * 20;
           y = apiPos2.y + (Math.random() - 0.5) * 20;
@@ -2300,7 +2310,9 @@ async function executeRLAction(
           target._wildernessCC,
         );
       } else if (target) {
-        apiRetry = await getAttackClickPos(page, target.name);
+        apiRetry = await getAttackClickPos(page, target.name, {
+          isBoatAttack: isBoat,
+        });
       }
       if (apiRetry && apiRetry.onScreen) {
         x = apiRetry.x;
@@ -2446,7 +2458,9 @@ async function executeRLAction(
           target._wildernessCC,
         );
       } else {
-        retryPos = await getAttackClickPos(page, target.name);
+        retryPos = await getAttackClickPos(page, target.name, {
+          isBoatAttack: isBoat,
+        });
       }
       if (retryPos && retryPos.onScreen) {
         // Check all UI elements before retry click
