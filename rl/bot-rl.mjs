@@ -567,6 +567,7 @@ async function extractGameState(page, botName) {
               }
               // Step 2: group fringe tiles into CCs (BFS among fringe only)
               const visited = new Set();
+              const SIZE_EST_DEPTH = 3;
               for (const seed of fringeTiles) {
                 if (visited.has(seed)) continue;
                 visited.add(seed);
@@ -590,9 +591,28 @@ async function extractGameState(page, botName) {
                     }
                   }
                 }
+                // Expand outward by SIZE_EST_DEPTH layers for size estimate
+                const sizeVisited = new Set(ccFringe);
+                let frontier = ccFringe;
+                for (let d = 0; d < SIZE_EST_DEPTH; d++) {
+                  const nextFrontier = [];
+                  for (const t of frontier) {
+                    for (const n of g.neighbors(t)) {
+                      if (
+                        !sizeVisited.has(n) &&
+                        g.ownerID(n) === 0 &&
+                        (!hasIsLand || g.isLand(n))
+                      ) {
+                        sizeVisited.add(n);
+                        nextFrontier.push(n);
+                      }
+                    }
+                  }
+                  frontier = nextFrontier;
+                }
                 wildernessCCs.push({
                   id: `wilderness_${wildCCIndex++}`,
-                  tileCount: ccFringe.length,
+                  tileCount: sizeVisited.size,
                   ourBorderTiles: Array.from(ourBorderSet),
                   centroidX: sx / ccFringe.length,
                   centroidY: sy / ccFringe.length,

@@ -269,9 +269,10 @@ function getObservation() {
       }
     }
 
-    // Step 2: Group fringe tiles into CCs via BFS (only among fringe tiles — very fast)
+    // Step 2: Group fringe tiles into CCs, then expand depth-3 for size estimate
     const visited = new Set<TileRef>();
     let ccIndex = 0;
+    const SIZE_EST_DEPTH = 3;
 
     for (const seed of fringeTiles) {
       if (visited.has(seed)) continue;
@@ -281,10 +282,9 @@ function getObservation() {
       const queue: TileRef[] = [seed];
       const ourBorderSet = new Set<TileRef>();
 
-      // BFS among fringe tiles only (tiles in fringeTiles set)
+      // BFS among fringe tiles only to find the CC group
       while (queue.length > 0) {
         const curr = queue.pop()!;
-        // Add border tiles that connect to this fringe tile
         for (const bt of fringeToOurBorder.get(curr) || []) {
           ourBorderSet.add(bt);
         }
@@ -297,13 +297,29 @@ function getObservation() {
         }
       }
 
+      // Expand outward from fringe by SIZE_EST_DEPTH layers for size estimate
+      const sizeVisited = new Set<TileRef>(ccFringe);
+      let frontier = ccFringe;
+      for (let d = 0; d < SIZE_EST_DEPTH; d++) {
+        const nextFrontier: TileRef[] = [];
+        for (const t of frontier) {
+          for (const n of game.neighbors(t)) {
+            if (!sizeVisited.has(n) && game.isLand(n) && !game.hasOwner(n)) {
+              sizeVisited.add(n);
+              nextFrontier.push(n);
+            }
+          }
+        }
+        frontier = nextFrontier;
+      }
+
       const ccId = `wilderness_${ccIndex++}`;
       newBorderCache.set(ccId, Array.from(ourBorderSet));
 
       newNeighbors.push({
         id: ccId,
         name: "Wilderness",
-        tiles: ccFringe.length, // fringe size as proxy for CC size
+        tiles: sizeVisited.size, // depth-3 expansion for better size estimate
         troops: 0,
         alive: true,
         relation: 0,
