@@ -356,6 +356,7 @@ function getObservation() {
   // Border tiles (for action targeting)
   const borderTilesArr: { x: number; y: number; ref: number }[] = [];
   let count = 0;
+  const borderSet = rlPlayer.borderTiles();
   for (const t of borderSet) {
     if (count++ > 200) break; // Cap for performance
     borderTilesArr.push({ x: game.x(t), y: game.y(t), ref: t });
