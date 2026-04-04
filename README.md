@@ -1,8 +1,36 @@
 # AlphaFront
 Training RL agents for [OpenFront.io](https://openfront.io/).
 
+## How to run the rl-bot (locally):
+(note that you may need to help it a bit sometimes)
+1.⁠ ⁠Pull the best model from hf (make sure if you made updates that the code you’re running matches the architecture of the model you downloaded.You can do this with  your equivalent of
+
+cd /Users/joshua/openfront-rl/rl
+  /Users/joshua/anaconda3/bin/python -c "from huggingface_hub import hf_hub_download;                                              
+  hf_hub_download('mischievers/openfront-rl-agent', 'best_model.pt', local_dir='checkpoints', force_download=True)"
+Then
+
+1. Start policy server (terminal 1)                                                                                            
+  cd /Users/joshua/openfront-rl/rl                                                                                                 
+  /Users/joshua/anaconda3/bin/python play.py --model checkpoints/best_model.pt --mode server --port 8765                           
+                                                                                                                                   
+2. Run the Puppeteer bot (terminal 2)                                                                                          
+  cd /Users/joshua/openfront-bot                                                                                         
+  node bot-rl.mjs
 
 
+## To train:
+you can start by setting up an env such that you can run ⁠ python train.py --num-envs 4 --maps plains,big_plains,world ⁠
+Key flags you can tweak:
+  --num-envs 8          # more parallel games (faster learning, more CPU)                                                          
+  --lr 3e-4             # learning rate                                                                                            
+  --ent-coef 0.01       # entropy bonus (higher = more exploration)                                                                
+  --rollout-steps 512   # steps per env per rollout                                                                                
+  --ppo-epochs 4        # PPO update passes                                                                                        
+  --opponents 3         # number of bot opponents                                                                                  
+  --anneal-lr           # decay LR to zero over training
+
+# OLD - Open Front
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="resources/images/OpenFrontLogoDark.svg">
