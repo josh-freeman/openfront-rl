@@ -233,7 +233,9 @@ async function joinGame(page) {
       w: window.innerWidth,
       h: window.innerHeight,
     }));
-    if (vp) await page.mouse.click(vp.w * 0.3, vp.h * 0.72);
+    // Click center of the featured game card (big map preview, upper-left area)
+    // NOT the SOLO button below it
+    if (vp) await page.mouse.click(vp.w * 0.25, vp.h * 0.35);
   }
 
   await sleep(3000);
