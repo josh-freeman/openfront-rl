@@ -236,6 +236,7 @@ def train(args):
         ticks_per_step=args.ticks_per_step,
         max_steps=args.max_steps,
         max_neighbors=max_neighbors,
+        uv_threadpool_size=args.uv_threadpool_size,
     )
 
     hidden_sizes = [int(x) for x in args.hidden_sizes.split(",")]
@@ -669,6 +670,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-interval", type=int, default=50)
     parser.add_argument("--save-dir", default="./checkpoints")
     parser.add_argument("--hidden-sizes", default="256,256,128", help="Comma-separated backbone layer sizes")
+    parser.add_argument("--uv-threadpool-size", type=int, default=1, help="UV_THREADPOOL_SIZE for each env subprocess (1=min overhead, 4=Node default)")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--load-weights", default="", help="Load model weights only (fresh optimizer) from a .pt file")
     parser.add_argument("--hf-repo", default="mischievers/openfront-rl-agent", help="HuggingFace repo for auto-push")

@@ -7,11 +7,12 @@ uv pip install -r requirements.txt -c clariden/constraints.txt
 
 python train.py \
     --curriculum \
-    --num-envs 16 \
+    --num-envs 64 \
     --rollout-steps 1024 \
     --num-updates 10000 \
     --save-dir ./checkpoints \
-    --anneal-lr
+    --anneal-lr \
+    --uv-threadpool-size 1 # compare with 4 to verify no sps regression
 
 zellij attach openfront
 

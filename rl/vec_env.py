@@ -34,6 +34,7 @@ class VecOpenFrontEnv:
         ticks_per_step: int = 10,
         max_steps: int = 10000,
         max_neighbors: int = 16,
+        uv_threadpool_size: int = 1,
     ):
         self.num_envs = num_envs
         self.maps = maps or ["plains"]
@@ -42,6 +43,7 @@ class VecOpenFrontEnv:
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
+        self._uv_threadpool_size = uv_threadpool_size
 
         # 16 player stats + max_neighbors * 4 neighbor features
         obs_size = 16 + max_neighbors * 4
@@ -65,7 +67,7 @@ class VecOpenFrontEnv:
             except Exception:
                 pass
 
-        env = {**__import__("os").environ, "UV_THREADPOOL_SIZE": "1"}
+        env = {**__import__("os").environ, "UV_THREADPOOL_SIZE": str(self._uv_threadpool_size)}
         proc = subprocess.Popen(
             ["npx", "tsx", self._server_script],
             stdin=subprocess.PIPE,
