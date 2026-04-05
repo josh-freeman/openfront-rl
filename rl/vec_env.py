@@ -63,6 +63,7 @@ class VecOpenFrontEnv:
             except Exception:
                 pass
 
+        env = {**__import__("os").environ, "UV_THREADPOOL_SIZE": "1"}
         proc = subprocess.Popen(
             ["npx", "tsx", self._server_script],
             stdin=subprocess.PIPE,
@@ -71,6 +72,7 @@ class VecOpenFrontEnv:
             cwd=self._repo_dir,
             text=True,
             bufsize=1,
+            env=env,
         )
         line = proc.stdout.readline()
         msg = json.loads(line)
