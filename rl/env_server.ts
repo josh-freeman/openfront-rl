@@ -157,6 +157,11 @@ let cachedWildernessData: {
 } | null = null;
 let wildernessLastTick = -1;
 const WILDERNESS_RECOMPUTE_INTERVAL = 10; // recompute every N ticks
+
+// Our territory CC centroids cache
+let cachedOurCentroids: Array<{ x: number; y: number }> = [];
+let ourCentroidsLastTick = -1;
+const OUR_CENTROIDS_RECOMPUTE_INTERVAL = 50; // recompute every N ticks
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -231,51 +236,16 @@ function getObservation() {
   }> = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
-    .map((p) => {
-      // Sampled min border-to-border Manhattan distance
-      // This naturally finds the closest "island" of the opponent
-      const DIST_SAMPLES = 30;
-      const mapDiag = width + height;
-      let minDist = mapDiag; // worst case = full map diagonal
-
-      const theirBorder = Array.from(p.borderTiles());
-      const ourBorder = Array.from(rlPlayer!.borderTiles());
-      if (theirBorder.length > 0 && ourBorder.length > 0) {
-        // Sample up to DIST_SAMPLES from each side
-        const sampleTheir =
-          theirBorder.length <= DIST_SAMPLES
-            ? theirBorder
-            : Array.from(
-                { length: DIST_SAMPLES },
-                () =>
-                  theirBorder[Math.floor(Math.random() * theirBorder.length)],
-              );
-        const sampleOur =
-          ourBorder.length <= DIST_SAMPLES
-            ? ourBorder
-            : Array.from(
-                { length: DIST_SAMPLES },
-                () => ourBorder[Math.floor(Math.random() * ourBorder.length)],
-              );
-        for (const t1 of sampleOur) {
-          for (const t2 of sampleTheir) {
-            const d = game!.manhattanDist(t1, t2);
-            if (d < minDist) minDist = d;
-          }
-        }
-      }
-
-      return {
-        id: p.id(),
-        name: p.name(),
-        tiles: p.numTilesOwned(),
-        troops: p.troops(),
-        alive: p.isAlive(),
-        relation: rlPlayer!.relation(p),
-        isLandNeighbor: landNeighborIds.has(p.id()),
-        distance: minDist / mapDiag, // normalized [0, 1]
-      };
-    });
+    .map((p) => ({
+      id: p.id(),
+      name: p.name(),
+      tiles: p.numTilesOwned(),
+      troops: p.troops(),
+      alive: p.isAlive(),
+      relation: rlPlayer!.relation(p),
+      isLandNeighbor: landNeighborIds.has(p.id()),
+      distance: 1.0, // placeholder, computed below after centroids are ready
+    }));
 
   // Wilderness connected components: unclaimed land regions bordering us
   // Only recompute every N ticks — wilderness changes slowly
@@ -375,6 +345,57 @@ function getObservation() {
   wildernessBorderCache = cachedWildernessData.borderCache;
   for (const wn of cachedWildernessData.neighbors) {
     neighbors.push({ ...wn });
+  }
+
+  // Recompute our territory CC centroids periodically
+  if (currentTick - ourCentroidsLastTick >= OUR_CENTROIDS_RECOMPUTE_INTERVAL) {
+    ourCentroidsLastTick = currentTick;
+    // BFS over our tiles to find connected components and their centroids
+    const ourTiles = rlPlayer.tiles();
+    const visited = new Set<TileRef>();
+    cachedOurCentroids = [];
+    for (const seed of ourTiles) {
+      if (visited.has(seed)) continue;
+      visited.add(seed);
+      let sx = 0;
+      let sy = 0;
+      let count = 0;
+      const queue: TileRef[] = [seed];
+      while (queue.length > 0) {
+        const curr = queue.pop()!;
+        sx += game.x(curr);
+        sy += game.y(curr);
+        count++;
+        for (const n of game.neighbors(curr)) {
+          if (!visited.has(n) && ourTiles.has(n)) {
+            visited.add(n);
+            queue.push(n);
+          }
+        }
+      }
+      cachedOurCentroids.push({ x: sx / count, y: sy / count });
+    }
+  }
+
+  // Compute distance for each non-wilderness neighbor:
+  // min over their border tiles of (min over our centroids of Manhattan distance)
+  const mapDiag = width + height;
+  for (const nb of neighbors) {
+    if (nb.id.startsWith("wilderness_")) continue; // already 0
+    const opponent = game.player(nb.id);
+    if (!opponent) continue;
+    const theirBorder = opponent.borderTiles();
+    if (theirBorder.size === 0 || cachedOurCentroids.length === 0) continue;
+    let minDist = mapDiag;
+    for (const t of theirBorder) {
+      const tx = game.x(t);
+      const ty = game.y(t);
+      for (const c of cachedOurCentroids) {
+        const d = Math.abs(tx - c.x) + Math.abs(ty - c.y);
+        if (d < minDist) minDist = d;
+      }
+    }
+    nb.distance = minDist / mapDiag;
   }
 
   // Sort: land neighbors first, then by territory size
