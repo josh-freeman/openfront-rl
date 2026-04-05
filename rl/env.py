@@ -101,9 +101,10 @@ class OpenFrontEnv(gym.Env):
         #   0: tiles (normalized)
         #   1: troops (normalized)
         #   2: relation (normalized)
-        #   3: isAlive (0/1)
+        #   3: isLandNeighbor (0/1)
+        #   4: distance (normalized L1 to closest border, 0=adjacent, 1=far)
         # Action mask (17 bools) is passed via info dict, NOT in obs vector
-        obs_size = 16 + max_neighbors * 4
+        obs_size = 16 + max_neighbors * 5
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -200,14 +201,15 @@ class OpenFrontEnv(gym.Env):
             vec[14] = -1.0  # any failure
         vec[15] = float(obs.get("lastActionSucceeded", False))
 
-        # Neighbor features
+        # Neighbor features (5 per neighbor)
         self._neighbors_cache = neighbors
         for i, n in enumerate(neighbors[: self.max_neighbors]):
-            base = 16 + i * 4
+            base = 16 + i * 5
             vec[base] = n.get("tiles", 0) / total
             vec[base + 1] = n.get("troops", 0) / 100000
             vec[base + 2] = n.get("relation", 0) / 3
             vec[base + 3] = float(n.get("isLandNeighbor", True))
+            vec[base + 4] = n.get("distance", 1.0)  # normalized [0, 1]
 
         return vec
 
