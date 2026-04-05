@@ -1,0 +1,14 @@
+torch==2.10.0a0
+torch_tensorrt==2.10.0a0
+torchao==0.15.0
+torchtitan==0.2.0
+torchvision==0.25.0a0
+transformer_engine==2.11.0
+triton_kernels==1.0.0
+python-dateutil==2.9.0.post0
+pytorch-triton==3.6.0
+pycocotools==2.0
+nvfuser==0.2.34
+nvidia-cuda-runtime-cu13==0.0.0a0
+lightning-thunder==0.2.7.dev0
+flash_attn==2.7.4.post1
