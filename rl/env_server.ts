@@ -348,13 +348,16 @@ function getObservation() {
   }
 
   // Recompute our territory CC centroids periodically
+  // BFS over borderTiles (much smaller than full tile set) — two border tiles
+  // are in the same CC if adjacent directly or through a 1-hop owned tile
   if (currentTick - ourCentroidsLastTick >= OUR_CENTROIDS_RECOMPUTE_INTERVAL) {
     ourCentroidsLastTick = currentTick;
-    // BFS over our tiles to find connected components and their centroids
-    const ourTiles = rlPlayer.tiles();
+    const ourBorder = rlPlayer.borderTiles();
+    const borderSet = new Set<TileRef>(ourBorder);
     const visited = new Set<TileRef>();
+    const myId = game.ownerID(ourBorder.values().next().value!);
     cachedOurCentroids = [];
-    for (const seed of ourTiles) {
+    for (const seed of ourBorder) {
       if (visited.has(seed)) continue;
       visited.add(seed);
       let sx = 0;
@@ -366,10 +369,21 @@ function getObservation() {
         sx += game.x(curr);
         sy += game.y(curr);
         count++;
-        for (const n of game.neighbors(curr)) {
-          if (!visited.has(n) && ourTiles.has(n)) {
-            visited.add(n);
-            queue.push(n);
+        for (const adj of game.neighbors(curr)) {
+          if (visited.has(adj)) continue;
+          // Direct border-to-border adjacency
+          if (borderSet.has(adj)) {
+            visited.add(adj);
+            queue.push(adj);
+          }
+          // Connected through a 1-hop owned (non-border) tile
+          else if (game.ownerID(adj) === myId) {
+            for (const adj2 of game.neighbors(adj)) {
+              if (!visited.has(adj2) && borderSet.has(adj2)) {
+                visited.add(adj2);
+                queue.push(adj2);
+              }
+            }
           }
         }
       }
