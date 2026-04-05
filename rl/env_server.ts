@@ -227,18 +227,55 @@ function getObservation() {
     alive: boolean;
     relation: number;
     isLandNeighbor: boolean;
+    distance: number;
   }> = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
-    .map((p) => ({
-      id: p.id(),
-      name: p.name(),
-      tiles: p.numTilesOwned(),
-      troops: p.troops(),
-      alive: p.isAlive(),
-      relation: rlPlayer!.relation(p),
-      isLandNeighbor: landNeighborIds.has(p.id()),
-    }));
+    .map((p) => {
+      // Sampled min border-to-border Manhattan distance
+      // This naturally finds the closest "island" of the opponent
+      const DIST_SAMPLES = 30;
+      const mapDiag = width + height;
+      let minDist = mapDiag; // worst case = full map diagonal
+
+      const theirBorder = Array.from(p.borderTiles());
+      const ourBorder = Array.from(rlPlayer!.borderTiles());
+      if (theirBorder.length > 0 && ourBorder.length > 0) {
+        // Sample up to DIST_SAMPLES from each side
+        const sampleTheir =
+          theirBorder.length <= DIST_SAMPLES
+            ? theirBorder
+            : Array.from(
+                { length: DIST_SAMPLES },
+                () =>
+                  theirBorder[Math.floor(Math.random() * theirBorder.length)],
+              );
+        const sampleOur =
+          ourBorder.length <= DIST_SAMPLES
+            ? ourBorder
+            : Array.from(
+                { length: DIST_SAMPLES },
+                () => ourBorder[Math.floor(Math.random() * ourBorder.length)],
+              );
+        for (const t1 of sampleOur) {
+          for (const t2 of sampleTheir) {
+            const d = game!.manhattanDist(t1, t2);
+            if (d < minDist) minDist = d;
+          }
+        }
+      }
+
+      return {
+        id: p.id(),
+        name: p.name(),
+        tiles: p.numTilesOwned(),
+        troops: p.troops(),
+        alive: p.isAlive(),
+        relation: rlPlayer!.relation(p),
+        isLandNeighbor: landNeighborIds.has(p.id()),
+        distance: minDist / mapDiag, // normalized [0, 1]
+      };
+    });
 
   // Wilderness connected components: unclaimed land regions bordering us
   // Only recompute every N ticks — wilderness changes slowly
@@ -324,6 +361,7 @@ function getObservation() {
         alive: true,
         relation: 0,
         isLandNeighbor: true,
+        distance: 0, // wilderness is always adjacent to our border
       });
     }
 
