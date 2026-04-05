@@ -18,6 +18,7 @@ import argparse
 import json
 import random
 from pathlib import Path
+from tqdm import tqdm
 
 try:
     import wandb
@@ -395,7 +396,7 @@ def train(args):
             param_group["lr"] = lr_now
 
         # Collect rollout
-        for step in range(args.rollout_steps):
+        for step in tqdm(range(args.rollout_steps), desc=f"Update {update+1} rollout", leave=False):
             obs_buf[step] = obs
             masks_buf[step] = action_masks
             land_masks_buf[step] = land_target_masks
@@ -519,35 +520,32 @@ def train(args):
         t_elapsed = time.time() - t_start
         sps = (args.rollout_steps * args.num_envs) / t_elapsed
 
-        if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
-            mean_r = np.mean(episode_rewards)
-            mean_l = np.mean(episode_lengths)
-            win_rate = np.mean(episode_wins) if episode_wins else 0.0
-            survival_pct = mean_l / envs.max_steps  # fraction of max episode length
-            entry = {
-                "update": update + 1,
-                "global_step": global_step,
-                "num_episodes": num_episodes,
-                "mean_reward": float(mean_r),
-                "mean_length": float(mean_l),
-                "win_rate": float(win_rate),
-                "survival_pct": float(survival_pct),
-                "max_steps": envs.max_steps,
-                "loss": float(loss.item()),
-                "sps": float(sps),
-            }
-            log_entries.append(entry)
+        if (update + 1) % args.log_interval == 0:
+            has_episodes = len(episode_rewards) > 0
+            mean_r = float(np.mean(episode_rewards)) if has_episodes else float("nan")
+            mean_l = float(np.mean(episode_lengths)) if has_episodes else float("nan")
+            win_rate = float(np.mean(episode_wins)) if episode_wins else float("nan")
+            survival_pct = mean_l / envs.max_steps if has_episodes else float("nan")
             current_lr = optimizer.param_groups[0]["lr"]
-            if wandb is not None:
-                wandb.log({
+            if has_episodes:
+                entry = {
                     "update": update + 1,
                     "global_step": global_step,
                     "num_episodes": num_episodes,
-                    "reward/mean": float(mean_r),
-                    "reward/win_rate": float(win_rate),
-                    "episode_length": float(mean_l),
-                    "episode_length/survival_pct": float(survival_pct),
-                    "episode_length/max_steps": envs.max_steps,
+                    "mean_reward": mean_r,
+                    "mean_length": mean_l,
+                    "win_rate": win_rate,
+                    "survival_pct": survival_pct,
+                    "max_steps": envs.max_steps,
+                    "loss": float(loss.item()),
+                    "sps": float(sps),
+                }
+                log_entries.append(entry)
+            if wandb is not None:
+                wandb_dict = {
+                    "update": update + 1,
+                    "global_step": global_step,
+                    "num_episodes": num_episodes,
                     "loss/total": float(loss.item()),
                     "loss/policy": float(policy_loss.item()),
                     "loss/value": float(value_loss.item()),
@@ -556,10 +554,21 @@ def train(args):
                     "lr": current_lr,
                     "curriculum/stage": curriculum_stage,
                     "curriculum/opponents": envs.num_opponents,
-                }, step=global_step)
+                }
+                if has_episodes:
+                    wandb_dict.update({
+                        "reward/mean": mean_r,
+                        "reward/win_rate": win_rate,
+                        "episode_length": mean_l,
+                        "episode_length/survival_pct": survival_pct,
+                        "episode_length/max_steps": envs.max_steps,
+                    })
+                wandb.log(wandb_dict, step=global_step)
+            ep_str = (f"reward={mean_r:.2f} win={win_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%})"
+                      if has_episodes else "no episodes yet")
             print(
                 f"[update {update+1}/{args.num_updates}] "
-                f"episodes={num_episodes} reward={mean_r:.2f} win={win_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
+                f"episodes={num_episodes} {ep_str} "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
             )
 
