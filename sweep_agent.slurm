@@ -27,6 +27,9 @@ git checkout sweep
 
 cd rl
 
+# Clean up any previous sweep checkpoints so trials don't collide
+rm -rf checkpoints_sweep
+
 # Run 1 sweep trial per job (--count 1)
 wandb agent --count 1 "hallu-probes-ethz/openfront-rl/$SWEEP_ID"
 
