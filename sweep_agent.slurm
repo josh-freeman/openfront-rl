@@ -23,7 +23,7 @@ echo "Node: $(hostname)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "Sweep ID: $SWEEP_ID"
 
-git checkout v17-distance-observation
+git checkout sweep
 
 cd rl
 
