@@ -134,7 +134,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
         obs_dict = json.loads(body)
 
         # Convert observation dict to vector (same as env.py)
-        obs_vec = np.zeros(80, dtype=np.float32)  # 16 + 16*4
+        obs_vec = np.zeros(96, dtype=np.float32)  # 16 + 16*5
         total = max(obs_dict.get("totalMapTiles", 1), 1)
         obs_vec[0] = obs_dict.get("myTiles", 0) / total
         obs_vec[1] = obs_dict.get("myTroops", 0) / 100000
@@ -163,11 +163,12 @@ class PolicyHandler(BaseHTTPRequestHandler):
         obs_vec[15] = float(obs_dict.get("lastActionSucceeded", False))
 
         for i, n in enumerate(neighbors[:16]):
-            base = 16 + i * 4
+            base = 16 + i * 5
             obs_vec[base] = n.get("tiles", 0) / total
             obs_vec[base + 1] = n.get("troops", 0) / 100000
             obs_vec[base + 2] = n.get("relation", 0) / 3
             obs_vec[base + 3] = float(n.get("isLandNeighbor", True))
+            obs_vec[base + 4] = n.get("distance", 1.0)
 
         # Extract action mask if provided
         action_mask = obs_dict.get("actionMask", None)
@@ -203,7 +204,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
                 f.write(f"VEC: [{', '.join(f'{v:.5f}' for v in player)}]\n")
                 # Log first 3 neighbors
                 for ni in range(min(3, len(neighbors))):
-                    base = 16 + ni * 4
+                    base = 16 + ni * 5
                     n = neighbors[ni]
                     f.write(f"  n{ni}: raw=[tiles={n.get('tiles')} troops={n.get('troops')} rel={n.get('relation')} alive={n.get('alive')} land={n.get('isLandNeighbor')}] vec=[{obs_vec[base]:.5f}, {obs_vec[base+1]:.4f}, {obs_vec[base+2]:.2f}, {obs_vec[base+3]:.0f}]\n")
                 if mask_t is not None:
@@ -243,7 +244,7 @@ class PolicyHandler(BaseHTTPRequestHandler):
 
 def serve_policy(args):
     """Run HTTP policy server for live Puppeteer bot play."""
-    model, device = load_model(args.model, 80)
+    model, device = load_model(args.model, 96)
     PolicyHandler.model = model
     PolicyHandler.device = device
 

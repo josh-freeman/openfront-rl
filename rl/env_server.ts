@@ -157,6 +157,11 @@ let cachedWildernessData: {
 } | null = null;
 let wildernessLastTick = -1;
 const WILDERNESS_RECOMPUTE_INTERVAL = 10; // recompute every N ticks
+
+// Our territory CC centroids cache
+let cachedOurCentroids: Array<{ x: number; y: number }> = [];
+let ourCentroidsLastTick = -1;
+const OUR_CENTROIDS_RECOMPUTE_INTERVAL = 50; // recompute every N ticks
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
@@ -227,6 +232,7 @@ function getObservation() {
     alive: boolean;
     relation: number;
     isLandNeighbor: boolean;
+    distance: number;
   }> = game
     .players()
     .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
@@ -238,6 +244,7 @@ function getObservation() {
       alive: p.isAlive(),
       relation: rlPlayer!.relation(p),
       isLandNeighbor: landNeighborIds.has(p.id()),
+      distance: 1.0, // placeholder, computed below after centroids are ready
     }));
 
   // Wilderness connected components: unclaimed land regions bordering us
@@ -324,6 +331,7 @@ function getObservation() {
         alive: true,
         relation: 0,
         isLandNeighbor: true,
+        distance: 0, // wilderness is always adjacent to our border
       });
     }
 
@@ -337,6 +345,73 @@ function getObservation() {
   wildernessBorderCache = cachedWildernessData.borderCache;
   for (const wn of cachedWildernessData.neighbors) {
     neighbors.push({ ...wn });
+  }
+
+  // Recompute our territory CC centroids periodically
+  // BFS over borderTiles (much smaller than full tile set) — two border tiles
+  // are in the same CC if adjacent directly or through a 1-hop owned tile
+  if (currentTick - ourCentroidsLastTick >= OUR_CENTROIDS_RECOMPUTE_INTERVAL) {
+    ourCentroidsLastTick = currentTick;
+    const ourBorder = rlPlayer.borderTiles();
+    cachedOurCentroids = [];
+    if (ourBorder.size > 0) {
+      const borderSet = ourBorder;
+      const visited = new Set<TileRef>();
+      const myId = game.ownerID(ourBorder.values().next().value!);
+      for (const seed of ourBorder) {
+        if (visited.has(seed)) continue;
+        visited.add(seed);
+        let sx = 0;
+        let sy = 0;
+        let count = 0;
+        const queue: TileRef[] = [seed];
+        while (queue.length > 0) {
+          const curr = queue.pop()!;
+          sx += game.x(curr);
+          sy += game.y(curr);
+          count++;
+          for (const adj of game.neighbors(curr)) {
+            if (visited.has(adj)) continue;
+            // Direct border-to-border adjacency
+            if (borderSet.has(adj)) {
+              visited.add(adj);
+              queue.push(adj);
+            }
+            // Connected through a 1-hop owned (non-border) tile
+            else if (game.ownerID(adj) === myId) {
+              for (const adj2 of game.neighbors(adj)) {
+                if (!visited.has(adj2) && borderSet.has(adj2)) {
+                  visited.add(adj2);
+                  queue.push(adj2);
+                }
+              }
+            }
+          }
+        }
+        cachedOurCentroids.push({ x: sx / count, y: sy / count });
+      }
+    } // end if ourBorder.size > 0
+  }
+
+  // Compute distance for each non-wilderness neighbor:
+  // min over their border tiles of (min over our centroids of Manhattan distance)
+  const mapDiag = width + height;
+  for (const nb of neighbors) {
+    if (nb.id.startsWith("wilderness_")) continue; // already 0
+    const opponent = game.player(nb.id);
+    if (!opponent) continue;
+    const theirBorder = opponent.borderTiles();
+    if (theirBorder.size === 0 || cachedOurCentroids.length === 0) continue;
+    let minDist = mapDiag;
+    for (const t of theirBorder) {
+      const tx = game.x(t);
+      const ty = game.y(t);
+      for (const c of cachedOurCentroids) {
+        const d = Math.abs(tx - c.x) + Math.abs(ty - c.y);
+        if (d < minDist) minDist = d;
+      }
+    }
+    nb.distance = minDist / mapDiag;
   }
 
   // Sort: land neighbors first, then by territory size
@@ -525,13 +600,17 @@ function calculateReward(): number {
   if (newlyDead > 0) reward += newlyDead / numOpponentsAtStart;
   prevAliveCount = aliveCount;
 
-  // Winner bonus: credit for all remaining alive opponents
+  // Win/loss resolution (mutually exclusive)
   const winner = game.getWinner();
-  if (winner && winner.id() === "rl_agent" && aliveCount > 0) {
-    reward += aliveCount / numOpponentsAtStart;
+  if (winner) {
+    if (winner.id() === "rl_agent") {
+      if (aliveCount > 0) reward += aliveCount / numOpponentsAtStart;
+    } else {
+      reward -= 1.0;
+    }
+  } else if (!rlPlayer.isAlive()) {
+    reward -= 1.0;
   }
-
-  if (!rlPlayer.isAlive()) reward -= 1.0;
 
   return reward;
 }
