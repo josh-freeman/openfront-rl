@@ -1,0 +1,51 @@
+program: train.py
+method: bayes
+metric:
+  name: reward/mean
+  goal: maximize
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5e-5
+    max: 1e-3
+  vf-coef:
+    values: [0.25, 0.5, 1.0]
+  ent-coef:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.1
+  gae-lambda:
+    values: [0.9, 0.95, 0.98]
+  clip-eps:
+    values: [0.1, 0.2, 0.3]
+  gamma:
+    values: [0.99, 0.995, 0.999]
+  ppo-epochs:
+    values: [3, 4, 6]
+command:
+  - ${env}
+  - python
+  - -u
+  - ${program}
+  - --opponents
+  - "2"
+  - --difficulty
+  - Easy
+  - --num-envs
+  - "16"
+  - --rollout-steps
+  - "1024"
+  - --num-updates
+  - "250"
+  - --curriculum
+  - --win-threshold
+  - "0.80"
+  - --hidden-sizes
+  - "512,512,256"
+  - --save-interval
+  - "50"
+  - --log-interval
+  - "5"
+  - --save-dir
+  - ./checkpoints_sweep
+  - ${args}
