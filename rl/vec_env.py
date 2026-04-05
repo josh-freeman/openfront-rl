@@ -32,6 +32,7 @@ class VecOpenFrontEnv:
         ticks_per_step: int = 10,
         max_steps: int = 10000,
         max_neighbors: int = 16,
+        potential_alpha: float = 0.0,
     ):
         self.num_envs = num_envs
         self.maps = maps or ["plains"]
@@ -40,6 +41,7 @@ class VecOpenFrontEnv:
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
+        self.potential_alpha = potential_alpha
 
         # 16 player stats + max_neighbors * 5 neighbor features
         obs_size = 16 + max_neighbors * 5
@@ -205,6 +207,7 @@ class VecOpenFrontEnv:
                     "map": map_name,
                     "numOpponents": self.num_opponents,
                     "difficulty": self.difficulty,
+                    "potentialAlpha": self.potential_alpha,
                 },
             })
         except (RuntimeError, BrokenPipeError):
@@ -215,6 +218,7 @@ class VecOpenFrontEnv:
                     "map": map_name,
                     "numOpponents": self.num_opponents,
                     "difficulty": self.difficulty,
+                    "potentialAlpha": self.potential_alpha,
                 },
             })
         land_mask, sea_mask = self._extract_target_masks(resp["obs"])
