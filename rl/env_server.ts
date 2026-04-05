@@ -600,19 +600,17 @@ function calculateReward(): number {
   if (newlyDead > 0) reward += newlyDead / numOpponentsAtStart;
   prevAliveCount = aliveCount;
 
-  // Win/loss resolution
+  // Win/loss resolution (mutually exclusive)
   const winner = game.getWinner();
   if (winner) {
     if (winner.id() === "rl_agent") {
-      // Winner bonus: credit for remaining alive opponents
       if (aliveCount > 0) reward += aliveCount / numOpponentsAtStart;
     } else {
-      // Lost (someone else hit 80% territory) — wipe out gains
       reward -= 1.0;
     }
+  } else if (!rlPlayer.isAlive()) {
+    reward -= 1.0;
   }
-
-  if (!rlPlayer.isAlive()) reward -= 1.0;
 
   return reward;
 }
