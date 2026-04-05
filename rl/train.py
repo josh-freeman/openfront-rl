@@ -223,7 +223,7 @@ def train(args):
     if args.curriculum:
         maps = MAP_TIER_1
     max_neighbors = 16
-    obs_dim = 16 + max_neighbors * 4  # 80
+    obs_dim = 16 + max_neighbors * 5  # 96
 
     # Create vectorized environment
     from vec_env import VecOpenFrontEnv
