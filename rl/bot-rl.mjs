@@ -654,6 +654,18 @@ async function extractGameState(page, botName) {
             }
 
             // Get all players from game API (not just leaderboard top 10)
+            const mapW = typeof g.width === "function" ? g.width() : g.width;
+            const mapH = typeof g.height === "function" ? g.height() : g.height;
+            const mapDiag = (mapW || 1000) + (mapH || 1000);
+            const DIST_SAMPLES = 30;
+            // Pre-sample our border for distance computation
+            const sampleOur =
+              myBorder.length <= DIST_SAMPLES
+                ? myBorder
+                : Array.from(
+                    { length: DIST_SAMPLES },
+                    () => myBorder[Math.floor(Math.random() * myBorder.length)],
+                  );
             const allPlayers =
               typeof g.players === "function" ? g.players() : [];
             for (const n of allPlayers) {
@@ -676,12 +688,47 @@ async function extractGameState(page, botName) {
                   ? me2.isAlliedWith(n)
                   : false;
               if (isLand) landNeighborNames.add(dname);
+
+              // Compute sampled min border-to-border distance
+              let distance = 1.0; // default: max distance
+              if (sampleOur.length > 0 && typeof n.borderTiles === "function") {
+                try {
+                  const bt = await n.borderTiles();
+                  const theirBorder = bt?.borderTiles
+                    ? [...bt.borderTiles]
+                    : [];
+                  if (theirBorder.length > 0) {
+                    const sampleTheir =
+                      theirBorder.length <= DIST_SAMPLES
+                        ? theirBorder
+                        : Array.from(
+                            { length: DIST_SAMPLES },
+                            () =>
+                              theirBorder[
+                                Math.floor(Math.random() * theirBorder.length)
+                              ],
+                          );
+                    let minDist = mapDiag;
+                    for (const t1 of sampleOur) {
+                      for (const t2 of sampleTheir) {
+                        const d =
+                          Math.abs(g.x(t1) - g.x(t2)) +
+                          Math.abs(g.y(t1) - g.y(t2));
+                        if (d < minDist) minDist = d;
+                      }
+                    }
+                    distance = minDist / mapDiag;
+                  }
+                } catch (e) {}
+              }
+
               apiNeighborData.set(dname, {
                 tiles,
                 troops,
                 relation: rel,
                 isLand,
                 isAllied: allied,
+                distance,
               });
             }
             state.hasCoast = hasCoast;
@@ -761,6 +808,7 @@ async function extractGameState(page, botName) {
           visible: info.visible,
           labelX: info.labelX,
           labelY: info.labelY,
+          distance: api?.distance ?? 1.0, // normalized L1 border distance
         });
       }
 
@@ -779,6 +827,7 @@ async function extractGameState(page, botName) {
             visible: true,
             labelX: null,
             labelY: null,
+            distance: 0, // wilderness is adjacent to our border
             _wildernessCC: wcc, // stash for attack targeting
           });
         }
