@@ -78,8 +78,7 @@ class VecOpenFrontEnv:
         self._procs[idx] = proc
 
     def _start_all(self):
-        for i in range(self.num_envs):
-            self._start_server(i)
+        list(self._pool.map(self._start_server, range(self.num_envs)))
 
     def _send(self, idx: int, msg: dict) -> dict:
         proc = self._procs[idx]
@@ -227,8 +226,8 @@ class VecOpenFrontEnv:
         masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
         land_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
         sea_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
-        for i in range(self.num_envs):
-            obs[i], masks[i], land_masks[i], sea_masks[i] = self.reset_single(i)
+        for i, result in enumerate(self._pool.map(self.reset_single, range(self.num_envs))):
+            obs[i], masks[i], land_masks[i], sea_masks[i] = result
         return obs, masks, land_masks, sea_masks
 
     def _step_single(self, i: int, action: np.ndarray):
