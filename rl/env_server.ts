@@ -353,42 +353,44 @@ function getObservation() {
   if (currentTick - ourCentroidsLastTick >= OUR_CENTROIDS_RECOMPUTE_INTERVAL) {
     ourCentroidsLastTick = currentTick;
     const ourBorder = rlPlayer.borderTiles();
-    const borderSet = new Set<TileRef>(ourBorder);
-    const visited = new Set<TileRef>();
-    const myId = game.ownerID(ourBorder.values().next().value!);
     cachedOurCentroids = [];
-    for (const seed of ourBorder) {
-      if (visited.has(seed)) continue;
-      visited.add(seed);
-      let sx = 0;
-      let sy = 0;
-      let count = 0;
-      const queue: TileRef[] = [seed];
-      while (queue.length > 0) {
-        const curr = queue.pop()!;
-        sx += game.x(curr);
-        sy += game.y(curr);
-        count++;
-        for (const adj of game.neighbors(curr)) {
-          if (visited.has(adj)) continue;
-          // Direct border-to-border adjacency
-          if (borderSet.has(adj)) {
-            visited.add(adj);
-            queue.push(adj);
-          }
-          // Connected through a 1-hop owned (non-border) tile
-          else if (game.ownerID(adj) === myId) {
-            for (const adj2 of game.neighbors(adj)) {
-              if (!visited.has(adj2) && borderSet.has(adj2)) {
-                visited.add(adj2);
-                queue.push(adj2);
+    if (ourBorder.size > 0) {
+      const borderSet = ourBorder;
+      const visited = new Set<TileRef>();
+      const myId = game.ownerID(ourBorder.values().next().value!);
+      for (const seed of ourBorder) {
+        if (visited.has(seed)) continue;
+        visited.add(seed);
+        let sx = 0;
+        let sy = 0;
+        let count = 0;
+        const queue: TileRef[] = [seed];
+        while (queue.length > 0) {
+          const curr = queue.pop()!;
+          sx += game.x(curr);
+          sy += game.y(curr);
+          count++;
+          for (const adj of game.neighbors(curr)) {
+            if (visited.has(adj)) continue;
+            // Direct border-to-border adjacency
+            if (borderSet.has(adj)) {
+              visited.add(adj);
+              queue.push(adj);
+            }
+            // Connected through a 1-hop owned (non-border) tile
+            else if (game.ownerID(adj) === myId) {
+              for (const adj2 of game.neighbors(adj)) {
+                if (!visited.has(adj2) && borderSet.has(adj2)) {
+                  visited.add(adj2);
+                  queue.push(adj2);
+                }
               }
             }
           }
         }
+        cachedOurCentroids.push({ x: sx / count, y: sy / count });
       }
-      cachedOurCentroids.push({ x: sx / count, y: sy / count });
-    }
+    } // end if ourBorder.size > 0
   }
 
   // Compute distance for each non-wilderness neighbor:
