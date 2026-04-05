@@ -556,6 +556,7 @@ def train(args):
                     "lr": current_lr,
                     "curriculum/stage": curriculum_stage,
                     "curriculum/opponents": envs.num_opponents,
+                    "best_reward": float(best_reward),
                 }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
