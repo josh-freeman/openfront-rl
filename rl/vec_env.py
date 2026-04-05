@@ -9,9 +9,11 @@ import json
 import subprocess
 import numpy as np
 import random
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
+
+from tqdm import tqdm
 
 from env import (
     NUM_ACTIONS, BUILD_TYPES, NUKE_TYPES,
@@ -80,7 +82,11 @@ class VecOpenFrontEnv:
         self._procs[idx] = proc
 
     def _start_all(self):
-        list(self._pool.map(self._start_server, range(self.num_envs)))
+        futures = {self._pool.submit(self._start_server, i): i for i in range(self.num_envs)}
+        with tqdm(total=self.num_envs, desc="Starting env servers", unit="env") as pbar:
+            for future in as_completed(futures):
+                future.result()
+                pbar.update(1)
 
     def _send(self, idx: int, msg: dict) -> dict:
         proc = self._procs[idx]
@@ -228,8 +234,12 @@ class VecOpenFrontEnv:
         masks = np.ones((self.num_envs, NUM_ACTIONS), dtype=np.float32)
         land_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
         sea_masks = np.ones((self.num_envs, self.max_neighbors), dtype=np.float32)
-        for i, result in enumerate(self._pool.map(self.reset_single, range(self.num_envs))):
-            obs[i], masks[i], land_masks[i], sea_masks[i] = result
+        futures = {self._pool.submit(self.reset_single, i): i for i in range(self.num_envs)}
+        with tqdm(total=self.num_envs, desc="Resetting envs", unit="env") as pbar:
+            for future in as_completed(futures):
+                i = futures[future]
+                obs[i], masks[i], land_masks[i], sea_masks[i] = future.result()
+                pbar.update(1)
         return obs, masks, land_masks, sea_masks
 
     def _step_single(self, i: int, action: np.ndarray):
