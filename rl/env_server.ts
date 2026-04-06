@@ -1,15 +1,38 @@
 /**
- * OpenFront RL Environment Server
+ * OpenFront RL Environment Server (Multi-Agent Self-Play)
  *
  * Runs the headless OpenFront game and communicates with a Python
  * training script via JSON lines over stdin/stdout.
  *
- * Protocol:
- *   Python sends: { "cmd": "reset", "config": {...} }
- *   Server sends: { "obs": {...}, "reward": 0, "done": false, "info": {...} }
+ * Single game process hosts K RL agents (shared policy on the Python
+ * side) + N Nations (PlayerType.Nation, strong AI) + B Bots (PlayerType.Bot,
+ * tribes). All K RL agents are registered as PlayerType.Human so the engine's
+ * WinCheckExecution considers them for winner determination.
  *
- *   Python sends: { "cmd": "step", "action": {...} }
- *   Server sends: { "obs": {...}, "reward": 0.5, "done": false, "info": {...} }
+ * Protocol:
+ *   Python sends: { "cmd": "reset", "config": { map, numAgents, numNations,
+ *                                                numBots, difficulty,
+ *                                                potentialAlpha } }
+ *   Server sends: { "obs": [obs_0, ..., obs_{K-1}],
+ *                   "rewards": [r_0, ..., r_{K-1}],
+ *                   "dones":   [d_0, ..., d_{K-1}],
+ *                   "gameDone": bool,
+ *                   "gameInfo": { anyAgentBeatAI, numAgentsAliveAtEnd, ... } }
+ *
+ *   Python sends: { "cmd": "step", "actions": [a_0, ..., a_{K-1}],
+ *                   "ticksPerStep": 10 }
+ *   Server sends: same shape as reset response.
+ *
+ * Reward semantics (per agent):
+ *   + 1/numOpponentsAtStart per newly-dead opponent (shared kill credit)
+ *   - 1 on death (once, then zombie frames with reward=0)
+ *   + 1 when game.getWinner() == this agent
+ *   + potentialAlpha * (phi_t - phi_{t-1}) — per-agent territory delta
+ *
+ * Done semantics:
+ *   Per-slot done=True is emitted ONLY at game end (engine winner, all RL
+ *   dead, or max_steps). Dead agents produce zombie frames (zero obs, NOOP
+ *   mask, reward=0) until game end.
  */
 
 import fs from "fs";
@@ -21,18 +44,21 @@ import { AttackExecution } from "../src/core/execution/AttackExecution";
 import { ConstructionExecution } from "../src/core/execution/ConstructionExecution";
 import { DeleteUnitExecution } from "../src/core/execution/DeleteUnitExecution";
 import { MoveWarshipExecution } from "../src/core/execution/MoveWarshipExecution";
+import { NationExecution } from "../src/core/execution/NationExecution";
 import { NukeExecution } from "../src/core/execution/NukeExecution";
 import { RetreatExecution } from "../src/core/execution/RetreatExecution";
 import { SpawnExecution } from "../src/core/execution/SpawnExecution";
 import { TransportShipExecution } from "../src/core/execution/TransportShipExecution";
 import { UpgradeStructureExecution } from "../src/core/execution/UpgradeStructureExecution";
 import {
+  Cell,
   Difficulty,
   Game,
   GameMapSize,
   GameMapType,
   GameMode,
   GameType,
+  Nation,
   Player,
   PlayerInfo,
   PlayerType,
@@ -42,6 +68,7 @@ import { createGame } from "../src/core/game/GameImpl";
 import { TileRef } from "../src/core/game/GameMap";
 import {
   genTerrainFromBin,
+  Nation as ManifestNation,
   MapManifest,
 } from "../src/core/game/TerrainMapLoader";
 import { UserSettings } from "../src/core/game/UserSettings";
@@ -141,35 +168,54 @@ class RLServerConfig {
   }
 }
 
+// ---------- Per-agent state ----------
+
+interface AgentState {
+  id: string; // player id (e.g. "rl_agent_0")
+  player: Player | null;
+  prevAliveOpponents: number;
+  prevTerritoryPct: number;
+  lastBuildResult:
+    | "success"
+    | "invalid_tile"
+    | "no_tile"
+    | "no_port"
+    | "no_gold"
+    | "none";
+  lastActionSucceeded: boolean;
+  // Caches for observation generation (per-agent because they depend on
+  // borderTiles / centroids of this specific player).
+  neighborsCache: any[];
+  wildernessBorderCache: Map<string, TileRef[]>;
+  cachedWildernessData: {
+    neighbors: any[];
+    borderCache: Map<string, TileRef[]>;
+  } | null;
+  wildernessLastTick: number;
+  cachedOurCentroids: Array<{ x: number; y: number }>;
+  ourCentroidsLastTick: number;
+  // Reward bookkeeping
+  diedOnTick: number; // -1 if alive, tick number when dead
+  alreadyGotDeathPenalty: boolean;
+  alreadyGotWinBonus: boolean;
+}
+
 // ---------- Game State ----------
 
 let game: Game | null = null;
-let rlPlayer: Player | null = null;
+let agents: AgentState[] = [];
 let tickCount = 0;
-let landTiles = 0; // cached at reset for reward normalization
-let prevAliveCount = 0;
-let numOpponentsAtStart = 0;
-let prevTerritoryPct = 0;
-let potentialAlpha = 100; // potential-based reward shaping coefficient
-// Wilderness CC cache: maps synthetic IDs to our border tiles adjacent to that CC
-let wildernessBorderCache: Map<string, TileRef[]> = new Map();
-let cachedWildernessData: {
-  neighbors: any[];
-  borderCache: Map<string, TileRef[]>;
-} | null = null;
-let wildernessLastTick = -1;
-const WILDERNESS_RECOMPUTE_INTERVAL = 10; // recompute every N ticks
-
-// Our territory CC centroids cache
-let cachedOurCentroids: Array<{ x: number; y: number }> = [];
-let ourCentroidsLastTick = -1;
-const OUR_CENTROIDS_RECOMPUTE_INTERVAL = 50; // recompute every N ticks
+let numOpponentsAtStart = 0; // total non-self players at game start (same for every agent)
+let potentialAlpha = 100;
+let anyAgentBeatAI = false;
+let nonRLIds: Set<string> = new Set(); // ids of nations + tribes
+const WILDERNESS_RECOMPUTE_INTERVAL = 10;
+const OUR_CENTROIDS_RECOMPUTE_INTERVAL = 50;
 const GAME_ID = "rl-training";
 
 // ---------- Helper: Load map ----------
 
 async function loadMap(mapName: string) {
-  // Try testdata maps first, then resources/maps
   const mapsDirs = [
     path.join(__rldir, "../tests/testdata/maps"),
     path.join(__rldir, "../resources/maps"),
@@ -199,27 +245,79 @@ async function loadMap(mapName: string) {
 
   const gameMap = await genTerrainFromBin(manifest.map, mapBin);
   const miniGameMap = await genTerrainFromBin(manifest.map4x, miniMapBin);
-  return { gameMap, miniGameMap };
+  return { gameMap, miniGameMap, manifestNations: manifest.nations ?? [] };
 }
 
-// ---------- Observation extraction ----------
+// ---------- Zombie observation (for dead agents) ----------
 
-function getObservation() {
-  if (!game || !rlPlayer) {
-    return { error: "no game" };
+function zombieObservation(): any {
+  const width = game?.width() ?? 0;
+  const height = game?.height() ?? 0;
+  return {
+    tick: tickCount,
+    alive: false,
+    myTiles: 0,
+    myTroops: 0,
+    myGold: 0,
+    mapWidth: width,
+    mapHeight: height,
+    neighbors: [],
+    units: [],
+    borderTiles: [],
+    incomingAttacks: 0,
+    outgoingAttacks: 0,
+    allPlayers: [],
+    totalMapTiles: width * height,
+    territoryPct: 0,
+    hasSilo: false,
+    hasPort: false,
+    hasSAM: false,
+    numWarships: 0,
+    numNukes: 0,
+    lastBuildResult: "none",
+    lastActionSucceeded: false,
+    // Action mask: only NOOP valid
+    actionMask: [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+    ],
+    landTargetMask: new Array(16).fill(0),
+    seaTargetMask: new Array(16).fill(0),
+  };
+}
+
+// ---------- Observation extraction (per agent) ----------
+
+function getObservation(agent: AgentState): any {
+  if (!game || !agent.player || !agent.player.isAlive()) {
+    return zombieObservation();
   }
+  const rlPlayer = agent.player;
 
   const width = game.width();
   const height = game.height();
 
-  // Our player state
   const myTiles = rlPlayer.numTilesOwned();
   const myTroops = rlPlayer.troops();
   const myGold = Number(rlPlayer.gold());
   const alive = rlPlayer.isAlive();
 
-  // All alive players (not just land neighbors) — sorted by relevance
-  // Land neighbors first (immediate threats), then others sorted by size
+  // All alive non-self players — land neighbors first, then others by size
   const landNeighborIds = new Set(
     rlPlayer
       .neighbors()
@@ -237,48 +335,41 @@ function getObservation() {
     distance: number;
   }> = game
     .players()
-    .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive())
+    .filter((p) => p.id() !== rlPlayer.id() && p.isAlive())
     .map((p) => ({
       id: p.id(),
       name: p.name(),
       tiles: p.numTilesOwned(),
       troops: p.troops(),
       alive: p.isAlive(),
-      relation: rlPlayer!.relation(p),
+      relation: rlPlayer.relation(p),
       isLandNeighbor: landNeighborIds.has(p.id()),
-      distance: 1.0, // placeholder, computed below after centroids are ready
+      distance: 1.0,
     }));
 
-  // Wilderness connected components: unclaimed land regions bordering us
-  // Only recompute every N ticks — wilderness changes slowly
+  // ---- Wilderness CCs (per-agent cache) ----
   const currentTick = tickCount;
   if (
-    !cachedWildernessData ||
-    currentTick - wildernessLastTick >= WILDERNESS_RECOMPUTE_INTERVAL
+    !agent.cachedWildernessData ||
+    currentTick - agent.wildernessLastTick >= WILDERNESS_RECOMPUTE_INTERVAL
   ) {
-    wildernessLastTick = currentTick;
+    agent.wildernessLastTick = currentTick;
     const newBorderCache = new Map<string, TileRef[]>();
     const newNeighbors: typeof neighbors = [];
 
-    // Step 1: Find all unclaimed tiles directly adjacent to our border (1-layer fringe)
     const borderSet = rlPlayer.borderTiles();
-    const fringeTiles = new Set<TileRef>(); // unclaimed tiles touching our border
-    const fringeToOurBorder = new Map<TileRef, TileRef[]>(); // fringe tile → our border tiles next to it
-    const borderToFringe = new Map<TileRef, TileRef[]>(); // our border tile → fringe tiles next to it
+    const fringeTiles = new Set<TileRef>();
+    const fringeToOurBorder = new Map<TileRef, TileRef[]>();
 
     for (const bt of borderSet) {
       for (const adj of game.neighbors(bt)) {
         if (!game.isLand(adj) || game.hasOwner(adj)) continue;
         fringeTiles.add(adj);
-        // Track which border tiles connect to this fringe tile
         if (!fringeToOurBorder.has(adj)) fringeToOurBorder.set(adj, []);
         fringeToOurBorder.get(adj)!.push(bt);
-        if (!borderToFringe.has(bt)) borderToFringe.set(bt, []);
-        borderToFringe.get(bt)!.push(adj);
       }
     }
 
-    // Step 2: Group fringe tiles into CCs, then expand depth-3 for size estimate
     const visited = new Set<TileRef>();
     let ccIndex = 0;
     const SIZE_EST_DEPTH = 3;
@@ -291,7 +382,6 @@ function getObservation() {
       const queue: TileRef[] = [seed];
       const ourBorderSet = new Set<TileRef>();
 
-      // BFS among fringe tiles only to find the CC group
       while (queue.length > 0) {
         const curr = queue.pop()!;
         for (const bt of fringeToOurBorder.get(curr) || []) {
@@ -306,7 +396,6 @@ function getObservation() {
         }
       }
 
-      // Expand outward from fringe by SIZE_EST_DEPTH layers for size estimate
       const sizeVisited = new Set<TileRef>(ccFringe);
       let frontier = ccFringe;
       for (let d = 0; d < SIZE_EST_DEPTH; d++) {
@@ -322,40 +411,42 @@ function getObservation() {
         frontier = nextFrontier;
       }
 
-      const ccId = `wilderness_${ccIndex++}`;
+      // Wilderness CC IDs are per-agent-scoped so they don't collide between
+      // agents (each agent has its own wildernessBorderCache).
+      const ccId = `wilderness_${agent.id}_${ccIndex++}`;
       newBorderCache.set(ccId, Array.from(ourBorderSet));
 
       newNeighbors.push({
         id: ccId,
         name: "Wilderness",
-        tiles: sizeVisited.size, // depth-3 expansion for better size estimate
+        tiles: sizeVisited.size,
         troops: 0,
         alive: true,
         relation: 0,
         isLandNeighbor: true,
-        distance: 0, // wilderness is always adjacent to our border
+        distance: 0,
       });
     }
 
-    cachedWildernessData = {
+    agent.cachedWildernessData = {
       neighbors: newNeighbors,
       borderCache: newBorderCache,
     };
   }
 
-  // Apply cached wilderness data
-  wildernessBorderCache = cachedWildernessData.borderCache;
-  for (const wn of cachedWildernessData.neighbors) {
+  agent.wildernessBorderCache = agent.cachedWildernessData.borderCache;
+  for (const wn of agent.cachedWildernessData.neighbors) {
     neighbors.push({ ...wn });
   }
 
-  // Recompute our territory CC centroids periodically
-  // BFS over borderTiles (much smaller than full tile set) — two border tiles
-  // are in the same CC if adjacent directly or through a 1-hop owned tile
-  if (currentTick - ourCentroidsLastTick >= OUR_CENTROIDS_RECOMPUTE_INTERVAL) {
-    ourCentroidsLastTick = currentTick;
+  // ---- Our territory CC centroids (per-agent cache) ----
+  if (
+    currentTick - agent.ourCentroidsLastTick >=
+    OUR_CENTROIDS_RECOMPUTE_INTERVAL
+  ) {
+    agent.ourCentroidsLastTick = currentTick;
     const ourBorder = rlPlayer.borderTiles();
-    cachedOurCentroids = [];
+    agent.cachedOurCentroids = [];
     if (ourBorder.size > 0) {
       const borderSet = ourBorder;
       const visited = new Set<TileRef>();
@@ -374,13 +465,10 @@ function getObservation() {
           count++;
           for (const adj of game.neighbors(curr)) {
             if (visited.has(adj)) continue;
-            // Direct border-to-border adjacency
             if (borderSet.has(adj)) {
               visited.add(adj);
               queue.push(adj);
-            }
-            // Connected through a 1-hop owned (non-border) tile
-            else if (game.ownerID(adj) === myId) {
+            } else if (game.ownerID(adj) === myId) {
               for (const adj2 of game.neighbors(adj)) {
                 if (!visited.has(adj2) && borderSet.has(adj2)) {
                   visited.add(adj2);
@@ -390,25 +478,25 @@ function getObservation() {
             }
           }
         }
-        cachedOurCentroids.push({ x: sx / count, y: sy / count });
+        agent.cachedOurCentroids.push({ x: sx / count, y: sy / count });
       }
-    } // end if ourBorder.size > 0
+    }
   }
 
-  // Compute distance for each non-wilderness neighbor:
-  // min over their border tiles of (min over our centroids of Manhattan distance)
+  // Distance to each non-wilderness neighbor
   const mapDiag = width + height;
   for (const nb of neighbors) {
-    if (nb.id.startsWith("wilderness_")) continue; // already 0
+    if (nb.id.startsWith("wilderness_")) continue;
     const opponent = game.player(nb.id);
     if (!opponent) continue;
     const theirBorder = opponent.borderTiles();
-    if (theirBorder.size === 0 || cachedOurCentroids.length === 0) continue;
+    if (theirBorder.size === 0 || agent.cachedOurCentroids.length === 0)
+      continue;
     let minDist = mapDiag;
     for (const t of theirBorder) {
       const tx = game.x(t);
       const ty = game.y(t);
-      for (const c of cachedOurCentroids) {
+      for (const c of agent.cachedOurCentroids) {
         const d = Math.abs(tx - c.x) + Math.abs(ty - c.y);
         if (d < minDist) minDist = d;
       }
@@ -416,11 +504,12 @@ function getObservation() {
     nb.distance = minDist / mapDiag;
   }
 
-  // Sort: land neighbors first, then by territory size
   neighbors.sort((a, b) => {
     if (a.isLandNeighbor !== b.isLandNeighbor) return a.isLandNeighbor ? -1 : 1;
     return b.tiles - a.tiles;
   });
+
+  agent.neighborsCache = neighbors;
 
   // Our units
   const units = rlPlayer.units().map((u) => ({
@@ -436,9 +525,8 @@ function getObservation() {
   let hasCoast = false;
   const borderSet = rlPlayer.borderTiles();
   for (const t of borderSet) {
-    if (count++ > 200) break; // Cap for performance
+    if (count++ > 200) break;
     borderTilesArr.push({ x: game.x(t), y: game.y(t), ref: t });
-    // Check if any neighbor is water (not land) → we have coast
     if (!hasCoast) {
       for (const adj of game.neighbors(t)) {
         if (!game.isLand(adj)) {
@@ -449,21 +537,18 @@ function getObservation() {
     }
   }
 
-  // Incoming/outgoing attacks
   const incoming = rlPlayer.incomingAttacks().length;
   const outgoing = rlPlayer.outgoingAttacks().length;
 
-  // All players summary
   const allPlayers = game.players().map((p) => ({
     id: p.id(),
     name: p.name(),
     tiles: p.numTilesOwned(),
     troops: p.troops(),
     alive: p.isAlive(),
-    isUs: p.id() === rlPlayer!.id(),
+    isUs: p.id() === rlPlayer.id(),
   }));
 
-  // Unit type counts
   const hasSilo = units.some((u) => u.type === UnitType.MissileSilo);
   const hasPort = units.some((u) => u.type === UnitType.Port);
   const hasSAM = units.some((u) => u.type === UnitType.SAMLauncher);
@@ -475,8 +560,6 @@ function getObservation() {
       u.type === UnitType.MIRV,
   ).length;
 
-  // Affordability flags — tell the model what it can actually build right now
-  // Uses canBuild on a random border tile as a proxy (checks gold + unit constraints)
   const sampleTile =
     borderTilesArr.length > 0
       ? borderTilesArr[Math.floor(Math.random() * borderTilesArr.length)].ref
@@ -503,26 +586,23 @@ function getObservation() {
     sampleTile !== null &&
     rlPlayer.canBuild(UnitType.Warship, sampleTile) !== false;
 
-  // Nuke affordability (need silo + gold)
   const canAffordAtom = hasSilo && myGold >= 750_000;
   const canAffordHBomb = hasSilo && myGold >= 5_000_000;
   const canAffordMIRV = hasSilo && myGold >= 10_000_000;
 
-  const hasNeighbors = neighbors.length > 0;
   const hasTroops = myTroops > 10;
   const hasOutgoingAttacks = outgoing > 0;
   const hasUnits = units.length > 0;
   const canDelete = hasUnits && rlPlayer.canDeleteUnit();
 
-  // Per-target masks: which neighbors are valid targets for land vs sea actions
   const landTargetMask = new Array(16).fill(0);
   const seaTargetMask = new Array(16).fill(0);
   const canReachBySea = hasCoast || hasPort;
   neighbors.slice(0, 16).forEach((n, i) => {
     if (n.id.startsWith("wilderness_")) {
-      landTargetMask[i] = 1; // wilderness always attackable on land
+      landTargetMask[i] = 1;
     } else {
-      const notAllied = !rlPlayer!.isAlliedWith(game!.player(n.id));
+      const notAllied = !rlPlayer.isAlliedWith(game!.player(n.id));
       if (n.isLandNeighbor && notAllied) landTargetMask[i] = 1;
       if (notAllied && canReachBySea) seaTargetMask[i] = 1;
     }
@@ -530,17 +610,15 @@ function getObservation() {
   const hasAttackableNeighbor = landTargetMask.some((v) => v === 1);
   const hasAttackableBySeaNeighbor = seaTargetMask.some((v) => v === 1);
 
-  // Action mask: 17 booleans, true = action is valid right now
-  // Indices match env.py action IDs exactly
   const actionMask = [
-    true, // 0: NOOP — always valid
+    true, // 0: NOOP
     hasAttackableNeighbor && hasTroops, // 1: ATTACK
-    hasAttackableBySeaNeighbor && hasTroops, // 2: BOAT_ATTACK (sea mask already gates on coast)
+    hasAttackableBySeaNeighbor && hasTroops, // 2: BOAT_ATTACK
     hasOutgoingAttacks, // 3: RETREAT
     canAffordCity, // 4: BUILD_CITY
     canAffordFactory, // 5: BUILD_FACTORY
     canAffordDefense, // 6: BUILD_DEFENSE
-    canAffordPort && hasCoast, // 7: BUILD_PORT (need coast to place a port)
+    canAffordPort && hasCoast, // 7: BUILD_PORT
     canAffordSAM, // 8: BUILD_SAM
     canAffordSilo, // 9: BUILD_SILO
     canAffordWarship && hasPort, // 10: BUILD_WARSHIP
@@ -548,8 +626,8 @@ function getObservation() {
     canAffordHBomb && hasAttackableBySeaNeighbor, // 12: LAUNCH_HBOMB
     canAffordMIRV && hasAttackableBySeaNeighbor, // 13: LAUNCH_MIRV
     numWarships > 0 && hasAttackableBySeaNeighbor, // 14: MOVE_WARSHIP
-    hasUnits && myGold >= 50_000, // 15: UPGRADE (rough check)
-    canDelete, // 16: DELETE_UNIT (respects 300-tick cooldown)
+    hasUnits && myGold >= 50_000, // 15: UPGRADE
+    canDelete, // 16: DELETE_UNIT
   ];
 
   return {
@@ -573,53 +651,61 @@ function getObservation() {
     hasSAM,
     numWarships,
     numNukes,
-    lastBuildResult,
-    lastActionSucceeded,
-    canAffordCity,
-    canAffordDefense,
-    canAffordFactory,
-    canAffordPort,
-    canAffordSilo,
-    canAffordSAM,
-    canAffordWarship,
+    lastBuildResult: agent.lastBuildResult,
+    lastActionSucceeded: agent.lastActionSucceeded,
     actionMask,
     landTargetMask,
     seaTargetMask,
   };
 }
 
-// ---------- Reward calculation ----------
+// ---------- Reward calculation (per agent) ----------
 
-function calculateReward(): number {
-  if (!rlPlayer || !game) return 0;
+function calculateReward(agent: AgentState): number {
+  if (!game || !agent.player) return 0;
+
+  // Zombie frames after death: emit no reward signal
+  if (agent.alreadyGotDeathPenalty) return 0;
 
   let reward = 0;
 
-  const aliveCount = game
+  // Kill credit: any opponent (agent or non-RL) that died since last step
+  const aliveOpponents = game
     .players()
-    .filter((p) => p.id() !== rlPlayer!.id() && p.isAlive()).length;
-  const newlyDead = prevAliveCount - aliveCount;
-  if (newlyDead > 0) reward += newlyDead / numOpponentsAtStart;
-  prevAliveCount = aliveCount;
+    .filter((p) => p.id() !== agent.id && p.isAlive()).length;
+  const newlyDead = agent.prevAliveOpponents - aliveOpponents;
+  if (newlyDead > 0 && numOpponentsAtStart > 0) {
+    reward += newlyDead / numOpponentsAtStart;
+  }
+  agent.prevAliveOpponents = aliveOpponents;
 
-  // Win/loss resolution (mutually exclusive)
+  // Engine-declared winner bonus
   const winner = game.getWinner();
-  if (winner) {
-    if (winner.id() === "rl_agent") {
-      if (aliveCount > 0) reward += aliveCount / numOpponentsAtStart;
-    } else {
-      reward -= 1.0;
-    }
-  } else if (!rlPlayer.isAlive()) {
-    reward -= 1.0;
+  if (
+    winner &&
+    typeof (winner as any).id === "function" &&
+    (winner as any).id() === agent.id &&
+    !agent.alreadyGotWinBonus
+  ) {
+    reward += 1;
+    agent.alreadyGotWinBonus = true;
   }
 
-  // Potential-based reward shaping: alpha * (phi_t - phi_{t-1})
-  // where phi = territory fraction
+  // Death penalty (delivered once on death tick)
+  if (!agent.player.isAlive()) {
+    reward -= 1;
+    agent.alreadyGotDeathPenalty = true;
+    agent.diedOnTick = tickCount;
+    // Freeze territory pct so future potential shaping is zero
+    agent.prevTerritoryPct = 0;
+    return reward;
+  }
+
+  // Potential-based reward shaping (alive only)
   const totalTiles = game.width() * game.height();
-  const currentPct = rlPlayer.numTilesOwned() / totalTiles;
-  reward += potentialAlpha * (currentPct - prevTerritoryPct);
-  prevTerritoryPct = currentPct;
+  const currentPct = agent.player.numTilesOwned() / totalTiles;
+  reward += potentialAlpha * (currentPct - agent.prevTerritoryPct);
+  agent.prevTerritoryPct = currentPct;
 
   return reward;
 }
@@ -643,9 +729,12 @@ interface RLAction {
   nukeType?: string;
 }
 
-function findClosestBorderTile(target: Player): TileRef | null {
-  if (!game || !rlPlayer) return null;
-  const borderArr = Array.from(rlPlayer.borderTiles());
+function findClosestBorderTile(
+  agent: AgentState,
+  target: Player,
+): TileRef | null {
+  if (!game || !agent.player) return null;
+  const borderArr = Array.from(agent.player.borderTiles());
   if (borderArr.length === 0) return null;
   const targetTiles = Array.from(target.borderTiles());
   if (targetTiles.length === 0) return null;
@@ -663,31 +752,17 @@ function findClosestBorderTile(target: Player): TileRef | null {
   return bestTile;
 }
 
-// Track build outcomes so the model can learn what works
-let lastBuildResult:
-  | "success"
-  | "invalid_tile"
-  | "no_tile"
-  | "no_port"
-  | "no_gold"
-  | "none" = "none";
-let lastActionSucceeded = false;
-
 /**
- * Pick the best tile for building a given unit type.
- * - Cities/Factories: far from borders (safe interior) for economy
- * - DefensePost/SAMLauncher: near borders but ~3-5 tiles back (time to build before enemy reaches)
- * - MissileSilo: medium distance from border (protected but in range)
- * - Port: needs to be near water (handled by canBuild)
+ * Pick the best tile for building a given unit type, relative to this agent's
+ * territory.
  */
-function pickBuildTile(unitType: UnitType): TileRef | null {
-  if (!game || !rlPlayer) return null;
+function pickBuildTile(agent: AgentState, unitType: UnitType): TileRef | null {
+  if (!game || !agent.player) return null;
+  const rlPlayer = agent.player;
 
   const borders = Array.from(rlPlayer.borderTiles());
   if (borders.length === 0) return null;
 
-  // Compute distance from each border tile to nearest enemy border
-  // We'll use this to rank tiles
   const enemyBorders: TileRef[] = [];
   for (const n of rlPlayer.neighbors()) {
     if (n.isPlayer()) {
@@ -698,14 +773,12 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
   }
 
-  // Score each of our border tiles by distance to nearest enemy
   const scored = borders.map((t) => {
     let minEnemyDist = Infinity;
     for (const eb of enemyBorders) {
       const d = game!.manhattanDist(t, eb);
       if (d < minEnemyDist) minEnemyDist = d;
     }
-    // If no enemies, use distance from map center as proxy
     if (minEnemyDist === Infinity) {
       const cx = game!.width() / 2;
       const cy = game!.height() / 2;
@@ -716,13 +789,11 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     return { tile: t, dist: minEnemyDist };
   });
 
-  // Sort by distance to enemy
   scored.sort((a, b) => a.dist - b.dist);
 
   switch (unitType) {
     case UnitType.City:
     case UnitType.Factory: {
-      // Try top 20% farthest tiles, pick a random one from those // Economy buildings: pick from the FARTHEST tiles from enemies (safe interior)
       const safeTiles = scored.slice(Math.floor(scored.length * 0.8));
       if (safeTiles.length === 0)
         return scored[scored.length - 1]?.tile ?? null;
@@ -731,7 +802,6 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
 
     case UnitType.DefensePost:
     case UnitType.SAMLauncher: {
-      // Pick tiles at 20-40% from the front (some buffer to finish building) // Defensive buildings: near borders but not ON the border
       const lo = Math.floor(scored.length * 0.2);
       const hi = Math.floor(scored.length * 0.4);
       const defTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -741,7 +811,6 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     case UnitType.MissileSilo: {
-      // Silos: medium distance, ~40-60% back from front
       const lo = Math.floor(scored.length * 0.4);
       const hi = Math.floor(scored.length * 0.6);
       const siloTiles = scored.slice(lo, Math.max(hi, lo + 1));
@@ -751,7 +820,6 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     case UnitType.Port: {
-      // Ports need water adjacency — try multiple border tiles, canBuild will validate
       const shuffled = [...scored].sort(() => Math.random() - 0.5);
       for (const s of shuffled.slice(0, 20)) {
         if (rlPlayer.canBuild(unitType, s.tile) !== false) {
@@ -762,15 +830,15 @@ function pickBuildTile(unitType: UnitType): TileRef | null {
     }
 
     default:
-      // Fallback: random border tile
       return borders[Math.floor(Math.random() * borders.length)];
   }
 }
 
-function executeAction(action: RLAction) {
-  if (!game || !rlPlayer || !rlPlayer.isAlive()) return;
-  lastBuildResult = "none";
-  lastActionSucceeded = false;
+function executeAction(agent: AgentState, action: RLAction) {
+  if (!game || !agent.player || !agent.player.isAlive()) return;
+  const rlPlayer = agent.player;
+  agent.lastBuildResult = "none";
+  agent.lastActionSucceeded = false;
 
   switch (action.type) {
     case "attack": {
@@ -781,25 +849,26 @@ function executeAction(action: RLAction) {
       if (troops < 10) break;
 
       if (action.targetPlayerId.startsWith("wilderness_")) {
-        // Attack unclaimed territory
-        const borderTiles = wildernessBorderCache.get(action.targetPlayerId);
+        const borderTiles = agent.wildernessBorderCache.get(
+          action.targetPlayerId,
+        );
         if (!borderTiles || borderTiles.length === 0) break;
         const sourceTile =
           borderTiles[Math.floor(Math.random() * borderTiles.length)];
         game.addExecution(
           new AttackExecution(troops, rlPlayer, null, sourceTile, true),
         );
-        lastActionSucceeded = true;
+        agent.lastActionSucceeded = true;
       } else {
         if (!game.hasPlayer(action.targetPlayerId)) break;
         const target = game.player(action.targetPlayerId);
         if (!target.isAlive()) break;
-        const tile = findClosestBorderTile(target);
+        const tile = findClosestBorderTile(agent, target);
         if (!tile) break;
         game.addExecution(
           new AttackExecution(troops, rlPlayer, target.id(), tile, true),
         );
-        lastActionSucceeded = true;
+        agent.lastActionSucceeded = true;
       }
       break;
     }
@@ -817,25 +886,22 @@ function executeAction(action: RLAction) {
       const ports = rlPlayer.units().filter((u) => u.type() === UnitType.Port);
       if (ports.length === 0) break;
 
-      // ref must be a tile owned by the target enemy — TransportShipExecution
-      // derives the target player and landing destination from this tile
       const targetBorder = Array.from(target.borderTiles());
       if (targetBorder.length === 0) break;
       const dst = targetBorder[Math.floor(targetBorder.length / 2)];
 
       game.addExecution(new TransportShipExecution(rlPlayer, dst, troops));
-      lastActionSucceeded = true;
+      agent.lastActionSucceeded = true;
       break;
     }
 
     case "retreat": {
       const attacks = rlPlayer.outgoingAttacks();
       if (attacks.length === 0) break;
-      // Retreat the most recent attack
       const attack = attacks[attacks.length - 1];
       if (!attack.retreating()) {
         game.addExecution(new RetreatExecution(rlPlayer, attack.id()));
-        lastActionSucceeded = true;
+        agent.lastActionSucceeded = true;
       }
       break;
     }
@@ -854,40 +920,38 @@ function executeAction(action: RLAction) {
       const ut = unitTypeMap[action.unitType];
       if (!ut) break;
 
-      // For warships, need a port
       if (ut === UnitType.Warship) {
         const ports = rlPlayer
           .units()
           .filter((u) => u.type() === UnitType.Port);
         if (ports.length === 0) {
-          lastBuildResult = "no_port";
+          agent.lastBuildResult = "no_port";
           break;
         }
         const canBuild = rlPlayer.canBuild(ut, ports[0].tile());
         if (canBuild !== false) {
           game.addExecution(new ConstructionExecution(rlPlayer, ut, canBuild));
-          lastBuildResult = "success";
-          lastActionSucceeded = true;
+          agent.lastBuildResult = "success";
+          agent.lastActionSucceeded = true;
         } else {
-          lastBuildResult = "invalid_tile";
+          agent.lastBuildResult = "invalid_tile";
         }
         break;
       }
 
-      // Smart tile selection based on unit type
-      const tile = pickBuildTile(ut);
+      const tile = pickBuildTile(agent, ut);
       if (!tile) {
-        lastBuildResult = "no_tile";
+        agent.lastBuildResult = "no_tile";
         break;
       }
 
       const canBuild = rlPlayer.canBuild(ut, tile);
       if (canBuild !== false) {
         game.addExecution(new ConstructionExecution(rlPlayer, ut, canBuild));
-        lastBuildResult = "success";
-        lastActionSucceeded = true;
+        agent.lastBuildResult = "success";
+        agent.lastActionSucceeded = true;
       } else {
-        lastBuildResult = "invalid_tile";
+        agent.lastBuildResult = "invalid_tile";
       }
       break;
     }
@@ -907,13 +971,11 @@ function executeAction(action: RLAction) {
       const nukeUt = nukeTypeMap[action.nukeType];
       if (!nukeUt) break;
 
-      // Find a missile silo
       const silos = rlPlayer
         .units()
         .filter((u) => u.type() === UnitType.MissileSilo);
       if (silos.length === 0) break;
 
-      // Target center of enemy territory
       const targetTiles = Array.from(target.borderTiles());
       if (targetTiles.length === 0) break;
       const dst = targetTiles[Math.floor(targetTiles.length / 2)];
@@ -921,7 +983,7 @@ function executeAction(action: RLAction) {
       game.addExecution(
         new NukeExecution(nukeUt as any, rlPlayer, dst, silos[0].tile()),
       );
-      lastActionSucceeded = true;
+      agent.lastActionSucceeded = true;
       break;
     }
 
@@ -935,7 +997,6 @@ function executeAction(action: RLAction) {
         .filter((u) => u.type() === UnitType.Warship);
       if (warships.length === 0) break;
 
-      // Move warship toward target's territory
       const targetTiles = Array.from(target.borderTiles());
       if (targetTiles.length === 0) break;
       const dst = targetTiles[Math.floor(targetTiles.length / 2)];
@@ -943,17 +1004,16 @@ function executeAction(action: RLAction) {
       game.addExecution(
         new MoveWarshipExecution(rlPlayer, warships[0].id(), dst),
       );
-      lastActionSucceeded = true;
+      agent.lastActionSucceeded = true;
       break;
     }
 
     case "upgrade": {
-      // Upgrade the first upgradeable structure
       const units = rlPlayer.units();
       for (const u of units) {
         if (rlPlayer.canUpgradeUnit(u)) {
           game.addExecution(new UpgradeStructureExecution(rlPlayer, u.id()));
-          lastActionSucceeded = true;
+          agent.lastActionSucceeded = true;
           break;
         }
       }
@@ -961,21 +1021,20 @@ function executeAction(action: RLAction) {
     }
 
     case "delete_unit": {
-      // Delete the least useful unit (e.g. last built)
       const units = rlPlayer.units();
       if (units.length === 0) break;
       if (rlPlayer.canDeleteUnit()) {
         game.addExecution(
           new DeleteUnitExecution(rlPlayer, units[units.length - 1].id()),
         );
-        lastActionSucceeded = true;
+        agent.lastActionSucceeded = true;
       }
       break;
     }
 
     case "noop":
     default:
-      lastActionSucceeded = true; // noop always "succeeds"
+      agent.lastActionSucceeded = true;
       break;
   }
 }
@@ -984,24 +1043,34 @@ function executeAction(action: RLAction) {
 
 interface ResetConfig {
   map?: string;
-  numOpponents?: number;
+  numAgents?: number;
+  numNations?: number;
+  numBots?: number;
   difficulty?: string;
-  ticksPerStep?: number;
-  maxTicks?: number;
   potentialAlpha?: number;
+}
+
+function shuffleInPlace<T>(arr: T[]): T[] {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 async function resetGame(config: ResetConfig = {}) {
   const mapName = config.map || "plains";
   if (config.potentialAlpha !== undefined)
     potentialAlpha = config.potentialAlpha;
-  const numOpponents = config.numOpponents ?? 3;
+  const numAgents = Math.max(1, config.numAgents ?? 1);
+  const numNations = Math.max(0, config.numNations ?? 0);
+  const numBots = Math.max(0, config.numBots ?? 0);
   const difficulty = (config.difficulty as Difficulty) || Difficulty.Medium;
 
-  const { gameMap, miniGameMap } = await loadMap(mapName);
+  const { gameMap, miniGameMap, manifestNations } = await loadMap(mapName);
 
   const gameConfig: GameConfig = {
-    gameMap: GameMapType.Asia, // doesn't matter for headless
+    gameMap: GameMapType.Asia, // placeholder — unused for headless
     gameMapSize: GameMapSize.Normal,
     gameMode: GameMode.FFA,
     gameType: GameType.Singleplayer,
@@ -1024,18 +1093,62 @@ async function resetGame(config: ResetConfig = {}) {
     false,
   );
 
-  // Create our RL player
-  const rlInfo = new PlayerInfo("RLAgent", PlayerType.Human, null, "rl_agent");
+  // RL agents (PlayerType.Human → eligible for engine's winner check)
+  const humans: PlayerInfo[] = [];
+  for (let i = 0; i < numAgents; i++) {
+    humans.push(
+      new PlayerInfo(`RLAgent${i}`, PlayerType.Human, null, `rl_agent_${i}`),
+    );
+  }
 
-  game = createGame([rlInfo], [], gameMap, miniGameMap, cfgObj);
+  // Nations: random sample of manifest nations (fallback to synthetic spawn
+  // locations if manifest has fewer entries than requested)
+  const chosenManifest: ManifestNation[] = shuffleInPlace([
+    ...manifestNations,
+  ]).slice(0, Math.min(numNations, manifestNations.length));
+  const nations: Nation[] = [];
+  for (let i = 0; i < chosenManifest.length; i++) {
+    const mn = chosenManifest[i];
+    nations.push(
+      new Nation(
+        new Cell(mn.coordinates[0], mn.coordinates[1]),
+        new PlayerInfo(mn.name, PlayerType.Nation, null, `nation_${i}`),
+      ),
+    );
+  }
+  // If numNations > manifest count, add extra nations without fixed spawn
+  // cells (NationExecution will spawn them randomly).
+  for (let i = chosenManifest.length; i < numNations; i++) {
+    nations.push(
+      new Nation(
+        undefined,
+        new PlayerInfo(`Nation${i}`, PlayerType.Nation, null, `nation_${i}`),
+      ),
+    );
+  }
 
-  // Add our spawn
-  game.addExecution(new SpawnExecution(GAME_ID, rlInfo));
+  game = createGame([...humans], nations, gameMap, miniGameMap, cfgObj);
 
-  // Add opponent bots (Nations)
-  for (let i = 0; i < numOpponents; i++) {
-    const botInfo = new PlayerInfo(`Bot${i}`, PlayerType.Bot, null, `bot_${i}`);
-    game.addExecution(new SpawnExecution(GAME_ID, botInfo));
+  // Spawn RL agents
+  for (const h of humans) {
+    game.addExecution(new SpawnExecution(GAME_ID, h));
+  }
+
+  // Register Nation behaviors (each NationExecution will emit its own
+  // SpawnExecution during the spawn phase).
+  for (const n of nations) {
+    game.addExecution(new NationExecution(GAME_ID, n));
+  }
+
+  // Spawn tribes (PlayerType.Bot — simple AI)
+  for (let i = 0; i < numBots; i++) {
+    const tribe = new PlayerInfo(
+      `Tribe${i}`,
+      PlayerType.Bot,
+      null,
+      `tribe_${i}`,
+    );
+    game.addExecution(new SpawnExecution(GAME_ID, tribe));
   }
 
   // Run spawn phase
@@ -1045,81 +1158,170 @@ async function resetGame(config: ResetConfig = {}) {
     spawnTicks++;
   }
 
-  rlPlayer = game.player("rl_agent");
-  tickCount = 0;
-  cachedWildernessData = null;
-  wildernessLastTick = -1;
-
-  // Cache land tile count for reward normalization
-  landTiles = 0;
-  const total = game.width() * game.height();
-  for (let t = 0; t < total; t++) {
-    if (!game.isWater(t as TileRef)) landTiles++;
+  // Build agent state
+  agents = [];
+  for (let i = 0; i < numAgents; i++) {
+    const id = `rl_agent_${i}`;
+    const player = game.hasPlayer(id) ? game.player(id) : null;
+    const territoryPct = player
+      ? player.numTilesOwned() / (game.width() * game.height())
+      : 0;
+    agents.push({
+      id,
+      player,
+      prevAliveOpponents: 0, // set below after all agents are built
+      prevTerritoryPct: territoryPct,
+      lastBuildResult: "none",
+      lastActionSucceeded: false,
+      neighborsCache: [],
+      wildernessBorderCache: new Map(),
+      cachedWildernessData: null,
+      wildernessLastTick: -1,
+      cachedOurCentroids: [],
+      ourCentroidsLastTick: -1,
+      diedOnTick: -1,
+      alreadyGotDeathPenalty: false,
+      alreadyGotWinBonus: false,
+    });
   }
-  if (landTiles === 0) landTiles = total; // fallback
 
-  numOpponentsAtStart = game
-    .players()
-    .filter((p) => p.id() !== rlPlayer!.id()).length;
-  prevAliveCount = numOpponentsAtStart;
-  prevTerritoryPct = rlPlayer.numTilesOwned() / (game.width() * game.height());
+  // Total non-self players at start (same for every agent in a symmetric game)
+  numOpponentsAtStart = Math.max(
+    1,
+    game.players().filter((p) => !p.id().startsWith("rl_agent_")).length +
+      (numAgents - 1),
+  );
 
-  return getObservation();
+  // Per-agent initial opponent count
+  for (const agent of agents) {
+    agent.prevAliveOpponents = game
+      .players()
+      .filter((p) => p.id() !== agent.id && p.isAlive()).length;
+  }
+
+  // Track which player IDs are NOT RL agents (for anyAgentBeatAI milestone)
+  nonRLIds = new Set(
+    game
+      .players()
+      .map((p) => p.id())
+      .filter((id) => !id.startsWith("rl_agent_")),
+  );
+
+  tickCount = 0;
+  anyAgentBeatAI = false;
+
+  // Build initial observations and info
+  const obs = agents.map((a) => getObservation(a));
+  return {
+    obs,
+    rewards: agents.map(() => 0),
+    dones: agents.map(() => false),
+    gameDone: false,
+    gameInfo: {
+      anyAgentBeatAI,
+      numAgentsAliveAtEnd: agents.filter((a) => a.player?.isAlive()).length,
+      tickCount: 0,
+      winner: null,
+    },
+  };
 }
 
 // ---------- Step: advance game N ticks ----------
 
-function stepGame(action: RLAction, ticksPerStep: number = 10) {
-  if (!game || !rlPlayer) {
-    return { obs: { error: "no game" }, reward: 0, done: true, info: {} };
+function stepGame(actions: RLAction[], ticksPerStep: number = 10) {
+  if (!game || agents.length === 0) {
+    return {
+      obs: [{ error: "no game" }],
+      rewards: [0],
+      dones: [true],
+      gameDone: true,
+      gameInfo: { anyAgentBeatAI: false, numAgentsAliveAtEnd: 0, tickCount: 0 },
+    };
   }
 
-  // Execute RL agent's action
-  executeAction(action);
+  // Execute each agent's action (dead agents are skipped)
+  for (let i = 0; i < agents.length; i++) {
+    const agent = agents[i];
+    if (
+      agent.player &&
+      agent.player.isAlive() &&
+      !agent.alreadyGotDeathPenalty
+    ) {
+      executeAction(agent, actions[i] ?? { type: "noop" });
+    }
+  }
 
-  // Advance N ticks
-  for (let i = 0; i < ticksPerStep; i++) {
+  // Advance ticks
+  for (let t = 0; t < ticksPerStep; t++) {
     game.executeNextTick();
     tickCount++;
-
-    if (!rlPlayer.isAlive()) break;
     if (game.getWinner()) break;
-    // Early exit if all opponents eliminated
-    if (
-      game
-        .players()
-        .filter((p) => p.id() !== rlPlayer!.id())
-        .every((p) => !p.isAlive())
-    )
-      break;
+    if (agents.every((a) => !a.player || !a.player.isAlive())) break;
   }
 
-  const reward = calculateReward();
+  // Milestone: did agents wipe out all non-RL players this game?
+  if (!anyAgentBeatAI) {
+    const nonRLAlive = game
+      .players()
+      .filter((p) => nonRLIds.has(p.id()) && p.isAlive()).length;
+    const anyAgentAlive = agents.some((a) => a.player && a.player.isAlive());
+    if (nonRLAlive === 0 && anyAgentAlive) {
+      anyAgentBeatAI = true;
+    }
+  }
 
-  // Check if all opponents are dead (game.getWinner() doesn't fire in FFA)
-  const allOpponentsDead = game
-    .players()
-    .filter((p) => p.id() !== rlPlayer!.id())
-    .every((p) => !p.isAlive());
-  const done =
-    !rlPlayer.isAlive() || game.getWinner() !== null || allOpponentsDead;
+  // Per-agent rewards and observations
+  const rewards: number[] = [];
+  const obsArr: any[] = [];
+  for (const agent of agents) {
+    rewards.push(calculateReward(agent));
+    obsArr.push(getObservation(agent));
+  }
 
-  const obs = getObservation();
-  const info = {
-    tickCount,
-    winner: game.getWinner()?.name() ?? null,
-    weWon:
-      rlPlayer.isAlive() &&
-      (game.getWinner()?.id() === "rl_agent" || allOpponentsDead),
+  // Game-level done.
+  // In FFA mode the engine only fires getWinner() on territory-% or timer
+  // conditions — NOT simply when one player is last standing.  Mirror the old
+  // behaviour: also end the episode as soon as all non-RL players are dead and
+  // at most one RL agent is still alive (nobody left to fight).
+  // With K>1, when multiple RL agents are alive after all bots/nations die the
+  // game continues so agents can learn agent-vs-agent combat.
+  const allRLDead = agents.every((a) => !a.player || !a.player.isAlive());
+  const winnerExists = game.getWinner() !== null;
+  const numRLAlive = agents.filter((a) => a.player?.isAlive()).length;
+  const allNonRLDead =
+    nonRLIds.size > 0 &&
+    game.players().filter((p) => nonRLIds.has(p.id())).length === 0;
+  const gameDone =
+    allRLDead || winnerExists || (allNonRLDead && numRLAlive <= 1);
+
+  // Per-slot dones are all aligned to game end (zombie frames emit done=false
+  // until the game resolves; then all slots emit done=true together).
+  const dones = agents.map(() => gameDone);
+
+  const numAgentsAliveAtEnd = agents.filter((a) => a.player?.isAlive()).length;
+  const winner = game.getWinner();
+  const winnerName =
+    winner && typeof (winner as any).name === "function"
+      ? (winner as any).name()
+      : null;
+
+  return {
+    obs: obsArr,
+    rewards,
+    dones,
+    gameDone,
+    gameInfo: {
+      anyAgentBeatAI,
+      numAgentsAliveAtEnd,
+      tickCount,
+      winner: winnerName,
+    },
   };
-
-  return { obs, reward, done, info };
 }
 
 // ---------- Main: JSON-line protocol over stdin/stdout ----------
 
 async function main() {
-  // Suppress console.debug/warn to keep stdout clean for protocol
   console.debug = () => {};
   console.warn = () => {};
   const origLog = console.log;
@@ -1138,13 +1340,10 @@ async function main() {
       const msg = JSON.parse(line);
 
       if (msg.cmd === "reset") {
-        const obs = await resetGame(msg.config ?? {});
-        send({ obs, reward: 0, done: false, info: { tickCount: 0 } });
+        const result = await resetGame(msg.config ?? {});
+        send(result);
       } else if (msg.cmd === "step") {
-        const result = stepGame(
-          msg.action ?? { type: "noop" },
-          msg.ticksPerStep ?? 10,
-        );
+        const result = stepGame(msg.actions ?? [], msg.ticksPerStep ?? 10);
         send(result);
       } else if (msg.cmd === "close") {
         send({ status: "closed" });
