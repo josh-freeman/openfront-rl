@@ -368,31 +368,33 @@ def train(args):
         t_start = time.time()
 
         # Win-rate-gated curriculum: advance when win rate exceeds threshold
-        if args.curriculum and curriculum_stage < len(CURRICULUM_STAGES) - 1:
-            win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][4]
-            if (win_thresh is not None
-                    and len(episode_wins) >= CURRICULUM_MIN_EPISODES
-                    and np.mean(episode_wins) >= win_thresh):
-                curriculum_stage += 1
-                episode_wins.clear()  # reset window for new stage
-                diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
-                print(f"  Curriculum: advancing to stage {curriculum_stage} — "
-                      f"{diff} {opp_type} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
-                envs.difficulty = diff
-                envs.num_opponents = opp
-                envs.maps = maps
-                envs.max_steps = msteps
-                envs.opponent_type = opp_type
-                warmdown_counter = WARMDOWN_UPDATES
-        elif args.curriculum:
-            # Apply current stage settings (for resume)
+        if args.curriculum:
+            # Ensure current stage settings are applied (startup + resume)
             diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
-            if envs.difficulty != diff or envs.num_opponents != opp or envs.opponent_type != opp_type:
+            if envs.difficulty != diff or envs.num_opponents != opp or envs.opponent_type != opp_type or envs.max_steps != msteps:
                 envs.difficulty = diff
                 envs.num_opponents = opp
                 envs.maps = maps
                 envs.max_steps = msteps
                 envs.opponent_type = opp_type
+
+            # Check for advancement
+            if curriculum_stage < len(CURRICULUM_STAGES) - 1:
+                win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][4]
+                if (win_thresh is not None
+                        and len(episode_wins) >= CURRICULUM_MIN_EPISODES
+                        and np.mean(episode_wins) >= win_thresh):
+                    curriculum_stage += 1
+                    episode_wins.clear()  # reset window for new stage
+                    diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
+                    print(f"  Curriculum: advancing to stage {curriculum_stage} — "
+                          f"{diff} {opp_type} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
+                    envs.difficulty = diff
+                    envs.num_opponents = opp
+                    envs.maps = maps
+                    envs.max_steps = msteps
+                    envs.opponent_type = opp_type
+                    warmdown_counter = WARMDOWN_UPDATES
 
         # LR schedule: apply warmdown after curriculum transitions
         lr_now = args.lr
