@@ -149,6 +149,8 @@ let tickCount = 0;
 let landTiles = 0; // cached at reset for reward normalization
 let prevAliveCount = 0;
 let numOpponentsAtStart = 0;
+let prevTerritoryPct = 0;
+let potentialAlpha = 100; // potential-based reward shaping coefficient
 // Wilderness CC cache: maps synthetic IDs to our border tiles adjacent to that CC
 let wildernessBorderCache: Map<string, TileRef[]> = new Map();
 let cachedWildernessData: {
@@ -612,6 +614,13 @@ function calculateReward(): number {
     reward -= 1.0;
   }
 
+  // Potential-based reward shaping: alpha * (phi_t - phi_{t-1})
+  // where phi = territory fraction
+  const totalTiles = game.width() * game.height();
+  const currentPct = rlPlayer.numTilesOwned() / totalTiles;
+  reward += potentialAlpha * (currentPct - prevTerritoryPct);
+  prevTerritoryPct = currentPct;
+
   return reward;
 }
 
@@ -979,10 +988,13 @@ interface ResetConfig {
   difficulty?: string;
   ticksPerStep?: number;
   maxTicks?: number;
+  potentialAlpha?: number;
 }
 
 async function resetGame(config: ResetConfig = {}) {
   const mapName = config.map || "plains";
+  if (config.potentialAlpha !== undefined)
+    potentialAlpha = config.potentialAlpha;
   const numOpponents = config.numOpponents ?? 3;
   const difficulty = (config.difficulty as Difficulty) || Difficulty.Medium;
 
@@ -1050,6 +1062,7 @@ async function resetGame(config: ResetConfig = {}) {
     .players()
     .filter((p) => p.id() !== rlPlayer!.id()).length;
   prevAliveCount = numOpponentsAtStart;
+  prevTerritoryPct = rlPlayer.numTilesOwned() / (game.width() * game.height());
 
   return getObservation();
 }

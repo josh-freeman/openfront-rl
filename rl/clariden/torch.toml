@@ -1,0 +1,8 @@
+image = "nvcr.io/nvidia/pytorch:26.01-py3"
+
+mounts = ["/capstor", "/iopsstor", "/users"]
+workdir = "/users/alexpadula/scratch/"
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"

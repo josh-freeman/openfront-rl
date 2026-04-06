@@ -235,6 +235,7 @@ def train(args):
         ticks_per_step=args.ticks_per_step,
         max_steps=args.max_steps,
         max_neighbors=max_neighbors,
+        potential_alpha=args.potential_alpha,
     )
 
     hidden_sizes = [int(x) for x in args.hidden_sizes.split(",")]
@@ -435,8 +436,6 @@ def train(args):
                 if dones[i] or truncateds[i]:
                     ep_r = float(env_ep_rewards[i])
                     ep_won = infos[i].get("weWon", False)
-                    if ep_r < -1.0:
-                        print(f"  WARNING ep: reward={ep_r:.2f} won={ep_won} len={int(env_ep_lengths[i])}")
                     episode_rewards.append(ep_r)
                     episode_lengths.append(int(env_ep_lengths[i]))
                     episode_wins.append(1 if ep_won else 0)
@@ -663,6 +662,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden-sizes", default="256,256,128", help="Comma-separated backbone layer sizes")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--load-weights", default="", help="Load model weights only (fresh optimizer) from a .pt file")
+    parser.add_argument("--potential-alpha", type=float, default=0.0, help="Potential-based reward shaping coefficient (0=disabled)")
     parser.add_argument("--hf-repo", default="mischievers/openfront-rl-agent", help="HuggingFace repo for auto-push")
     args = parser.parse_args()
     train(args)
