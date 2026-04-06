@@ -986,6 +986,7 @@ interface ResetConfig {
   map?: string;
   numOpponents?: number;
   difficulty?: string;
+  opponentType?: string; // "bot" or "nation" (default: "nation")
   ticksPerStep?: number;
   maxTicks?: number;
   potentialAlpha?: number;
@@ -997,6 +998,7 @@ async function resetGame(config: ResetConfig = {}) {
     potentialAlpha = config.potentialAlpha;
   const numOpponents = config.numOpponents ?? 3;
   const difficulty = (config.difficulty as Difficulty) || Difficulty.Medium;
+  const useNations = (config.opponentType || "nation") === "nation";
 
   const { gameMap, miniGameMap } = await loadMap(mapName);
 
@@ -1032,9 +1034,10 @@ async function resetGame(config: ResetConfig = {}) {
   // Add our spawn
   game.addExecution(new SpawnExecution(GAME_ID, rlInfo));
 
-  // Add opponent bots (Nations)
+  // Add opponents (Bot or Nation depending on config)
+  const oppType = useNations ? PlayerType.Nation : PlayerType.Bot;
   for (let i = 0; i < numOpponents; i++) {
-    const botInfo = new PlayerInfo(`Bot${i}`, PlayerType.Bot, null, `bot_${i}`);
+    const botInfo = new PlayerInfo(`Bot${i}`, oppType, null, `bot_${i}`);
     game.addExecution(new SpawnExecution(GAME_ID, botInfo));
   }
 

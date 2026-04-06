@@ -332,19 +332,29 @@ def train(args):
     # Curriculum: gradual ramp of (difficulty, opponents, maps)
     # Win-rate-gated curriculum: advance only when model wins consistently
     CURRICULUM_STAGES = [
-        # (difficulty, opponents, maps, max_steps, win_threshold)
-        ("Easy",    2,  MAP_TIER_1,  8000,  0.75),
-        ("Easy",    5,  MAP_TIER_1, 10000,  0.65),
-        ("Easy",   10,  MAP_TIER_1, 12000,  0.55),
-        ("Easy",   15,  MAP_TIER_1, 15000,  0.50),
-        ("Medium",  2,  MAP_TIER_2, 15000,  0.70),
-        ("Medium",  5,  MAP_TIER_2, 20000,  0.60),
-        ("Medium",  8,  MAP_TIER_2, 25000,  0.50),
-        ("Medium", 12,  MAP_TIER_2, 30000,  0.45),
-        ("Hard",    2,  MAP_TIER_3, 25000,  0.65),
-        ("Hard",    5,  MAP_TIER_3, 40000,  0.55),
-        ("Hard",    8,  MAP_TIER_3, 50000,  0.45),
-        ("Hard",   15,  MAP_TIER_3, 80000,  None),  # final stage
+        # (difficulty, opponents, maps, max_steps, win_threshold, opponent_type)
+        # Bots: weak AI (1/3 max troops, 0.6x growth) — warm-up
+        ("Easy",    2,  MAP_TIER_1,  5000,  0.80, "bot"),
+        ("Easy",    5,  MAP_TIER_1,  8000,  0.80, "bot"),
+        ("Easy",   10,  MAP_TIER_1, 12000,  0.80, "bot"),
+        ("Easy",   15,  MAP_TIER_1, 15000,  0.80, "bot"),
+        # Easy Nations: 50% max troops, 0.9x growth
+        ("Easy",    5,  MAP_TIER_1, 12000,  0.65, "nation"),
+        ("Easy",   10,  MAP_TIER_2, 15000,  0.55, "nation"),
+        # Medium Nations: 75% max troops, 0.95x growth
+        ("Medium",  5,  MAP_TIER_2, 20000,  0.55, "nation"),
+        ("Medium", 10,  MAP_TIER_2, 25000,  0.45, "nation"),
+        ("Medium", 15,  MAP_TIER_2, 30000,  0.40, "nation"),
+        # Hard Nations: 100% max troops, 1x growth (= human)
+        ("Hard",    2,  MAP_TIER_2, 20000,  0.60, "nation"),
+        ("Hard",    5,  MAP_TIER_3, 35000,  0.50, "nation"),
+        ("Hard",   10,  MAP_TIER_3, 50000,  0.40, "nation"),
+        ("Hard",   15,  MAP_TIER_3, 65000,  0.35, "nation"),
+        # Impossible Nations: 125% max troops, 1.05x growth
+        ("Impossible",  2, MAP_TIER_3, 35000,  0.55, "nation"),
+        ("Impossible",  5, MAP_TIER_3, 50000,  0.40, "nation"),
+        ("Impossible", 10, MAP_TIER_3, 65000,  0.35, "nation"),
+        ("Impossible", 15, MAP_TIER_3, 80000,  None, "nation"),  # final stage
     ]
     CURRICULUM_MIN_EPISODES = 200
     curriculum_stage = 0
@@ -365,22 +375,24 @@ def train(args):
                     and np.mean(episode_wins) >= win_thresh):
                 curriculum_stage += 1
                 episode_wins.clear()  # reset window for new stage
-                diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:4]
+                diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
                 print(f"  Curriculum: advancing to stage {curriculum_stage} — "
-                      f"{diff} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
+                      f"{diff} {opp_type} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
                 envs.difficulty = diff
                 envs.num_opponents = opp
                 envs.maps = maps
                 envs.max_steps = msteps
+                envs.opponent_type = opp_type
                 warmdown_counter = WARMDOWN_UPDATES
         elif args.curriculum:
             # Apply current stage settings (for resume)
-            diff, opp, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:4]
-            if envs.difficulty != diff or envs.num_opponents != opp:
+            diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
+            if envs.difficulty != diff or envs.num_opponents != opp or envs.opponent_type != opp_type:
                 envs.difficulty = diff
                 envs.num_opponents = opp
                 envs.maps = maps
                 envs.max_steps = msteps
+                envs.opponent_type = opp_type
 
         # LR schedule: apply warmdown after curriculum transitions
         lr_now = args.lr
