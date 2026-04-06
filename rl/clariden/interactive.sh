@@ -11,6 +11,7 @@ python -u train.py \
     --win-threshold 0.80 \
     --num-envs 16 \
     --rollout-steps 1024 \
+    --minibatch-size 2048 \
     --num-updates 4000 \
     --lr 3.4e-4 \
     --vf-coef 1 \
@@ -25,6 +26,8 @@ python -u train.py \
     --num-nations 0 \
     --num-bots 2 \
     --difficulty Easy \
+    --maps plains,big_plains,ocean_and_land,half_land_half_ocean \
+    --max-steps 10000 \
     --win-threshold 0.80 \
     --num-envs 16 \
     --rollout-steps 1024 \

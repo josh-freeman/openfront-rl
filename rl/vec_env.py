@@ -12,6 +12,7 @@ import json
 import subprocess
 import numpy as np
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -75,6 +76,8 @@ class VecOpenFrontEnv:
         rl_dir = Path(__file__).parent
         self._repo_dir = str(rl_dir.parent)
         self._server_script = str(rl_dir / "env_server.ts")
+        # Use tsx binary directly to avoid npx resolution overhead
+        self._tsx_bin = str(rl_dir.parent / "node_modules" / ".bin" / "tsx")
 
         self._pool = ThreadPoolExecutor(max_workers=num_envs)
         self._start_all()
@@ -88,8 +91,9 @@ class VecOpenFrontEnv:
             except Exception:
                 pass
 
+        t0 = time.time()
         proc = subprocess.Popen(
-            ["npx", "tsx", self._server_script],
+            [self._tsx_bin, self._server_script],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -101,10 +105,12 @@ class VecOpenFrontEnv:
         msg = json.loads(line)
         assert msg.get("status") == "ready", f"Server {env_idx} not ready: {msg}"
         self._procs[env_idx] = proc
+        print(f"[init] server {env_idx} ready in {time.time()-t0:.1f}s", flush=True)
 
     def _start_all(self):
-        for i in range(self.num_envs):
-            self._start_server(i)
+        t0 = time.time()
+        list(self._pool.map(self._start_server, range(self.num_envs)))
+        print(f"[init] all {self.num_envs} servers ready in {time.time()-t0:.1f}s", flush=True)
 
     def _send(self, env_idx: int, msg: dict) -> dict:
         proc = self._procs[env_idx]
@@ -230,7 +236,7 @@ class VecOpenFrontEnv:
             "potentialAlpha": self.potential_alpha,
         }
 
-    def reset_env(self, env_idx: int):
+    def reset_env(self, env_idx: int, _time_it: bool = False):
         """Reset an entire game (all K agent slots).
 
         Returns a tuple of four (K, ...) arrays: obs, action_mask, land_target_mask,
@@ -239,11 +245,14 @@ class VecOpenFrontEnv:
         """
         self._step_counts[env_idx] = 0
         map_name = random.choice(self.maps)
+        t0 = time.time()
         try:
             resp = self._send(env_idx, {"cmd": "reset", "config": self._reset_config(map_name)})
         except (RuntimeError, BrokenPipeError):
             self._start_server(env_idx)
             resp = self._send(env_idx, {"cmd": "reset", "config": self._reset_config(map_name)})
+        if _time_it:
+            print(f"[init] env {env_idx} reset ({map_name}) in {time.time()-t0:.1f}s", flush=True)
 
         obs_arr = resp["obs"]  # list of K obs dicts
         obs_k = np.zeros((self.K, self.obs_dim), dtype=np.float32)
@@ -258,20 +267,24 @@ class VecOpenFrontEnv:
             land_k[k], sea_k[k] = self._extract_target_masks(o)
         return obs_k, mask_k, land_k, sea_k
 
-    def reset_all(self):
-        """Reset all envs. Returns (num_slots, ...) arrays."""
+    def reset_all(self, _time_it: bool = False):
+        """Reset all envs in parallel. Returns (num_slots, ...) arrays."""
         obs = np.zeros((self.num_slots, self.obs_dim), dtype=np.float32)
         masks = np.ones((self.num_slots, NUM_ACTIONS), dtype=np.float32)
         land_masks = np.ones((self.num_slots, self.max_neighbors), dtype=np.float32)
         sea_masks = np.ones((self.num_slots, self.max_neighbors), dtype=np.float32)
-        for e in range(self.num_envs):
-            o_k, m_k, l_k, s_k = self.reset_env(e)
+        t0 = time.time()
+        futures = {e: self._pool.submit(self.reset_env, e, _time_it) for e in range(self.num_envs)}
+        for e, fut in futures.items():
+            o_k, m_k, l_k, s_k = fut.result()
             start = e * self.K
             end = start + self.K
             obs[start:end] = o_k
             masks[start:end] = m_k
             land_masks[start:end] = l_k
             sea_masks[start:end] = s_k
+        if _time_it:
+            print(f"[init] all {self.num_envs} envs reset in {time.time()-t0:.1f}s", flush=True)
         return obs, masks, land_masks, sea_masks
 
     # ---------- Step ----------

@@ -26,10 +26,12 @@ except ImportError:
 
 # Maps organized by complexity tier — curriculum adds more maps as training progresses
 MAP_TIER_1 = [
-    # Simple, balanced maps for learning basics
-    "plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean",
+    # Simple, balanced maps for learning basics (small/medium only — large maps too slow with many players)
+    "plains", "big_plains", "ocean_and_land", "half_land_half_ocean",
 ]
 MAP_TIER_2 = MAP_TIER_1 + [
+    # Add mid-size real-geography maps and the larger flat maps
+    "world", "giantworldmap",
     # Mid-complexity: real geography, moderate water/chokepoints
     "europe", "europeclassic", "northamerica", "africa", "asia", "australia",
     "southamerica", "mediterranean", "britannia", "britanniaclassic",
@@ -336,7 +338,7 @@ def train(args):
     env_ep_lengths = np.zeros(num_slots, dtype=np.int32)
 
     # Initialize
-    obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all()
+    obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all(_time_it=True)
 
     # Self-play curriculum: K RL agents play in every game. Difficulty controls
     # nation AI strength; num_nations/num_bots control the non-RL population.
@@ -362,6 +364,7 @@ def train(args):
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
+        print(f"[update {update+1}/{args.num_updates}] starting rollout...", flush=True)
 
         # Win-rate-gated curriculum: advance when per-game win rate exceeds threshold
         if args.curriculum:
@@ -404,12 +407,17 @@ def train(args):
             param_group["lr"] = lr_now
 
         # Collect rollout
+        t_rollout_start = time.time()
+        t_inference_total = 0.0
+        t_step_total = 0.0
+        t_reset_total = 0.0
         for step in range(args.rollout_steps):
             obs_buf[step] = obs
             masks_buf[step] = action_masks
             land_masks_buf[step] = land_target_masks
             sea_masks_buf[step] = sea_target_masks
 
+            _t = time.time()
             obs_t = torch.FloatTensor(obs).to(device)
             masks_t = torch.FloatTensor(action_masks).to(device)
             land_t = torch.FloatTensor(land_target_masks).to(device)
@@ -418,13 +426,16 @@ def train(args):
                 action, log_prob, _, value = model.get_action_and_value(
                     obs_t, action_mask=masks_t,
                     land_target_mask=land_t, sea_target_mask=sea_t)
+            t_inference_total += time.time() - _t
 
             actions_np = action.cpu().numpy()  # (num_slots, 3)
             logprobs_buf[step] = log_prob.cpu().numpy()
             values_buf[step] = value.cpu().numpy()
             actions_buf[step] = actions_np
 
+            _t = time.time()
             next_obs, next_masks, next_land, next_sea, rewards, dones, truncateds, infos = envs.step(actions_np)
+            t_step_total += time.time() - _t
             rewards_buf[step] = rewards
             terminals_buf[step] = dones.astype(np.float32)
             truncateds_buf[step] = truncateds.astype(np.float32)
@@ -458,7 +469,9 @@ def train(args):
                         env_ep_rewards[flat] = 0
                         env_ep_lengths[flat] = 0
                     # Reset the whole game
+                    _t = time.time()
                     o_k, m_k, l_k, s_k = envs.reset_env(e)
+                    t_reset_total += time.time() - _t
                     end = start + K
                     next_obs[start:end] = o_k
                     next_masks[start:end] = m_k
@@ -475,6 +488,8 @@ def train(args):
         with torch.no_grad():
             last_values = model.get_action_and_value(torch.FloatTensor(obs).to(device))[3]
             last_values = last_values.cpu().numpy()
+
+        t_rollout_elapsed = time.time() - t_rollout_start
 
         # Compute GAE with proper truncation bootstrapping
         advantages, returns = compute_gae_vec(
@@ -499,6 +514,7 @@ def train(args):
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         # PPO epochs with minibatch updates
+        t_ppo_start = time.time()
         for _ in range(args.ppo_epochs):
             indices = np.random.permutation(batch_size)
             for start in range(0, batch_size, args.minibatch_size):
@@ -536,6 +552,7 @@ def train(args):
                 optimizer.step()
 
         # Logging
+        t_ppo_elapsed = time.time() - t_ppo_start
         t_elapsed = time.time() - t_start
         sps = (args.rollout_steps * num_slots) / t_elapsed
 
@@ -573,16 +590,28 @@ def train(args):
                     "loss/value": float(value_loss.item()),
                     "loss/entropy": float(entropy_loss.item()),
                     "perf/sps": float(sps),
+                    "perf/t_rollout": t_rollout_elapsed,
+                    "perf/t_inference": t_inference_total,
+                    "perf/t_env_step": t_step_total,
+                    "perf/t_reset": t_reset_total,
+                    "perf/t_ppo": t_ppo_elapsed,
                     "lr": current_lr,
                     "curriculum/stage": curriculum_stage,
                     "curriculum/num_nations": envs.num_nations,
                     "curriculum/num_bots": envs.num_bots,
                     "best_reward": float(best_reward),
                 }, step=global_step)
+            num_resets = sum(1 for e in range(args.num_envs)
+                             if dones[e * K] or truncateds[e * K])
             print(
                 f"[update {update+1}/{args.num_updates}] "
                 f"games={num_games} reward={mean_r:.2f} win={win_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
+            )
+            print(
+                f"  timing: rollout={t_rollout_elapsed:.1f}s "
+                f"(inference={t_inference_total:.1f}s, env_step={t_step_total:.1f}s, reset={t_reset_total:.1f}s) "
+                f"ppo={t_ppo_elapsed:.1f}s | total={t_elapsed:.1f}s"
             )
 
         # Save checkpoint
