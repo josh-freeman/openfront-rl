@@ -2,10 +2,18 @@
 Vectorized OpenFront Environment (Multi-Agent Self-Play)
 
 Runs N game server processes in parallel. Each process hosts K RL agents
-(shared-policy self-play) + M Nations (strong AI) + B Bots (tribes). Slots
-are flattened to a total of `num_envs * K` env slots for PPO batching;
-all K slots of a game share a single server process and a single game-done /
-truncation signal (whole-game resets, not per-slot).
+(shared-policy self-play) + some Nations + some Tribes. Slots are flattened
+to a total of `num_envs * K` env slots for PPO batching; all K slots of a
+game share a single server process and a single game-done / truncation signal
+(whole-game resets, not per-slot).
+
+Terminology (mirrors the game engine's PlayerType enum):
+  - tribe  (PlayerType.Bot)    — simple roaming AI; controlled by num_tribes
+  - nation (PlayerType.Nation) — strong territorial AI; controlled by num_nations
+  - bot    — collective term for any non-RL player (tribes + nations combined)
+
+`anyAgentBeatBots` fires mid-game as soon as all bots (tribes + nations) are
+dead while at least one RL agent is still alive. This is the curriculum signal.
 """
 
 import json
@@ -45,7 +53,7 @@ class VecOpenFrontEnv:
         num_agents_per_env: int = 4,
         maps: list[str] = None,
         num_nations: int = 0,
-        num_bots: int = 8,
+        num_tribes: int = 8,
         difficulty: str = "Easy",
         ticks_per_step: int = 10,
         max_steps: int = 10000,
@@ -57,7 +65,7 @@ class VecOpenFrontEnv:
         self.num_slots = num_envs * num_agents_per_env
         self.maps = maps or ["plains"]
         self.num_nations = num_nations
-        self.num_bots = num_bots
+        self.num_tribes = num_tribes
         self.difficulty = difficulty
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
@@ -231,7 +239,7 @@ class VecOpenFrontEnv:
             "map": map_name,
             "numAgents": self.K,
             "numNations": self.num_nations,
-            "numBots": self.num_bots,
+            "numTribes": self.num_tribes,
             "difficulty": self.difficulty,
             "potentialAlpha": self.potential_alpha,
         }
@@ -320,7 +328,7 @@ class VecOpenFrontEnv:
                 when Python-side max_steps is hit before natural termination.
             infos: list of per-slot dicts. For slots in envs whose game
                 finished or was truncated this step, info includes
-                `anyAgentBeatAI` (game-level milestone flag).
+                `anyAgentBeatBots` (game-level milestone flag).
         """
         obs = np.zeros((self.num_slots, self.obs_dim), dtype=np.float32)
         masks = np.ones((self.num_slots, NUM_ACTIONS), dtype=np.float32)
@@ -362,6 +370,7 @@ class VecOpenFrontEnv:
 
             obs_arr = resp["obs"]
             rewards_arr = resp["rewards"]
+            components_arr = resp.get("rewardComponents", [{}] * self.K)
             dones_arr = resp["dones"]
             game_done = bool(resp.get("gameDone", False))
             game_info = resp.get("gameInfo", {})
@@ -381,14 +390,19 @@ class VecOpenFrontEnv:
                 rewards[flat] = float(rewards_arr[k])
                 dones[flat] = bool(dones_arr[k])
                 truncateds[flat] = truncated_this_env
+                c = components_arr[k] if k < len(components_arr) else {}
                 infos[flat] = {
                     "env_idx": e,
                     "slot": k,
                     "gameDone": game_done,
-                    "anyAgentBeatAI": bool(game_info.get("anyAgentBeatAI", False)),
+                    "anyAgentBeatBots": bool(game_info.get("anyAgentBeatBots", False)),
                     "numAgentsAliveAtEnd": game_info.get("numAgentsAliveAtEnd", 0),
                     "tickCount": game_info.get("tickCount", 0),
                     "winner": game_info.get("winner"),
+                    "reward_kill_credit": float(c.get("killCredit", 0)),
+                    "reward_death_penalty": float(c.get("deathPenalty", 0)),
+                    "reward_winner_bonus": float(c.get("winnerBonus", 0)),
+                    "reward_potential_shaping": float(c.get("potentialShaping", 0)),
                 }
 
         return obs, masks, land_masks, sea_masks, rewards, dones, truncateds, infos

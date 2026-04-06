@@ -237,7 +237,7 @@ def train(args):
         num_agents_per_env=K,
         maps=maps,
         num_nations=args.num_nations,
-        num_bots=args.num_bots,
+        num_tribes=args.num_tribes,
         difficulty=args.difficulty,
         ticks_per_step=args.ticks_per_step,
         max_steps=args.max_steps,
@@ -255,9 +255,10 @@ def train(args):
     # Per-slot episode stats (K slots per game → higher-freq reward signal)
     episode_rewards = deque(maxlen=400)
     episode_lengths = deque(maxlen=400)
+    CURRICULUM_MIN_GAMES = 20  # rolling window size and minimum games before curriculum can advance
     # Per-game win flag: did any RL agent wipe out all non-RL players at any
-    # point during the game? This is the self-play win_rate metric.
-    game_wins = deque(maxlen=200)
+    # point during the game? This is the beat_ai_rate curriculum metric.
+    game_wins = deque(maxlen=CURRICULUM_MIN_GAMES)
     best_reward = -float("inf")
     stage_best_rewards = {}
     log_entries = []
@@ -313,7 +314,7 @@ def train(args):
         )
         wandb.config.update({"obs_dim": obs_dim, "maps": maps}, allow_val_change=True)
 
-    print(f"Training PPO on maps={maps}, agents/env={K}, nations={args.num_nations}, bots={args.num_bots}")
+    print(f"Training PPO on maps={maps}, agents/env={K}, nations={args.num_nations}, tribes={args.num_tribes}")
     print(f"num_envs={args.num_envs}, num_slots={num_slots}, rollout_steps={args.rollout_steps}")
     print(f"batch_size={num_slots * args.rollout_steps}, minibatch_size={args.minibatch_size}")
     print(f"obs_dim={obs_dim}, device={device}")
@@ -336,15 +337,28 @@ def train(args):
     # whole game, zombie frames included after death)
     env_ep_rewards = np.zeros(num_slots, dtype=np.float32)
     env_ep_lengths = np.zeros(num_slots, dtype=np.int32)
+    # Per-slot cumulative reward components (reset each episode, logged at end)
+    ep_kill_credit      = np.zeros(num_slots, dtype=np.float32)
+    ep_death_penalty    = np.zeros(num_slots, dtype=np.float32)
+    ep_winner_bonus     = np.zeros(num_slots, dtype=np.float32)
+    ep_potential_shaping = np.zeros(num_slots, dtype=np.float32)
+    # Rolling deques for mean per-episode component values (logged to wandb)
+    ep_kill_credits       = deque(maxlen=400)
+    ep_death_penalties    = deque(maxlen=400)
+    ep_winner_bonuses     = deque(maxlen=400)
+    ep_potential_shapings = deque(maxlen=400)
+    # Per-env anyAgentBeatBots tracking: fires once mid-game when all non-RL die.
+    # Tracked as a transition so curriculum gating doesn't wait for game end.
+    env_beat_ai = [False] * args.num_envs  # has anyAgentBeatBots fired this game?
 
     # Initialize
     obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all(_time_it=True)
 
     # Self-play curriculum: K RL agents play in every game. Difficulty controls
-    # nation AI strength; num_nations/num_bots control the non-RL population.
+    # nation AI strength; num_nations/num_tribes control the non-RL population.
     # Win-rate-gated curriculum: advance when model wins consistently.
     CURRICULUM_STAGES = [
-        # (difficulty, num_nations, num_bots, maps, max_steps, win_threshold)
+        # (difficulty, num_nations, num_tribes, maps, max_steps, win_threshold)
         ("Easy",    0,  8,  MAP_TIER_1, 10000, 0.75),
         ("Easy",    0, 15,  MAP_TIER_1, 12000, 0.70),
         ("Medium",  2,  8,  MAP_TIER_2, 15000, 0.65),
@@ -354,7 +368,6 @@ def train(args):
         ("Hard",    6, 12,  MAP_TIER_3, 40000, 0.45),
         ("Hard",    8, 15,  MAP_TIER_3, 60000, None),  # final stage
     ]
-    CURRICULUM_MIN_GAMES = 200
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES
@@ -364,11 +377,9 @@ def train(args):
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
-        print(f"[update {update+1}/{args.num_updates}] starting rollout...", flush=True)
-
-        # Win-rate-gated curriculum: advance when per-game win rate exceeds threshold
+        # beat_ai_rate-gated curriculum: advance when agents reliably beat all non-RL players
         if args.curriculum:
-            diff, n_nations, n_bots, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
+            diff, n_nations, n_tribes, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
             if curriculum_stage < len(CURRICULUM_STAGES) - 1:
                 win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][5]
                 if (win_thresh is not None
@@ -376,20 +387,20 @@ def train(args):
                         and np.mean(game_wins) >= win_thresh):
                     curriculum_stage += 1
                     game_wins.clear()  # reset window for new stage
-                    diff, n_nations, n_bots, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
+                    diff, n_nations, n_tribes, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
                     print(f"  Curriculum: advancing to stage {curriculum_stage} — "
-                          f"{diff} with {n_nations} nations / {n_bots} bots, "
+                          f"{diff} with {n_nations} nations / {n_tribes} tribes, "
                           f"{len(maps)} maps, max_steps={msteps}")
                     warmdown_counter = WARMDOWN_UPDATES
             # Always sync envs to current stage — fixes initial setup (update=0)
             # where stage 0's max_steps was never applied before this refactor.
             if (envs.difficulty != diff
                     or envs.num_nations != n_nations
-                    or envs.num_bots != n_bots
+                    or envs.num_tribes != n_tribes
                     or envs.max_steps != msteps):
                 envs.difficulty = diff
                 envs.num_nations = n_nations
-                envs.num_bots = n_bots
+                envs.num_tribes = n_tribes
                 envs.maps = maps
                 envs.max_steps = msteps
 
@@ -450,24 +461,50 @@ def train(args):
 
             env_ep_rewards += rewards
             env_ep_lengths += 1
+            for flat in range(num_slots):
+                info = infos[flat]
+                ep_kill_credit[flat]       += info.get("reward_kill_credit", 0)
+                ep_death_penalty[flat]     += info.get("reward_death_penalty", 0)
+                ep_winner_bonus[flat]      += info.get("reward_winner_bonus", 0)
+                ep_potential_shaping[flat] += info.get("reward_potential_shaping", 0)
 
             # Per-env (per-game) auto-reset: all K slots of a game share the
             # same done/truncated flag, so we iterate at the env level.
             for e in range(args.num_envs):
                 start = e * K
-                if dones[start] or truncateds[start]:
-                    # Record game-level win milestone once per game
-                    game_info = infos[start]
-                    game_wins.append(1 if game_info.get("anyAgentBeatAI", False) else 0)
+                game_info = infos[start]
+
+                # anyAgentBeatBots fires mid-game when all non-RL die.
+                # Record it immediately as a curriculum event (transition only,
+                # not repeated every step) so gating doesn't wait for game end.
+                if game_info.get("anyAgentBeatBots", False) and not env_beat_ai[e]:
+                    env_beat_ai[e] = True
+                    game_wins.append(1)
                     num_games += 1
-                    # Per-slot episode reward bookkeeping (one episode per slot
-                    # per game, zombie frames included after death)
+
+                if dones[start] or truncateds[start]:
+                    # If the game ended without any agent ever beating the AI,
+                    # record it as a loss for curriculum gating now.
+                    if not env_beat_ai[e]:
+                        game_wins.append(0)
+                        num_games += 1
+                    env_beat_ai[e] = False  # reset for next game
+
+                    # Per-slot episode reward bookkeeping
                     for k in range(K):
                         flat = start + k
                         episode_rewards.append(float(env_ep_rewards[flat]))
                         episode_lengths.append(int(env_ep_lengths[flat]))
+                        ep_kill_credits.append(float(ep_kill_credit[flat]))
+                        ep_death_penalties.append(float(ep_death_penalty[flat]))
+                        ep_winner_bonuses.append(float(ep_winner_bonus[flat]))
+                        ep_potential_shapings.append(float(ep_potential_shaping[flat]))
                         env_ep_rewards[flat] = 0
                         env_ep_lengths[flat] = 0
+                        ep_kill_credit[flat] = 0
+                        ep_death_penalty[flat] = 0
+                        ep_winner_bonus[flat] = 0
+                        ep_potential_shaping[flat] = 0
                     # Reset the whole game
                     _t = time.time()
                     o_k, m_k, l_k, s_k = envs.reset_env(e)
@@ -556,58 +593,73 @@ def train(args):
         t_elapsed = time.time() - t_start
         sps = (args.rollout_steps * num_slots) / t_elapsed
 
+        # Compute stats used by both wandb (every update) and console (every log_interval)
+        beat_ai_rate = np.mean(game_wins) if game_wins else 0.0
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        if wandb is not None:
+            wandb.log({
+                "update": update + 1,
+                "global_step": global_step,
+                "num_games": num_games,
+                "reward/beat_ai_rate": beat_ai_rate,
+                "reward_components/kill_credit": float(np.mean(ep_kill_credits)) if ep_kill_credits else 0,
+                "reward_components/death_penalty": float(np.mean(ep_death_penalties)) if ep_death_penalties else 0,
+                "reward_components/winner_bonus": float(np.mean(ep_winner_bonuses)) if ep_winner_bonuses else 0,
+                "reward_components/potential_shaping": float(np.mean(ep_potential_shapings)) if ep_potential_shapings else 0,
+                "loss/total": float(loss.item()),
+                "loss/policy": float(policy_loss.item()),
+                "loss/value": float(value_loss.item()),
+                "loss/entropy": float(entropy_loss.item()),
+                "perf/sps": float(sps),
+                "perf/t_rollout": t_rollout_elapsed,
+                "perf/t_inference": t_inference_total,
+                "perf/t_env_step": t_step_total,
+                "perf/t_reset": t_reset_total,
+                "perf/t_ppo": t_ppo_elapsed,
+                "lr": current_lr,
+                "curriculum/stage": curriculum_stage,
+                "curriculum/num_nations": envs.num_nations,
+                "curriculum/num_tribes": envs.num_tribes,
+                "best_reward": float(best_reward),
+            }, step=global_step)
+
         if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
             mean_r = np.mean(episode_rewards)
             mean_l = np.mean(episode_lengths)
-            win_rate = np.mean(game_wins) if game_wins else 0.0
-            survival_pct = mean_l / envs.max_steps  # fraction of max episode length
+            survival_pct = mean_l / envs.max_steps
             entry = {
                 "update": update + 1,
                 "global_step": global_step,
                 "num_games": num_games,
                 "mean_reward": float(mean_r),
                 "mean_length": float(mean_l),
-                "win_rate": float(win_rate),
+                "beat_ai_rate": float(beat_ai_rate),
                 "survival_pct": float(survival_pct),
                 "max_steps": envs.max_steps,
                 "loss": float(loss.item()),
                 "sps": float(sps),
             }
             log_entries.append(entry)
-            current_lr = optimizer.param_groups[0]["lr"]
             if wandb is not None:
                 wandb.log({
-                    "update": update + 1,
-                    "global_step": global_step,
-                    "num_games": num_games,
                     "reward/mean": float(mean_r),
-                    "reward/win_rate": float(win_rate),
                     "episode_length": float(mean_l),
                     "episode_length/survival_pct": float(survival_pct),
                     "episode_length/max_steps": envs.max_steps,
-                    "loss/total": float(loss.item()),
-                    "loss/policy": float(policy_loss.item()),
-                    "loss/value": float(value_loss.item()),
-                    "loss/entropy": float(entropy_loss.item()),
-                    "perf/sps": float(sps),
-                    "perf/t_rollout": t_rollout_elapsed,
-                    "perf/t_inference": t_inference_total,
-                    "perf/t_env_step": t_step_total,
-                    "perf/t_reset": t_reset_total,
-                    "perf/t_ppo": t_ppo_elapsed,
-                    "lr": current_lr,
-                    "curriculum/stage": curriculum_stage,
-                    "curriculum/num_nations": envs.num_nations,
-                    "curriculum/num_bots": envs.num_bots,
-                    "best_reward": float(best_reward),
                 }, step=global_step)
-            num_resets = sum(1 for e in range(args.num_envs)
-                             if dones[e * K] or truncateds[e * K])
             print(
                 f"[update {update+1}/{args.num_updates}] "
-                f"games={num_games} reward={mean_r:.2f} win={win_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
+                f"games={num_games} reward={mean_r:.2f} beat_ai={beat_ai_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
             )
+            if args.curriculum:
+                win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][5]
+                print(
+                    f"  curriculum: stage={curriculum_stage} "
+                    f"window={len(game_wins)}/{CURRICULUM_MIN_GAMES} "
+                    f"beat_ai={beat_ai_rate:.0%} thresh={win_thresh:.0%}"
+                )
             print(
                 f"  timing: rollout={t_rollout_elapsed:.1f}s "
                 f"(inference={t_inference_total:.1f}s, env_step={t_step_total:.1f}s, reset={t_reset_total:.1f}s) "
@@ -653,7 +705,7 @@ def train(args):
                         "maps": maps,
                         "num_agents_per_env": K,
                         "num_nations": args.num_nations,
-                        "num_bots": args.num_bots,
+                        "num_tribes": args.num_tribes,
                         "difficulty": args.difficulty,
                         "obs_dim": obs_dim,
                         "max_neighbors": max_neighbors,
@@ -694,9 +746,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-agents-per-env", type=int, default=4,
                         help="Number of RL self-play agents per game (all share the same policy)")
     parser.add_argument("--num-nations", type=int, default=0,
-                        help="Number of Nation AI players per game (strong AI)")
-    parser.add_argument("--num-bots", type=int, default=8,
-                        help="Number of Bot/tribe players per game (simple AI)")
+                        help="Number of Nation players per game (PlayerType.Nation, strong territorial AI)")
+    parser.add_argument("--num-tribes", type=int, default=8,
+                        help="Number of Tribe players per game (PlayerType.Bot, simple roaming AI)")
     parser.add_argument("--difficulty", default="Easy",
                         help="Difficulty level: Easy/Medium/Hard/Impossible (affects Nation AI strength)")
     parser.add_argument("--ticks-per-step", type=int, default=10)

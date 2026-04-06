@@ -5,19 +5,25 @@
  * training script via JSON lines over stdin/stdout.
  *
  * Single game process hosts K RL agents (shared policy on the Python
- * side) + N Nations (PlayerType.Nation, strong AI) + B Bots (PlayerType.Bot,
- * tribes). All K RL agents are registered as PlayerType.Human so the engine's
- * WinCheckExecution considers them for winner determination.
+ * side) + N Nations (PlayerType.Nation, strong territorial AI) + T Tribes
+ * (PlayerType.Bot, simple roaming AI). All K RL agents are registered as
+ * PlayerType.Human so the engine's WinCheckExecution considers them for
+ * winner determination.
+ *
+ * Terminology (mirrors the game engine's PlayerType enum):
+ *   - "tribe"  = PlayerType.Bot   — simple AI, spawns as a roaming unit
+ *   - "nation" = PlayerType.Nation — strong AI, has fixed territory on the map
+ *   - "bot"    = collective term for any non-RL player (tribes + nations)
  *
  * Protocol:
  *   Python sends: { "cmd": "reset", "config": { map, numAgents, numNations,
- *                                                numBots, difficulty,
+ *                                                numTribes, difficulty,
  *                                                potentialAlpha } }
  *   Server sends: { "obs": [obs_0, ..., obs_{K-1}],
  *                   "rewards": [r_0, ..., r_{K-1}],
  *                   "dones":   [d_0, ..., d_{K-1}],
  *                   "gameDone": bool,
- *                   "gameInfo": { anyAgentBeatAI, numAgentsAliveAtEnd, ... } }
+ *                   "gameInfo": { anyAgentBeatBots, numAgentsAliveAtEnd, ... } }
  *
  *   Python sends: { "cmd": "step", "actions": [a_0, ..., a_{K-1}],
  *                   "ticksPerStep": 10 }
@@ -207,8 +213,8 @@ let agents: AgentState[] = [];
 let tickCount = 0;
 let numOpponentsAtStart = 0; // total non-self players at game start (same for every agent)
 let potentialAlpha = 100;
-let anyAgentBeatAI = false;
-let nonRLIds: Set<string> = new Set(); // ids of nations + tribes
+let anyAgentBeatBots = false;
+let nonRLIds: Set<string> = new Set(); // ids of all bots (nations + tribes)
 const WILDERNESS_RECOMPUTE_INTERVAL = 10;
 const OUR_CENTROIDS_RECOMPUTE_INTERVAL = 50;
 const GAME_ID = "rl-training";
@@ -661,13 +667,27 @@ function getObservation(agent: AgentState): any {
 
 // ---------- Reward calculation (per agent) ----------
 
-function calculateReward(agent: AgentState): number {
-  if (!game || !agent.player) return 0;
+interface RewardComponents {
+  killCredit: number;
+  deathPenalty: number;
+  winnerBonus: number;
+  potentialShaping: number;
+}
+
+function calculateReward(agent: AgentState): {
+  total: number;
+  components: RewardComponents;
+} {
+  const components: RewardComponents = {
+    killCredit: 0,
+    deathPenalty: 0,
+    winnerBonus: 0,
+    potentialShaping: 0,
+  };
+  if (!game || !agent.player) return { total: 0, components };
 
   // Zombie frames after death: emit no reward signal
-  if (agent.alreadyGotDeathPenalty) return 0;
-
-  let reward = 0;
+  if (agent.alreadyGotDeathPenalty) return { total: 0, components };
 
   // Kill credit: any opponent (agent or non-RL) that died since last step
   const aliveOpponents = game
@@ -675,7 +695,7 @@ function calculateReward(agent: AgentState): number {
     .filter((p) => p.id() !== agent.id && p.isAlive()).length;
   const newlyDead = agent.prevAliveOpponents - aliveOpponents;
   if (newlyDead > 0 && numOpponentsAtStart > 0) {
-    reward += newlyDead / numOpponentsAtStart;
+    components.killCredit = newlyDead / numOpponentsAtStart;
   }
   agent.prevAliveOpponents = aliveOpponents;
 
@@ -687,27 +707,33 @@ function calculateReward(agent: AgentState): number {
     (winner as any).id() === agent.id &&
     !agent.alreadyGotWinBonus
   ) {
-    reward += 1;
+    components.winnerBonus = 1;
     agent.alreadyGotWinBonus = true;
   }
 
   // Death penalty (delivered once on death tick)
   if (!agent.player.isAlive()) {
-    reward -= 1;
+    components.deathPenalty = -1;
     agent.alreadyGotDeathPenalty = true;
     agent.diedOnTick = tickCount;
-    // Freeze territory pct so future potential shaping is zero
     agent.prevTerritoryPct = 0;
-    return reward;
+    const total =
+      components.killCredit + components.deathPenalty + components.winnerBonus;
+    return { total, components };
   }
 
   // Potential-based reward shaping (alive only)
   const totalTiles = game.width() * game.height();
   const currentPct = agent.player.numTilesOwned() / totalTiles;
-  reward += potentialAlpha * (currentPct - agent.prevTerritoryPct);
+  components.potentialShaping =
+    potentialAlpha * (currentPct - agent.prevTerritoryPct);
   agent.prevTerritoryPct = currentPct;
 
-  return reward;
+  const total =
+    components.killCredit +
+    components.winnerBonus +
+    components.potentialShaping;
+  return { total, components };
 }
 
 // ---------- Action execution ----------
@@ -1045,7 +1071,7 @@ interface ResetConfig {
   map?: string;
   numAgents?: number;
   numNations?: number;
-  numBots?: number;
+  numTribes?: number;
   difficulty?: string;
   potentialAlpha?: number;
 }
@@ -1064,7 +1090,7 @@ async function resetGame(config: ResetConfig = {}) {
     potentialAlpha = config.potentialAlpha;
   const numAgents = Math.max(1, config.numAgents ?? 1);
   const numNations = Math.max(0, config.numNations ?? 0);
-  const numBots = Math.max(0, config.numBots ?? 0);
+  const numTribes = Math.max(0, config.numTribes ?? 0);
   const difficulty = (config.difficulty as Difficulty) || Difficulty.Medium;
 
   const { gameMap, miniGameMap, manifestNations } = await loadMap(mapName);
@@ -1141,7 +1167,7 @@ async function resetGame(config: ResetConfig = {}) {
   }
 
   // Spawn tribes (PlayerType.Bot — simple AI)
-  for (let i = 0; i < numBots; i++) {
+  for (let i = 0; i < numTribes; i++) {
     const tribe = new PlayerInfo(
       `Tribe${i}`,
       PlayerType.Bot,
@@ -1199,7 +1225,7 @@ async function resetGame(config: ResetConfig = {}) {
       .filter((p) => p.id() !== agent.id && p.isAlive()).length;
   }
 
-  // Track which player IDs are NOT RL agents (for anyAgentBeatAI milestone)
+  // Track which player IDs are bots (nations + tribes) for anyAgentBeatBots milestone
   nonRLIds = new Set(
     game
       .players()
@@ -1208,7 +1234,7 @@ async function resetGame(config: ResetConfig = {}) {
   );
 
   tickCount = 0;
-  anyAgentBeatAI = false;
+  anyAgentBeatBots = false;
 
   // Build initial observations and info
   const obs = agents.map((a) => getObservation(a));
@@ -1218,7 +1244,7 @@ async function resetGame(config: ResetConfig = {}) {
     dones: agents.map(() => false),
     gameDone: false,
     gameInfo: {
-      anyAgentBeatAI,
+      anyAgentBeatBots,
       numAgentsAliveAtEnd: agents.filter((a) => a.player?.isAlive()).length,
       tickCount: 0,
       winner: null,
@@ -1235,7 +1261,11 @@ function stepGame(actions: RLAction[], ticksPerStep: number = 10) {
       rewards: [0],
       dones: [true],
       gameDone: true,
-      gameInfo: { anyAgentBeatAI: false, numAgentsAliveAtEnd: 0, tickCount: 0 },
+      gameInfo: {
+        anyAgentBeatBots: false,
+        numAgentsAliveAtEnd: 0,
+        tickCount: 0,
+      },
     };
   }
 
@@ -1259,22 +1289,25 @@ function stepGame(actions: RLAction[], ticksPerStep: number = 10) {
     if (agents.every((a) => !a.player || !a.player.isAlive())) break;
   }
 
-  // Milestone: did agents wipe out all non-RL players this game?
-  if (!anyAgentBeatAI) {
+  // Milestone: did agents wipe out all bots (nations + tribes) this game?
+  if (!anyAgentBeatBots) {
     const nonRLAlive = game
       .players()
       .filter((p) => nonRLIds.has(p.id()) && p.isAlive()).length;
     const anyAgentAlive = agents.some((a) => a.player && a.player.isAlive());
     if (nonRLAlive === 0 && anyAgentAlive) {
-      anyAgentBeatAI = true;
+      anyAgentBeatBots = true;
     }
   }
 
   // Per-agent rewards and observations
   const rewards: number[] = [];
+  const rewardComponents: RewardComponents[] = [];
   const obsArr: any[] = [];
   for (const agent of agents) {
-    rewards.push(calculateReward(agent));
+    const { total, components } = calculateReward(agent);
+    rewards.push(total);
+    rewardComponents.push(components);
     obsArr.push(getObservation(agent));
   }
 
@@ -1308,10 +1341,11 @@ function stepGame(actions: RLAction[], ticksPerStep: number = 10) {
   return {
     obs: obsArr,
     rewards,
+    rewardComponents,
     dones,
     gameDone,
     gameInfo: {
-      anyAgentBeatAI,
+      anyAgentBeatBots,
       numAgentsAliveAtEnd,
       tickCount,
       winner: winnerName,
