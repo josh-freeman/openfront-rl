@@ -257,7 +257,7 @@ def train(args):
     episode_lengths = deque(maxlen=400)
     CURRICULUM_MIN_GAMES = 20  # rolling window size and minimum games before curriculum can advance
     # Per-game win flag: did any RL agent wipe out all non-RL players at any
-    # point during the game? This is the beat_ai_rate curriculum metric.
+    # point during the game? This is the no_bots_left_rate curriculum metric.
     game_wins = deque(maxlen=CURRICULUM_MIN_GAMES)
     best_reward = -float("inf")
     stage_best_rewards = {}
@@ -349,7 +349,7 @@ def train(args):
     ep_potential_shapings = deque(maxlen=400)
     # Per-env anyAgentBeatBots tracking: fires once mid-game when all non-RL die.
     # Tracked as a transition so curriculum gating doesn't wait for game end.
-    env_beat_ai = [False] * args.num_envs  # has anyAgentBeatBots fired this game?
+    env_no_bots_left = [False] * args.num_envs  # has anyAgentBeatBots fired this game?
 
     # Initialize
     obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all(_time_it=True)
@@ -377,7 +377,7 @@ def train(args):
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
-        # beat_ai_rate-gated curriculum: advance when agents reliably beat all non-RL players
+        # no_bots_left_rate-gated curriculum: advance when agents reliably beat all non-RL players
         if args.curriculum:
             diff, n_nations, n_tribes, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
             if curriculum_stage < len(CURRICULUM_STAGES) - 1:
@@ -477,18 +477,18 @@ def train(args):
                 # anyAgentBeatBots fires mid-game when all non-RL die.
                 # Record it immediately as a curriculum event (transition only,
                 # not repeated every step) so gating doesn't wait for game end.
-                if game_info.get("anyAgentBeatBots", False) and not env_beat_ai[e]:
-                    env_beat_ai[e] = True
+                if game_info.get("anyAgentBeatBots", False) and not env_no_bots_left[e]:
+                    env_no_bots_left[e] = True
                     game_wins.append(1)
                     num_games += 1
 
                 if dones[start] or truncateds[start]:
                     # If the game ended without any agent ever beating the AI,
                     # record it as a loss for curriculum gating now.
-                    if not env_beat_ai[e]:
+                    if not env_no_bots_left[e]:
                         game_wins.append(0)
                         num_games += 1
-                    env_beat_ai[e] = False  # reset for next game
+                    env_no_bots_left[e] = False  # reset for next game
 
                     # Per-slot episode reward bookkeeping
                     for k in range(K):
@@ -594,7 +594,7 @@ def train(args):
         sps = (args.rollout_steps * num_slots) / t_elapsed
 
         # Compute stats used by both wandb (every update) and console (every log_interval)
-        beat_ai_rate = np.mean(game_wins) if game_wins else 0.0
+        no_bots_left_rate = np.mean(game_wins) if game_wins else 0.0
         current_lr = optimizer.param_groups[0]["lr"]
 
         if wandb is not None:
@@ -602,7 +602,7 @@ def train(args):
                 "update": update + 1,
                 "global_step": global_step,
                 "num_games": num_games,
-                "reward/beat_ai_rate": beat_ai_rate,
+                "reward/no_bots_left_rate": no_bots_left_rate,
                 "reward_components/kill_credit": float(np.mean(ep_kill_credits)) if ep_kill_credits else 0,
                 "reward_components/death_penalty": float(np.mean(ep_death_penalties)) if ep_death_penalties else 0,
                 "reward_components/winner_bonus": float(np.mean(ep_winner_bonuses)) if ep_winner_bonuses else 0,
@@ -634,7 +634,7 @@ def train(args):
                 "num_games": num_games,
                 "mean_reward": float(mean_r),
                 "mean_length": float(mean_l),
-                "beat_ai_rate": float(beat_ai_rate),
+                "no_bots_left_rate": float(no_bots_left_rate),
                 "survival_pct": float(survival_pct),
                 "max_steps": envs.max_steps,
                 "loss": float(loss.item()),
@@ -650,7 +650,7 @@ def train(args):
                 }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
-                f"games={num_games} reward={mean_r:.2f} beat_ai={beat_ai_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
+                f"games={num_games} reward={mean_r:.2f} no_bots_left={no_bots_left_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
             )
             if args.curriculum:
@@ -658,7 +658,7 @@ def train(args):
                 print(
                     f"  curriculum: stage={curriculum_stage} "
                     f"window={len(game_wins)}/{CURRICULUM_MIN_GAMES} "
-                    f"beat_ai={beat_ai_rate:.0%} thresh={win_thresh:.0%}"
+                    f"no_bots_left={no_bots_left_rate:.0%} thresh={win_thresh:.0%}"
                 )
             print(
                 f"  timing: rollout={t_rollout_elapsed:.1f}s "
