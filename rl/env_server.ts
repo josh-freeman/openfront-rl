@@ -943,7 +943,12 @@ async function resetGame(config: ResetConfig = {}) {
 
   // Add opponent bots (Nations)
   for (let i = 0; i < numOpponents; i++) {
-    const botInfo = new PlayerInfo(`Bot${i}`, PlayerType.Bot, null, `bot_${i}`);
+    const botInfo = new PlayerInfo(
+      `Bot${i}`,
+      PlayerType.Nation,
+      null,
+      `bot_${i}`,
+    );
     game.addExecution(new SpawnExecution(GAME_ID, botInfo));
   }
 
