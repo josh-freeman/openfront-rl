@@ -18,12 +18,16 @@ import puppeteer from "puppeteer-extra";
 import AdblockerPlugin from "puppeteer-extra-plugin-adblocker";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-puppeteer.use(StealthPlugin());
-puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
-
 const BOT_NAME = process.argv[2] || "xXDarkLord42Xx";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
 const GAME_URL = process.argv[4] || "https://openfront.io";
+const IS_LOCAL =
+  GAME_URL.includes("localhost") || GAME_URL.includes("127.0.0.1");
+
+puppeteer.use(StealthPlugin());
+if (!IS_LOCAL) {
+  puppeteer.use(AdblockerPlugin({ blockTrackers: false }));
+}
 const HEADLESS =
   process.env.HEADLESS === "1" || process.env.HEADLESS === "true";
 
@@ -2926,6 +2930,7 @@ async function main() {
       "--no-restore-session-state",
       "--disable-session-crashed-bubble",
       "--disable-notifications",
+      "--enable-features=SharedArrayBuffer",
     ],
   });
 
@@ -2957,35 +2962,39 @@ async function main() {
     }
   });
 
-  // Block ad requests at the network level (before navigation)
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const url = req.url();
-    const blocked = [
-      "doubleclick.net",
-      "googlesyndication.com",
-      "googleadservices.com",
-      "adservice.google",
-      "pagead2.googlesyndication",
-      "ads.google.com",
-      "hrblock.com",
-      "amazon-adsystem",
-      "adnxs.com",
-      "adsrvr.org",
-      "criteo.com",
-      "taboola.com",
-      "outbrain.com",
-      "ad.doubleclick",
-      "googletagmanager.com/gtag",
-      "facebook.net/tr",
-    ];
-    if (blocked.some((d) => url.includes(d))) {
-      req.abort().catch(() => {});
-    } else {
-      req.continue().catch(() => {});
-    }
-  });
-  log("Ad blocking enabled (network-level request interception)");
+  // Block ad requests at the network level (skip for local play — no ads)
+  if (!IS_LOCAL) {
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const url = req.url();
+      const blocked = [
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "adservice.google",
+        "pagead2.googlesyndication",
+        "ads.google.com",
+        "hrblock.com",
+        "amazon-adsystem",
+        "adnxs.com",
+        "adsrvr.org",
+        "criteo.com",
+        "taboola.com",
+        "outbrain.com",
+        "ad.doubleclick",
+        "googletagmanager.com/gtag",
+        "facebook.net/tr",
+      ];
+      if (blocked.some((d) => url.includes(d))) {
+        req.abort().catch(() => {});
+      } else {
+        req.continue().catch(() => {});
+      }
+    });
+    log("Ad blocking enabled (network-level request interception)");
+  } else {
+    log("Local play — ad blocking disabled");
+  }
 
   // ── Join game ──
   await joinGame(page);
