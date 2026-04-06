@@ -23,6 +23,9 @@ puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
 const BOT_NAME = process.argv[2] || "xXDarkLord42Xx";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
+const GAME_URL = process.argv[4] || "https://openfront.io";
+const HEADLESS =
+  process.env.HEADLESS === "1" || process.env.HEADLESS === "true";
 
 // Training: ticksPerStep=10, turnInterval=100ms → 1 action per 1000ms game time.
 // Live server ticks faster, so poll more frequently to stay responsive.
@@ -129,7 +132,8 @@ async function safePage(browser) {
   const pages = await browser.pages();
   for (const p of pages) {
     try {
-      if (p.url().includes("openfront.io")) return p;
+      const gameHost = new URL(GAME_URL).host;
+      if (p.url().includes(gameHost)) return p;
     } catch {}
   }
   if (pages.length > 0) return pages[0];
@@ -149,8 +153,8 @@ async function safeEval(page, fn, ...args) {
 // ── Lobby: join a public game ────────────────────────────────────
 
 async function joinGame(page) {
-  log("Going to openfront.io...");
-  await page.goto("https://openfront.io", {
+  log(`Going to ${GAME_URL}...`);
+  await page.goto(GAME_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
@@ -2911,8 +2915,8 @@ async function main() {
   }
 
   const browser = await puppeteer.launch({
-    headless: false,
-    defaultViewport: null,
+    headless: HEADLESS ? "new" : false,
+    defaultViewport: HEADLESS ? { width: 1400, height: 900 } : null,
     userDataDir: "/tmp/openfront-bot-profile",
     args: [
       "--window-size=1400,900",
@@ -2941,7 +2945,7 @@ async function main() {
         const p = await target.page();
         if (
           p &&
-          !p.url().includes("openfront.io") &&
+          !p.url().includes(new URL(GAME_URL).host) &&
           p.url() !== "about:blank"
         ) {
           log(`Closing ad tab: ${p.url().slice(0, 50)}`);
