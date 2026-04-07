@@ -543,9 +543,11 @@ function getObservation(agent: AgentState): any {
     }
   }
 
+  // Incoming/outgoing attacks
   const incoming = rlPlayer.incomingAttacks().length;
   const outgoing = rlPlayer.outgoingAttacks().length;
 
+  // All players summary
   const allPlayers = game.players().map((p) => ({
     id: p.id(),
     name: p.name(),
@@ -555,6 +557,7 @@ function getObservation(agent: AgentState): any {
     isUs: p.id() === rlPlayer.id(),
   }));
 
+  // Unit type counts
   const hasSilo = units.some((u) => u.type === UnitType.MissileSilo);
   const hasPort = units.some((u) => u.type === UnitType.Port);
   const hasSAM = units.some((u) => u.type === UnitType.SAMLauncher);
@@ -566,6 +569,8 @@ function getObservation(agent: AgentState): any {
       u.type === UnitType.MIRV,
   ).length;
 
+  // Affordability flags — tell the model what it can actually build right now
+  // Uses canBuild on a random border tile as a proxy (checks gold + unit constraints)
   const sampleTile =
     borderTilesArr.length > 0
       ? borderTilesArr[Math.floor(Math.random() * borderTilesArr.length)].ref
@@ -592,6 +597,7 @@ function getObservation(agent: AgentState): any {
     sampleTile !== null &&
     rlPlayer.canBuild(UnitType.Warship, sampleTile) !== false;
 
+  // Nuke affordability (need silo + gold)
   const canAffordAtom = hasSilo && myGold >= 750_000;
   const canAffordHBomb = hasSilo && myGold >= 5_000_000;
   const canAffordMIRV = hasSilo && myGold >= 10_000_000;
@@ -601,6 +607,7 @@ function getObservation(agent: AgentState): any {
   const hasUnits = units.length > 0;
   const canDelete = hasUnits && rlPlayer.canDeleteUnit();
 
+  // Per-target masks: which neighbors are valid targets for land vs sea actions
   const landTargetMask = new Array(16).fill(0);
   const seaTargetMask = new Array(16).fill(0);
   const canReachBySea = hasCoast || hasPort;
@@ -616,6 +623,8 @@ function getObservation(agent: AgentState): any {
   const hasAttackableNeighbor = landTargetMask.some((v) => v === 1);
   const hasAttackableBySeaNeighbor = seaTargetMask.some((v) => v === 1);
 
+  // Action mask: 17 booleans, true = action is valid right now
+  // Indices match env.py action IDs exactly
   const actionMask = [
     true, // 0: NOOP
     hasAttackableNeighbor && hasTroops, // 1: ATTACK
@@ -1321,6 +1330,8 @@ function stepGame(actions: RLAction[], ticksPerStep: number = 10) {
   const allRLDead = agents.every((a) => !a.player || !a.player.isAlive());
   const winnerExists = game.getWinner() !== null;
   const numRLAlive = agents.filter((a) => a.player?.isAlive()).length;
+  // game.players() returns only alive players (GameImpl.ts:522), so no
+  // explicit isAlive() check needed here.
   const allNonRLDead =
     nonRLIds.size > 0 &&
     game.players().filter((p) => nonRLIds.has(p.id())).length === 0;
