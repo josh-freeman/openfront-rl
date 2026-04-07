@@ -38,6 +38,7 @@ class VecOpenFrontEnv:
         self.maps = maps or ["plains"]
         self.num_opponents = num_opponents
         self.difficulty = difficulty
+        self.opponent_type = "nation"  # "bot" or "nation"
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors
@@ -207,6 +208,7 @@ class VecOpenFrontEnv:
                     "map": map_name,
                     "numOpponents": self.num_opponents,
                     "difficulty": self.difficulty,
+                    "opponentType": self.opponent_type,
                     "potentialAlpha": self.potential_alpha,
                 },
             })
@@ -218,6 +220,7 @@ class VecOpenFrontEnv:
                     "map": map_name,
                     "numOpponents": self.num_opponents,
                     "difficulty": self.difficulty,
+                    "opponentType": self.opponent_type,
                     "potentialAlpha": self.potential_alpha,
                 },
             })
