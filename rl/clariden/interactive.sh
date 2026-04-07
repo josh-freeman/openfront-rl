@@ -18,16 +18,15 @@ python -u train.py \
     --save-interval 10 \
     --log-interval 5 \
     --potential-alpha 1 \
-    --save-dir ./checkpoints/multiagent4
+    --save-dir ./checkpoints/multiagent5
 
 python -u train.py \
-    --num-agents-per-env 1 \
+    --num-agents-per-env 32 \
     --num-nations 2 \
-    --num-tribes 2 \
-    --difficulty Medium \
+    --num-tribes 64 \
+    --difficulty Easy \
     --maps plains,big_plains,ocean_and_land,half_land_half_ocean \
     --max-steps 10000 \
-    --win-threshold 0.80 \
     --num-envs 16 \
     --rollout-steps 1024 \
     --num-updates 4000 \
@@ -37,7 +36,7 @@ python -u train.py \
     --save-interval 10 \
     --log-interval 5 \
     --potential-alpha 1 \
-    --save-dir ./checkpoints/multiagent4
+    --save-dir ./checkpoints/multiagent-nocurriculum2
 
 zellij attach openfront
 

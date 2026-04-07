@@ -359,14 +359,16 @@ def train(args):
     # Win-rate-gated curriculum: advance when model wins consistently.
     CURRICULUM_STAGES = [
         # (difficulty, num_nations, num_tribes, maps, max_steps, win_threshold)
-        ("Easy",    0,  8,  MAP_TIER_1, 10000, 0.75),
-        ("Easy",    0, 15,  MAP_TIER_1, 12000, 0.70),
-        ("Medium",  2,  8,  MAP_TIER_2, 15000, 0.65),
-        ("Medium",  4, 10,  MAP_TIER_2, 20000, 0.55),
-        ("Medium",  6, 12,  MAP_TIER_2, 25000, 0.50),
-        ("Hard",    4, 10,  MAP_TIER_3, 30000, 0.50),
-        ("Hard",    6, 12,  MAP_TIER_3, 40000, 0.45),
-        ("Hard",    8, 15,  MAP_TIER_3, 60000, None),  # final stage
+        ("Easy",    0, 16,  MAP_TIER_1, 12000, 0.70),
+        ("Easy",    1, 15,  MAP_TIER_1, 15000, 0.70),
+        ("Easy",    2, 14,  MAP_TIER_1, 15000, 0.70),
+        ("Easy",    4, 11,  MAP_TIER_1, 15000, 0.70),
+        ("Medium",    1, 15,  MAP_TIER_1, 15000, 0.70),
+        ("Medium",    2, 14,  MAP_TIER_1, 15000, 0.70),
+        ("Medium",    4, 11,  MAP_TIER_1, 15000, 0.70),
+        ("Hard",    1, 15,  MAP_TIER_1, 15000, 0.70),
+        ("Hard",    2, 14,  MAP_TIER_1, 15000, 0.70),
+        ("Hard",    4, 11,  MAP_TIER_1, 15000, None), # final stage
     ]
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
