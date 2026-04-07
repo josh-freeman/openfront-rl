@@ -67,6 +67,7 @@ class VecOpenFrontEnv:
         self.num_nations = num_nations
         self.num_tribes = num_tribes
         self.difficulty = difficulty
+        self.opponent_type = "nation"  # "bot" or "nation"
         self.ticks_per_step = ticks_per_step
         self.max_steps = max_steps
         self.max_neighbors = max_neighbors

@@ -18,11 +18,18 @@ import puppeteer from "puppeteer-extra";
 import AdblockerPlugin from "puppeteer-extra-plugin-adblocker";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
-puppeteer.use(StealthPlugin());
-puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
-
 const BOT_NAME = process.argv[2] || "xXDarkLord42Xx";
 const POLICY_URL = process.argv[3] || "http://localhost:8765";
+const GAME_URL = process.argv[4] || "https://openfront.io";
+const IS_LOCAL =
+  GAME_URL.includes("localhost") || GAME_URL.includes("127.0.0.1");
+
+puppeteer.use(StealthPlugin());
+if (!IS_LOCAL) {
+  puppeteer.use(AdblockerPlugin({ blockTrackers: false }));
+}
+const HEADLESS =
+  process.env.HEADLESS === "1" || process.env.HEADLESS === "true";
 
 // Training: ticksPerStep=10, turnInterval=100ms → 1 action per 1000ms game time.
 // Live server ticks faster, so poll more frequently to stay responsive.
@@ -129,7 +136,8 @@ async function safePage(browser) {
   const pages = await browser.pages();
   for (const p of pages) {
     try {
-      if (p.url().includes("openfront.io")) return p;
+      const gameHost = new URL(GAME_URL).host;
+      if (p.url().includes(gameHost)) return p;
     } catch {}
   }
   if (pages.length > 0) return pages[0];
@@ -149,8 +157,8 @@ async function safeEval(page, fn, ...args) {
 // ── Lobby: join a public game ────────────────────────────────────
 
 async function joinGame(page) {
-  log("Going to openfront.io...");
-  await page.goto("https://openfront.io", {
+  log(`Going to ${GAME_URL}...`);
+  await page.goto(GAME_URL, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
@@ -2988,8 +2996,8 @@ async function main() {
   }
 
   const browser = await puppeteer.launch({
-    headless: false,
-    defaultViewport: null,
+    headless: HEADLESS ? "new" : false,
+    defaultViewport: HEADLESS ? { width: 1400, height: 900 } : null,
     userDataDir: "/tmp/openfront-bot-profile",
     args: [
       "--window-size=1400,900",
@@ -2999,6 +3007,7 @@ async function main() {
       "--no-restore-session-state",
       "--disable-session-crashed-bubble",
       "--disable-notifications",
+      "--enable-features=SharedArrayBuffer",
     ],
   });
 
@@ -3018,7 +3027,7 @@ async function main() {
         const p = await target.page();
         if (
           p &&
-          !p.url().includes("openfront.io") &&
+          !p.url().includes(new URL(GAME_URL).host) &&
           p.url() !== "about:blank"
         ) {
           log(`Closing ad tab: ${p.url().slice(0, 50)}`);
@@ -3030,35 +3039,39 @@ async function main() {
     }
   });
 
-  // Block ad requests at the network level (before navigation)
-  await page.setRequestInterception(true);
-  page.on("request", (req) => {
-    const url = req.url();
-    const blocked = [
-      "doubleclick.net",
-      "googlesyndication.com",
-      "googleadservices.com",
-      "adservice.google",
-      "pagead2.googlesyndication",
-      "ads.google.com",
-      "hrblock.com",
-      "amazon-adsystem",
-      "adnxs.com",
-      "adsrvr.org",
-      "criteo.com",
-      "taboola.com",
-      "outbrain.com",
-      "ad.doubleclick",
-      "googletagmanager.com/gtag",
-      "facebook.net/tr",
-    ];
-    if (blocked.some((d) => url.includes(d))) {
-      req.abort().catch(() => {});
-    } else {
-      req.continue().catch(() => {});
-    }
-  });
-  log("Ad blocking enabled (network-level request interception)");
+  // Block ad requests at the network level (skip for local play — no ads)
+  if (!IS_LOCAL) {
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const url = req.url();
+      const blocked = [
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "adservice.google",
+        "pagead2.googlesyndication",
+        "ads.google.com",
+        "hrblock.com",
+        "amazon-adsystem",
+        "adnxs.com",
+        "adsrvr.org",
+        "criteo.com",
+        "taboola.com",
+        "outbrain.com",
+        "ad.doubleclick",
+        "googletagmanager.com/gtag",
+        "facebook.net/tr",
+      ];
+      if (blocked.some((d) => url.includes(d))) {
+        req.abort().catch(() => {});
+      } else {
+        req.continue().catch(() => {});
+      }
+    });
+    log("Ad blocking enabled (network-level request interception)");
+  } else {
+    log("Local play — ad blocking disabled");
+  }
 
   // ── Join game ──
   await joinGame(page);
