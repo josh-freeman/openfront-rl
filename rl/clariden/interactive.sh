@@ -1,5 +1,5 @@
 zellij --session openfront
-srun --time=6:00:00 -A infra01 --container-writable --environment=/users/alexpadula/projects/openfront-rl/rl/clariden/torch.toml --pty bash
+srun --time=3:00:00 -A infra01 --container-writable --environment=/users/alexpadula/projects/openfront-rl/rl/clariden/torch.toml --pty bash
 cd ~/projects/openfront-rl/rl
 python -m venv --system-site-packages .venv
 source .venv/bin/activate
@@ -18,7 +18,8 @@ python -u train.py \
     --save-interval 10 \
     --log-interval 5 \
     --potential-alpha 1 \
-    --save-dir ./checkpoints/multiagent5
+    --save-dir ./checkpoints/multiagent6 \
+    --resume
 
 python -u train.py \
     --num-agents-per-env 32 \

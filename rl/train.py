@@ -629,7 +629,7 @@ def train(args):
         if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
             mean_r = np.mean(episode_rewards)
             mean_l = np.mean(episode_lengths)
-            survival_pct = mean_l / envs.max_steps
+            survival_pct = mean_l / envs.max_steps # fraction of max episode length
             entry = {
                 "update": update + 1,
                 "global_step": global_step,
@@ -657,10 +657,11 @@ def train(args):
             )
             if args.curriculum:
                 win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][5]
+                thresh_str = f"{win_thresh:.0%}" if win_thresh is not None else "final"
                 print(
                     f"  curriculum: stage={curriculum_stage} "
                     f"window={len(game_wins)}/{CURRICULUM_MIN_GAMES} "
-                    f"no_bots_left={no_bots_left_rate:.0%} thresh={win_thresh:.0%}"
+                    f"no_bots_left={no_bots_left_rate:.0%} thresh={thresh_str}"
                 )
             print(
                 f"  timing: rollout={t_rollout_elapsed:.1f}s "
