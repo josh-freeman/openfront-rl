@@ -26,10 +26,12 @@ except ImportError:
 
 # Maps organized by complexity tier — curriculum adds more maps as training progresses
 MAP_TIER_1 = [
-    # Simple, balanced maps for learning basics
-    "plains", "big_plains", "world", "giantworldmap", "ocean_and_land", "half_land_half_ocean",
+    # Simple, balanced maps for learning basics (small/medium only — large maps too slow with many players)
+    "plains", "big_plains", "ocean_and_land", "half_land_half_ocean",
 ]
 MAP_TIER_2 = MAP_TIER_1 + [
+    # Add mid-size real-geography maps and the larger flat maps
+    "world", "giantworldmap",
     # Mid-complexity: real geography, moderate water/chokepoints
     "europe", "europeclassic", "northamerica", "africa", "asia", "australia",
     "southamerica", "mediterranean", "britannia", "britanniaclassic",
@@ -225,12 +227,17 @@ def train(args):
     max_neighbors = 16
     obs_dim = 16 + max_neighbors * 5  # 96
 
+    K = args.num_agents_per_env
+    num_slots = args.num_envs * K
+
     # Create vectorized environment
     from vec_env import VecOpenFrontEnv
     envs = VecOpenFrontEnv(
         num_envs=args.num_envs,
+        num_agents_per_env=K,
         maps=maps,
-        num_opponents=args.opponents,
+        num_nations=args.num_nations,
+        num_tribes=args.num_tribes,
         difficulty=args.difficulty,
         ticks_per_step=args.ticks_per_step,
         max_steps=args.max_steps,
@@ -245,15 +252,19 @@ def train(args):
     # Logging
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-    episode_rewards = deque(maxlen=100)
-    episode_lengths = deque(maxlen=100)
-    episode_wins = deque(maxlen=200)
+    # Per-slot episode stats (K slots per game → higher-freq reward signal)
+    episode_rewards = deque(maxlen=400)
+    episode_lengths = deque(maxlen=400)
+    CURRICULUM_MIN_GAMES = 20  # rolling window size and minimum games before curriculum can advance
+    # Per-game win flag: did any RL agent wipe out all non-RL players at any
+    # point during the game? This is the no_bots_left_rate curriculum metric.
+    game_wins = deque(maxlen=CURRICULUM_MIN_GAMES)
     best_reward = -float("inf")
     stage_best_rewards = {}
     log_entries = []
     global_step = 0
     start_update = 0
-    num_episodes = 0
+    num_games = 0
 
     # Load weights only (fresh optimizer) from a specific checkpoint
     if args.load_weights:
@@ -274,7 +285,7 @@ def train(args):
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_update = checkpoint.get("update", 0)
             global_step = checkpoint.get("global_step", 0)
-            num_episodes = checkpoint.get("num_episodes", 0)
+            num_games = checkpoint.get("num_games", checkpoint.get("num_episodes", 0))
             curriculum_stage = checkpoint.get("curriculum_stage", 0)
 
             if state_path.exists():
@@ -303,60 +314,62 @@ def train(args):
         )
         wandb.config.update({"obs_dim": obs_dim, "maps": maps}, allow_val_change=True)
 
-    print(f"Training PPO on maps={maps}, opponents={args.opponents}")
-    print(f"num_envs={args.num_envs}, rollout_steps={args.rollout_steps}")
-    print(f"batch_size={args.num_envs * args.rollout_steps}, minibatch_size={args.minibatch_size}")
+    print(f"Training PPO on maps={maps}, agents/env={K}, nations={args.num_nations}, tribes={args.num_tribes}")
+    print(f"num_envs={args.num_envs}, num_slots={num_slots}, rollout_steps={args.rollout_steps}")
+    print(f"batch_size={num_slots * args.rollout_steps}, minibatch_size={args.minibatch_size}")
     print(f"obs_dim={obs_dim}, device={device}")
     print(f"Saving checkpoints to {save_dir}")
 
-    # Storage for rollouts: (num_steps, num_envs, ...)
-    obs_buf = np.zeros((args.rollout_steps, args.num_envs, obs_dim), dtype=np.float32)
-    masks_buf = np.ones((args.rollout_steps, args.num_envs, NUM_ACTIONS), dtype=np.float32)
-    land_masks_buf = np.ones((args.rollout_steps, args.num_envs, max_neighbors), dtype=np.float32)
-    sea_masks_buf = np.ones((args.rollout_steps, args.num_envs, max_neighbors), dtype=np.float32)
-    actions_buf = np.zeros((args.rollout_steps, args.num_envs, 3), dtype=np.float32)
-    logprobs_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
-    rewards_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
-    terminals_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
-    truncateds_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
-    truncated_values_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
-    values_buf = np.zeros((args.rollout_steps, args.num_envs), dtype=np.float32)
+    # Storage for rollouts: (num_steps, num_slots, ...) where num_slots = num_envs * K
+    obs_buf = np.zeros((args.rollout_steps, num_slots, obs_dim), dtype=np.float32)
+    masks_buf = np.ones((args.rollout_steps, num_slots, NUM_ACTIONS), dtype=np.float32)
+    land_masks_buf = np.ones((args.rollout_steps, num_slots, max_neighbors), dtype=np.float32)
+    sea_masks_buf = np.ones((args.rollout_steps, num_slots, max_neighbors), dtype=np.float32)
+    actions_buf = np.zeros((args.rollout_steps, num_slots, 3), dtype=np.float32)
+    logprobs_buf = np.zeros((args.rollout_steps, num_slots), dtype=np.float32)
+    rewards_buf = np.zeros((args.rollout_steps, num_slots), dtype=np.float32)
+    terminals_buf = np.zeros((args.rollout_steps, num_slots), dtype=np.float32)
+    truncateds_buf = np.zeros((args.rollout_steps, num_slots), dtype=np.float32)
+    truncated_values_buf = np.zeros((args.rollout_steps, num_slots), dtype=np.float32)
+    values_buf = np.zeros((args.rollout_steps, num_slots), dtype=np.float32)
 
-    # Track per-env episode stats
-    env_ep_rewards = np.zeros(args.num_envs, dtype=np.float32)
-    env_ep_lengths = np.zeros(args.num_envs, dtype=np.int32)
+    # Per-slot running episode stats (one "episode" = one slot's view of a
+    # whole game, zombie frames included after death)
+    env_ep_rewards = np.zeros(num_slots, dtype=np.float32)
+    env_ep_lengths = np.zeros(num_slots, dtype=np.int32)
+    # Per-slot cumulative reward components (reset each episode, logged at end)
+    ep_kill_credit      = np.zeros(num_slots, dtype=np.float32)
+    ep_death_penalty    = np.zeros(num_slots, dtype=np.float32)
+    ep_winner_bonus     = np.zeros(num_slots, dtype=np.float32)
+    ep_potential_shaping = np.zeros(num_slots, dtype=np.float32)
+    # Rolling deques for mean per-episode component values (logged to wandb)
+    ep_kill_credits       = deque(maxlen=400)
+    ep_death_penalties    = deque(maxlen=400)
+    ep_winner_bonuses     = deque(maxlen=400)
+    ep_potential_shapings = deque(maxlen=400)
+    # Per-env anyAgentBeatBots tracking: fires once mid-game when all non-RL die.
+    # Tracked as a transition so curriculum gating doesn't wait for game end.
+    env_no_bots_left = [False] * args.num_envs  # has anyAgentBeatBots fired this game?
 
     # Initialize
-    obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all()
+    obs, action_masks, land_target_masks, sea_target_masks = envs.reset_all(_time_it=True)
 
-    # Curriculum: gradual ramp of (difficulty, opponents, maps)
-    # Win-rate-gated curriculum: advance only when model wins consistently
+    # Self-play curriculum: K RL agents play in every game. Difficulty controls
+    # nation AI strength; num_nations/num_tribes control the non-RL population.
+    # Win-rate-gated curriculum: advance when model wins consistently.
     CURRICULUM_STAGES = [
-        # (difficulty, opponents, maps, max_steps, win_threshold, opponent_type)
-        # Bots: weak AI (1/3 max troops, 0.6x growth) — warm-up
-        ("Easy",    2,  MAP_TIER_1,  5000,  0.80, "bot"),
-        ("Easy",    5,  MAP_TIER_1,  8000,  0.80, "bot"),
-        ("Easy",   10,  MAP_TIER_1, 12000,  0.80, "bot"),
-        ("Easy",   15,  MAP_TIER_1, 15000,  0.80, "bot"),
-        # Easy Nations: 50% max troops, 0.9x growth
-        ("Easy",    5,  MAP_TIER_1, 12000,  0.65, "nation"),
-        ("Easy",   10,  MAP_TIER_2, 15000,  0.55, "nation"),
-        # Medium Nations: 75% max troops, 0.95x growth
-        ("Medium",  5,  MAP_TIER_2, 20000,  0.55, "nation"),
-        ("Medium", 10,  MAP_TIER_2, 25000,  0.45, "nation"),
-        ("Medium", 15,  MAP_TIER_2, 30000,  0.40, "nation"),
-        # Hard Nations: 100% max troops, 1x growth (= human)
-        ("Hard",    2,  MAP_TIER_2, 20000,  0.60, "nation"),
-        ("Hard",    5,  MAP_TIER_3, 35000,  0.50, "nation"),
-        ("Hard",   10,  MAP_TIER_3, 50000,  0.40, "nation"),
-        ("Hard",   15,  MAP_TIER_3, 65000,  0.35, "nation"),
-        # Impossible Nations: 125% max troops, 1.05x growth
-        ("Impossible",  2, MAP_TIER_3, 35000,  0.55, "nation"),
-        ("Impossible",  5, MAP_TIER_3, 50000,  0.40, "nation"),
-        ("Impossible", 10, MAP_TIER_3, 65000,  0.35, "nation"),
-        ("Impossible", 15, MAP_TIER_3, 80000,  None, "nation"),  # final stage
+        # (difficulty, num_nations, num_tribes, maps, max_steps, win_threshold)
+        ("Easy",    0, 16,  MAP_TIER_1, 12000, 0.70),
+        ("Easy",    1, 15,  MAP_TIER_1, 15000, 0.70),
+        ("Easy",    2, 14,  MAP_TIER_1, 15000, 0.70),
+        ("Easy",    4, 11,  MAP_TIER_1, 15000, 0.70),
+        ("Medium",    1, 15,  MAP_TIER_1, 15000, 0.70),
+        ("Medium",    2, 14,  MAP_TIER_1, 15000, 0.70),
+        ("Medium",    4, 11,  MAP_TIER_1, 15000, 0.70),
+        ("Hard",    1, 15,  MAP_TIER_1, 15000, 0.70),
+        ("Hard",    2, 14,  MAP_TIER_1, 15000, 0.70),
+        ("Hard",    4, 11,  MAP_TIER_1, 15000, None), # final stage
     ]
-    CURRICULUM_MIN_EPISODES = 200
     curriculum_stage = 0
     # LR warmdown: after a curriculum transition, temporarily reduce LR
     # then ramp back up over WARMDOWN_UPDATES
@@ -366,35 +379,32 @@ def train(args):
 
     for update in range(start_update, args.num_updates):
         t_start = time.time()
-
-        # Win-rate-gated curriculum: advance when win rate exceeds threshold
+        # no_bots_left_rate-gated curriculum: advance when agents reliably beat all non-RL players
         if args.curriculum:
-            # Ensure current stage settings are applied (startup + resume)
-            diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
-            if envs.difficulty != diff or envs.num_opponents != opp or envs.opponent_type != opp_type or envs.max_steps != msteps:
+            diff, n_nations, n_tribes, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
+            if curriculum_stage < len(CURRICULUM_STAGES) - 1:
+                win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][5]
+                if (win_thresh is not None
+                        and len(game_wins) >= CURRICULUM_MIN_GAMES
+                        and np.mean(game_wins) >= win_thresh):
+                    curriculum_stage += 1
+                    game_wins.clear()  # reset window for new stage
+                    diff, n_nations, n_tribes, maps, msteps = CURRICULUM_STAGES[curriculum_stage][:5]
+                    print(f"  Curriculum: advancing to stage {curriculum_stage} — "
+                          f"{diff} with {n_nations} nations / {n_tribes} tribes, "
+                          f"{len(maps)} maps, max_steps={msteps}")
+                    warmdown_counter = WARMDOWN_UPDATES
+            # Always sync envs to current stage — fixes initial setup (update=0)
+            # where stage 0's max_steps was never applied before this refactor.
+            if (envs.difficulty != diff
+                    or envs.num_nations != n_nations
+                    or envs.num_tribes != n_tribes
+                    or envs.max_steps != msteps):
                 envs.difficulty = diff
-                envs.num_opponents = opp
+                envs.num_nations = n_nations
+                envs.num_tribes = n_tribes
                 envs.maps = maps
                 envs.max_steps = msteps
-                envs.opponent_type = opp_type
-
-            # Check for advancement
-            if curriculum_stage < len(CURRICULUM_STAGES) - 1:
-                win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][4]
-                if (win_thresh is not None
-                        and len(episode_wins) >= CURRICULUM_MIN_EPISODES
-                        and np.mean(episode_wins) >= win_thresh):
-                    curriculum_stage += 1
-                    episode_wins.clear()  # reset window for new stage
-                    diff, opp, maps, msteps, _, opp_type = CURRICULUM_STAGES[curriculum_stage]
-                    print(f"  Curriculum: advancing to stage {curriculum_stage} — "
-                          f"{diff} {opp_type} with {opp} opponents, {len(maps)} maps, max_steps={msteps}")
-                    envs.difficulty = diff
-                    envs.num_opponents = opp
-                    envs.maps = maps
-                    envs.max_steps = msteps
-                    envs.opponent_type = opp_type
-                    warmdown_counter = WARMDOWN_UPDATES
 
         # LR schedule: apply warmdown after curriculum transitions
         lr_now = args.lr
@@ -410,12 +420,17 @@ def train(args):
             param_group["lr"] = lr_now
 
         # Collect rollout
+        t_rollout_start = time.time()
+        t_inference_total = 0.0
+        t_step_total = 0.0
+        t_reset_total = 0.0
         for step in range(args.rollout_steps):
             obs_buf[step] = obs
             masks_buf[step] = action_masks
             land_masks_buf[step] = land_target_masks
             sea_masks_buf[step] = sea_target_masks
 
+            _t = time.time()
             obs_t = torch.FloatTensor(obs).to(device)
             masks_t = torch.FloatTensor(action_masks).to(device)
             land_t = torch.FloatTensor(land_target_masks).to(device)
@@ -424,41 +439,85 @@ def train(args):
                 action, log_prob, _, value = model.get_action_and_value(
                     obs_t, action_mask=masks_t,
                     land_target_mask=land_t, sea_target_mask=sea_t)
+            t_inference_total += time.time() - _t
 
-            actions_np = action.cpu().numpy()  # (num_envs, 3)
+            actions_np = action.cpu().numpy()  # (num_slots, 3)
             logprobs_buf[step] = log_prob.cpu().numpy()
             values_buf[step] = value.cpu().numpy()
             actions_buf[step] = actions_np
 
+            _t = time.time()
             next_obs, next_masks, next_land, next_sea, rewards, dones, truncateds, infos = envs.step(actions_np)
+            t_step_total += time.time() - _t
             rewards_buf[step] = rewards
             terminals_buf[step] = dones.astype(np.float32)
             truncateds_buf[step] = truncateds.astype(np.float32)
 
-            # For truncated envs, estimate the value of the terminal state
-            # before resetting — this is the bootstrap target
+            # For truncated slots, estimate the value of the terminal state
+            # before resetting — this is the bootstrap target.
             if np.any(truncateds):
                 trunc_obs = torch.FloatTensor(next_obs[truncateds]).to(device)
                 with torch.no_grad():
                     trunc_vals = model.get_action_and_value(trunc_obs)[3]
                 truncated_values_buf[step, truncateds] = trunc_vals.cpu().numpy()
 
-            # Track episode stats and auto-reset finished envs
             env_ep_rewards += rewards
             env_ep_lengths += 1
-            for i in range(args.num_envs):
-                if dones[i] or truncateds[i]:
-                    ep_r = float(env_ep_rewards[i])
-                    ep_won = infos[i].get("weWon", False)
-                    episode_rewards.append(ep_r)
-                    episode_lengths.append(int(env_ep_lengths[i]))
-                    episode_wins.append(1 if ep_won else 0)
-                    num_episodes += 1
-                    env_ep_rewards[i] = 0
-                    env_ep_lengths[i] = 0
-                    next_obs[i], next_masks[i], next_land[i], next_sea[i] = envs.reset_single(i)
+            for flat in range(num_slots):
+                info = infos[flat]
+                ep_kill_credit[flat]       += info.get("reward_kill_credit", 0)
+                ep_death_penalty[flat]     += info.get("reward_death_penalty", 0)
+                ep_winner_bonus[flat]      += info.get("reward_winner_bonus", 0)
+                ep_potential_shaping[flat] += info.get("reward_potential_shaping", 0)
 
-            global_step += args.num_envs
+            # Per-env (per-game) auto-reset: all K slots of a game share the
+            # same done/truncated flag, so we iterate at the env level.
+            for e in range(args.num_envs):
+                start = e * K
+                game_info = infos[start]
+
+                # anyAgentBeatBots fires mid-game when all non-RL die.
+                # Record it immediately as a curriculum event (transition only,
+                # not repeated every step) so gating doesn't wait for game end.
+                if game_info.get("anyAgentBeatBots", False) and not env_no_bots_left[e]:
+                    env_no_bots_left[e] = True
+                    game_wins.append(1)
+                    num_games += 1
+
+                if dones[start] or truncateds[start]:
+                    # If the game ended without any agent ever beating the AI,
+                    # record it as a loss for curriculum gating now.
+                    if not env_no_bots_left[e]:
+                        game_wins.append(0)
+                        num_games += 1
+                    env_no_bots_left[e] = False  # reset for next game
+
+                    # Per-slot episode reward bookkeeping
+                    for k in range(K):
+                        flat = start + k
+                        episode_rewards.append(float(env_ep_rewards[flat]))
+                        episode_lengths.append(int(env_ep_lengths[flat]))
+                        ep_kill_credits.append(float(ep_kill_credit[flat]))
+                        ep_death_penalties.append(float(ep_death_penalty[flat]))
+                        ep_winner_bonuses.append(float(ep_winner_bonus[flat]))
+                        ep_potential_shapings.append(float(ep_potential_shaping[flat]))
+                        env_ep_rewards[flat] = 0
+                        env_ep_lengths[flat] = 0
+                        ep_kill_credit[flat] = 0
+                        ep_death_penalty[flat] = 0
+                        ep_winner_bonus[flat] = 0
+                        ep_potential_shaping[flat] = 0
+                    # Reset the whole game
+                    _t = time.time()
+                    o_k, m_k, l_k, s_k = envs.reset_env(e)
+                    t_reset_total += time.time() - _t
+                    end = start + K
+                    next_obs[start:end] = o_k
+                    next_masks[start:end] = m_k
+                    next_land[start:end] = l_k
+                    next_sea[start:end] = s_k
+
+            global_step += num_slots
             obs = next_obs
             action_masks = next_masks
             land_target_masks = next_land
@@ -469,6 +528,8 @@ def train(args):
             last_values = model.get_action_and_value(torch.FloatTensor(obs).to(device))[3]
             last_values = last_values.cpu().numpy()
 
+        t_rollout_elapsed = time.time() - t_rollout_start
+
         # Compute GAE with proper truncation bootstrapping
         advantages, returns = compute_gae_vec(
             rewards_buf, values_buf, terminals_buf, truncateds_buf,
@@ -476,8 +537,8 @@ def train(args):
             gamma=args.gamma, lam=args.gae_lambda,
         )
 
-        # Flatten (num_steps, num_envs, ...) -> (batch_size, ...)
-        batch_size = args.rollout_steps * args.num_envs
+        # Flatten (num_steps, num_slots, ...) -> (batch_size, ...)
+        batch_size = args.rollout_steps * num_slots
         b_obs = torch.FloatTensor(obs_buf.reshape(batch_size, -1)).to(device)
         b_masks = torch.FloatTensor(masks_buf.reshape(batch_size, -1)).to(device)
         b_land_masks = torch.FloatTensor(land_masks_buf.reshape(batch_size, -1)).to(device)
@@ -492,6 +553,7 @@ def train(args):
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         # PPO epochs with minibatch updates
+        t_ppo_start = time.time()
         for _ in range(args.ppo_epochs):
             indices = np.random.permutation(batch_size)
             for start in range(0, batch_size, args.minibatch_size):
@@ -529,52 +591,82 @@ def train(args):
                 optimizer.step()
 
         # Logging
+        t_ppo_elapsed = time.time() - t_ppo_start
         t_elapsed = time.time() - t_start
-        sps = (args.rollout_steps * args.num_envs) / t_elapsed
+        sps = (args.rollout_steps * num_slots) / t_elapsed
+
+        # Compute stats used by both wandb (every update) and console (every log_interval)
+        no_bots_left_rate = np.mean(game_wins) if game_wins else 0.0
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        if wandb is not None:
+            wandb.log({
+                "update": update + 1,
+                "global_step": global_step,
+                "num_games": num_games,
+                "reward/no_bots_left_rate": no_bots_left_rate,
+                "reward_components/kill_credit": float(np.mean(ep_kill_credits)) if ep_kill_credits else 0,
+                "reward_components/death_penalty": float(np.mean(ep_death_penalties)) if ep_death_penalties else 0,
+                "reward_components/winner_bonus": float(np.mean(ep_winner_bonuses)) if ep_winner_bonuses else 0,
+                "reward_components/potential_shaping": float(np.mean(ep_potential_shapings)) if ep_potential_shapings else 0,
+                "loss/total": float(loss.item()),
+                "loss/policy": float(policy_loss.item()),
+                "loss/value": float(value_loss.item()),
+                "loss/entropy": float(entropy_loss.item()),
+                "perf/sps": float(sps),
+                "perf/t_rollout": t_rollout_elapsed,
+                "perf/t_inference": t_inference_total,
+                "perf/t_env_step": t_step_total,
+                "perf/t_reset": t_reset_total,
+                "perf/t_ppo": t_ppo_elapsed,
+                "lr": current_lr,
+                "curriculum/stage": curriculum_stage,
+                "curriculum/num_nations": envs.num_nations,
+                "curriculum/num_tribes": envs.num_tribes,
+                "best_reward": float(best_reward),
+            }, step=global_step)
 
         if (update + 1) % args.log_interval == 0 and len(episode_rewards) > 0:
             mean_r = np.mean(episode_rewards)
             mean_l = np.mean(episode_lengths)
-            win_rate = np.mean(episode_wins) if episode_wins else 0.0
-            survival_pct = mean_l / envs.max_steps  # fraction of max episode length
+            survival_pct = mean_l / envs.max_steps # fraction of max episode length
             entry = {
                 "update": update + 1,
                 "global_step": global_step,
-                "num_episodes": num_episodes,
+                "num_games": num_games,
                 "mean_reward": float(mean_r),
                 "mean_length": float(mean_l),
-                "win_rate": float(win_rate),
+                "no_bots_left_rate": float(no_bots_left_rate),
                 "survival_pct": float(survival_pct),
                 "max_steps": envs.max_steps,
                 "loss": float(loss.item()),
                 "sps": float(sps),
             }
             log_entries.append(entry)
-            current_lr = optimizer.param_groups[0]["lr"]
             if wandb is not None:
                 wandb.log({
-                    "update": update + 1,
-                    "global_step": global_step,
-                    "num_episodes": num_episodes,
                     "reward/mean": float(mean_r),
-                    "reward/win_rate": float(win_rate),
                     "episode_length": float(mean_l),
                     "episode_length/survival_pct": float(survival_pct),
                     "episode_length/max_steps": envs.max_steps,
-                    "loss/total": float(loss.item()),
-                    "loss/policy": float(policy_loss.item()),
-                    "loss/value": float(value_loss.item()),
-                    "loss/entropy": float(entropy_loss.item()),
-                    "perf/sps": float(sps),
-                    "lr": current_lr,
-                    "curriculum/stage": curriculum_stage,
-                    "curriculum/opponents": envs.num_opponents,
-                    "best_reward": float(best_reward),
                 }, step=global_step)
             print(
                 f"[update {update+1}/{args.num_updates}] "
-                f"episodes={num_episodes} reward={mean_r:.2f} win={win_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
+                f"games={num_games} reward={mean_r:.2f} no_bots_left={no_bots_left_rate:.0%} len={mean_l:.0f} ({survival_pct:.0%}) "
                 f"loss={loss.item():.4f} sps={sps:.0f}"
+            )
+            if args.curriculum:
+                win_thresh = args.win_threshold if args.win_threshold is not None else CURRICULUM_STAGES[curriculum_stage][5]
+                thresh_str = f"{win_thresh:.0%}" if win_thresh is not None else "final"
+                print(
+                    f"  curriculum: stage={curriculum_stage} "
+                    f"window={len(game_wins)}/{CURRICULUM_MIN_GAMES} "
+                    f"no_bots_left={no_bots_left_rate:.0%} thresh={thresh_str}"
+                )
+            print(
+                f"  timing: rollout={t_rollout_elapsed:.1f}s "
+                f"(inference={t_inference_total:.1f}s, env_step={t_step_total:.1f}s, reset={t_reset_total:.1f}s) "
+                f"ppo={t_ppo_elapsed:.1f}s | total={t_elapsed:.1f}s"
             )
 
         # Save checkpoint
@@ -586,7 +678,7 @@ def train(args):
                     "optimizer": optimizer.state_dict(),
                     "update": update + 1,
                     "global_step": global_step,
-                    "num_episodes": num_episodes,
+                    "num_games": num_games,
                     "curriculum_stage": curriculum_stage,
                 },
                 ckpt_path,
@@ -610,15 +702,18 @@ def train(args):
                 json.dump({
                     "update": update + 1,
                     "global_step": global_step,
-                    "num_episodes": num_episodes,
+                    "num_games": num_games,
                     "best_reward": float(best_reward),
                     "config": {
                         "maps": maps,
-                        "opponents": args.opponents,
+                        "num_agents_per_env": K,
+                        "num_nations": args.num_nations,
+                        "num_tribes": args.num_tribes,
                         "difficulty": args.difficulty,
                         "obs_dim": obs_dim,
                         "max_neighbors": max_neighbors,
                         "num_envs": args.num_envs,
+                        "num_slots": num_slots,
                         "lr": args.lr,
                         "rollout_steps": args.rollout_steps,
                         "hidden_sizes": hidden_sizes,
@@ -651,11 +746,17 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train OpenFront RL agent with PPO")
     parser.add_argument("--maps", default=",".join(AVAILABLE_MAPS), help="Comma-separated maps to randomly sample each episode")
-    parser.add_argument("--opponents", type=int, default=3)
-    parser.add_argument("--difficulty", default="Medium")
+    parser.add_argument("--num-agents-per-env", type=int, default=4,
+                        help="Number of RL self-play agents per game (all share the same policy)")
+    parser.add_argument("--num-nations", type=int, default=0,
+                        help="Number of Nation players per game (PlayerType.Nation, strong territorial AI)")
+    parser.add_argument("--num-tribes", type=int, default=8,
+                        help="Number of Tribe players per game (PlayerType.Bot, simple roaming AI)")
+    parser.add_argument("--difficulty", default="Easy",
+                        help="Difficulty level: Easy/Medium/Hard/Impossible (affects Nation AI strength)")
     parser.add_argument("--ticks-per-step", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=100000)
-    parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel environments")
+    parser.add_argument("--num-envs", type=int, default=4, help="Number of parallel game processes")
     parser.add_argument("--rollout-steps", type=int, default=512, help="Steps per env per rollout")
     parser.add_argument("--num-updates", type=int, default=10000, help="Number of PPO updates")
     parser.add_argument("--lr", type=float, default=3e-4)
